@@ -7582,7 +7582,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # systemd units without SIGUSR1 wiring this wait just times out
             # and we fall back to ``systemctl restart`` (the old behaviour).
             try:
-                from hermes_constants import (
+                from gateway.restart import (
                     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT as _DEFAULT_DRAIN,
                 )
             except Exception:
