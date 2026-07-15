@@ -4047,12 +4047,54 @@ class TestHandleMaxIterations:
             result = agent._handle_max_iterations(messages, 90)
 
         assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
         input_items = captured["input"]
         assert not any(
             item.get("type") == "function_call_output"
             and item.get("call_id") == "call_orphan"
             for item in input_items
         )
+
+    def test_xai_codex_summary_retry_strips_all_tool_controls(self, agent):
+        """Both xAI summary attempts must be valid toolless requests."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.5"
+        agent._cached_system_prompt = "You are helpful."
+        captured_calls = []
+        response_texts = iter(["", "Summary after retry"])
+
+        def fake_run_codex_stream(kwargs):
+            captured_calls.append(dict(kwargs))
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[
+                            SimpleNamespace(type="output_text", text=next(response_texts))
+                        ],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 100
+            )
+
+        assert result == "Summary after retry"
+        assert len(captured_calls) == 2
+        for kwargs in captured_calls:
+            assert "tools" not in kwargs
+            assert "tool_choice" not in kwargs
+            assert "parallel_tool_calls" not in kwargs
 
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
