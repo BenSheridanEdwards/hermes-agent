@@ -71,6 +71,49 @@ except Exception:
 AUTH_STORE_VERSION = 1
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
 
+
+def runtime_owns_oauth_refresh(provider: str) -> bool:
+    """Return whether this process may spend the provider's refresh token.
+
+    Missing ownership configuration preserves standalone Hermes behavior.
+    Once an ``oauth`` block is present, malformed or unknown ownership fails
+    closed so a typo cannot silently create a second refresh-token writer.
+    """
+    if provider not in {"openai-codex", "xai-oauth"}:
+        return True
+    config_path = get_config_path()
+    if not config_path.exists():
+        return True
+    try:
+        raw_config_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("OAuth refresh ownership unreadable; refusing runtime refresh")
+        return False
+    if not raw_config_text.strip() or all(
+        not line.strip() or line.lstrip().startswith("#")
+        for line in raw_config_text.splitlines()
+    ):
+        return True
+    config = read_raw_config()
+    if not config:
+        if raw_config_text.strip() in {"{}", "---", "---\n{}"}:
+            return True
+        logger.warning("OAuth refresh ownership unavailable; refusing runtime refresh")
+        return False
+    if "oauth" not in config:
+        return True
+    oauth_config = config.get("oauth")
+    if not isinstance(oauth_config, dict):
+        logger.warning("OAuth refresh ownership is invalid; refusing runtime refresh")
+        return False
+    refresh_owner = oauth_config.get("refresh_owner")
+    if refresh_owner == "runtime":
+        return True
+    if refresh_owner == "external":
+        return False
+    logger.warning("OAuth refresh owner must be runtime or external; refusing runtime refresh")
+    return False
+
 # Nous Portal defaults
 DEFAULT_NOUS_PORTAL_URL = "https://portal.nousresearch.com"
 DEFAULT_NOUS_INFERENCE_URL = "https://inference-api.nousresearch.com/v1"
@@ -1366,11 +1409,90 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     return list(global_entries) if isinstance(global_entries, list) else []
 
 
+def _parse_persisted_timestamp(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        numeric_value = float(value)
+        return numeric_value / 1000.0 if numeric_value > 1_000_000_000_000 else numeric_value
+    if isinstance(value, str) and value.strip():
+        try:
+            numeric_value = float(value)
+            return numeric_value / 1000.0 if numeric_value > 1_000_000_000_000 else numeric_value
+        except ValueError:
+            try:
+                return datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                return None
+    return None
+
+
+def _persisted_pool_entry_is_usable(entry: Dict[str, Any]) -> bool:
+    last_status = entry.get("last_status")
+    if last_status == "dead":
+        return False
+    if last_status != "exhausted":
+        return True
+    reset_timestamp = _parse_persisted_timestamp(entry.get("last_error_reset_at"))
+    if reset_timestamp is not None:
+        return time.time() >= reset_timestamp
+    status_timestamp = _parse_persisted_timestamp(entry.get("last_status_at"))
+    if status_timestamp is None:
+        return True
+    error_code = entry.get("last_error_code")
+    cooldown_seconds = 300 if error_code == 401 else 3600
+    return time.time() >= status_timestamp + cooldown_seconds
+
+
+def _selected_usable_oauth_pool_entry(
+    provider_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read the scheduler-owned, lowest-priority usable OAuth pool entry."""
+    entries = read_credential_pool(provider_id)
+    if not isinstance(entries, list) or not entries:
+        return None
+    indexed_entries = [
+        (index, entry)
+        for index, entry in enumerate(entries)
+        if isinstance(entry, dict)
+        and _persisted_pool_entry_is_usable(entry)
+    ]
+    if not indexed_entries:
+        return None
+
+    def selection_key(indexed_entry: Tuple[int, Dict[str, Any]]) -> Tuple[int, int]:
+        index, entry = indexed_entry
+        priority = entry.get("priority", 0)
+        return (priority if isinstance(priority, int) else 0, index)
+
+    _, selected_entry = min(indexed_entries, key=selection_key)
+    return selected_entry
+
+
+def _selected_oauth_pool_tokens(provider_id: str) -> Optional[Dict[str, Any]]:
+    selected_entry = _selected_usable_oauth_pool_entry(provider_id)
+    if selected_entry is None:
+        return None
+    access_token = selected_entry.get("access_token")
+    refresh_token = selected_entry.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        return None
+    return {
+        "access_token": access_token.strip(),
+        "refresh_token": refresh_token.strip(),
+        "last_refresh": selected_entry.get("last_refresh"),
+    }
+
+
 def write_credential_pool(
     provider_id: str,
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    oauth_token_write_authority: Optional[str] = None,
+    authorized_oauth_entry_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1400,6 +1522,52 @@ def write_credential_pool(
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
+        if (
+            oauth_token_write_authority != "external-scheduler"
+            and not runtime_owns_oauth_refresh(provider_id)
+        ):
+            authorized_entry_ids = {
+                entry_id
+                for entry_id in (authorized_oauth_entry_ids or ())
+                if entry_id
+            }
+            existing_by_id = {
+                disk_entry.get("id"): disk_entry
+                for disk_entry in existing_list
+                if isinstance(disk_entry, dict) and disk_entry.get("id")
+            }
+            token_fields = (
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "expires_at_ms",
+                "expires_in",
+                "token_type",
+                "last_refresh",
+            )
+            protected_entries: List[Dict[str, Any]] = []
+            for incoming_entry in sanitized_entries:
+                if not isinstance(incoming_entry, dict):
+                    continue
+                disk_entry = existing_by_id.get(incoming_entry.get("id"))
+                if not isinstance(disk_entry, dict):
+                    if (
+                        incoming_entry.get("auth_type") == "oauth"
+                        or incoming_entry.get("refresh_token")
+                    ):
+                        if (
+                            oauth_token_write_authority == "interactive-login"
+                            and incoming_entry.get("id") in authorized_entry_ids
+                        ):
+                            protected_entries.append(incoming_entry)
+                        continue
+                    protected_entries.append(incoming_entry)
+                    continue
+                for token_field in token_fields:
+                    if token_field in disk_entry:
+                        incoming_entry[token_field] = disk_entry[token_field]
+                protected_entries.append(incoming_entry)
+            sanitized_entries = protected_entries
         new_ids = {
             entry.get("id")
             for entry in sanitized_entries
@@ -3331,10 +3499,10 @@ def _sync_codex_pool_entries(
     if not access_token:
         return
     refresh_token = tokens.get("refresh_token")
-    pool = auth_store.get("credential_pool")
+    pool = auth_store.setdefault("credential_pool", {})
     if not isinstance(pool, dict):
         return
-    entries = pool.get("openai-codex")
+    entries = pool.setdefault("openai-codex", [])
     if not isinstance(entries, list):
         return
     # Previous singleton access_token (before this re-auth overwrote it) —
@@ -3345,6 +3513,7 @@ def _sync_codex_pool_entries(
     prev_at = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+    updated_existing_entry = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -3377,6 +3546,19 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+        updated_existing_entry = True
+    if not updated_existing_entry and not runtime_owns_oauth_refresh("openai-codex"):
+        entries.append({
+            "id": uuid.uuid4().hex[:6],
+            "label": "OpenAI Codex",
+            "auth_type": "oauth",
+            "priority": len(entries),
+            "source": "device_code",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "last_refresh": last_refresh,
+            "base_url": DEFAULT_CODEX_BASE_URL,
+        })
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
@@ -3652,23 +3834,49 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    runtime_refresh_allowed = runtime_owns_oauth_refresh("openai-codex")
+    externally_managed_tokens = (
+        None if runtime_refresh_allowed else _selected_oauth_pool_tokens("openai-codex")
+    )
+    if not runtime_refresh_allowed and not externally_managed_tokens:
+        raise AuthError(
+            "Codex has no usable scheduler-owned OAuth credential.",
+            provider="openai-codex",
+            code="codex_external_pool_unavailable",
+            relogin_required=False,
+        )
     read_error: Optional[AuthError] = None
-    try:
-        data = _read_codex_tokens()
-    except AuthError as exc:
-        read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+    if externally_managed_tokens:
+        data = {
+            "tokens": externally_managed_tokens,
+            "last_refresh": externally_managed_tokens.get("last_refresh"),
+        }
+    else:
+        try:
+            data = _read_codex_tokens()
+        except AuthError as exc:
+            read_error = exc
+            if (
+                runtime_refresh_allowed
+                and getattr(exc, "relogin_required", False)
+                and getattr(exc, "code", None) in {
+                    "codex_auth_missing_access_token",
+                    "codex_auth_missing_refresh_token",
+                    "codex_auth_invalid_shape",
+                }
+            ):
+                imported = _recover_codex_tokens_from_cli(
+                    str(getattr(exc, "code", None) or "auth_error")
+                )
+                if imported:
+                    data = {
+                        "tokens": imported,
+                        "last_refresh": imported.get("last_refresh"),
+                    }
+                else:
+                    data = None
             else:
                 data = None
-        else:
-            data = None
 
     if data is None:
         pool_token = _pool_codex_access_token()
@@ -3718,9 +3926,11 @@ def resolve_codex_runtime_credentials(
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
 
-    should_refresh = bool(force_refresh)
+    should_refresh = runtime_refresh_allowed and bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:
-        should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+        should_refresh = runtime_refresh_allowed and _codex_access_token_is_expiring(
+            access_token, refresh_skew_seconds
+        )
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
@@ -3728,9 +3938,11 @@ def resolve_codex_runtime_credentials(
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
 
-            should_refresh = bool(force_refresh)
+            should_refresh = runtime_refresh_allowed and bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+                should_refresh = runtime_refresh_allowed and _codex_access_token_is_expiring(
+                    access_token, refresh_skew_seconds
+                )
 
             if should_refresh:
                 tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
@@ -3885,13 +4097,26 @@ def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str
         else None
     )
     if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
+        usable_entries = [
+            (index, entry)
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and _persisted_pool_entry_is_usable(entry)
+            and str(entry.get("access_token", "") or "").strip()
+            and str(entry.get("refresh_token", "") or "").strip()
+        ]
+        if usable_entries:
+            _, entry = min(
+                usable_entries,
+                key=lambda indexed_entry: (
+                    indexed_entry[1].get("priority", 0)
+                    if isinstance(indexed_entry[1].get("priority", 0), int)
+                    else 0,
+                    indexed_entry[0],
+                ),
+            )
             access_token = str(entry.get("access_token", "") or "").strip()
             refresh_token = str(entry.get("refresh_token", "") or "").strip()
-            if not access_token or not refresh_token:
-                continue
             merged = dict(state or {})
             merged["tokens"] = {
                 "access_token": access_token,
@@ -4039,6 +4264,9 @@ def _save_xai_oauth_tokens(
         # to root too, or root is left holding a revoked refresh token (#43589).
         write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
         state = _load_provider_state(auth_store, "xai-oauth") or {}
+        previous_singleton_tokens = (
+            state.get("tokens") if isinstance(state.get("tokens"), dict) else None
+        )
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4047,9 +4275,78 @@ def _save_xai_oauth_tokens(
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
         _save_provider_state(auth_store, "xai-oauth", state)
+        _sync_xai_oauth_pool_entries(
+            auth_store,
+            tokens,
+            last_refresh,
+            previous_singleton_tokens=previous_singleton_tokens,
+        )
         _save_auth_store(auth_store)
         if write_through_to_root:
             _write_through_xai_oauth_to_global_root(state)
+
+
+def _sync_xai_oauth_pool_entries(
+    auth_store: Dict[str, Any],
+    tokens: Dict[str, Any],
+    last_refresh: Optional[str],
+    *,
+    previous_singleton_tokens: Optional[Dict[str, Any]],
+) -> None:
+    """Commit an interactive/singleton xAI login into its pool authority."""
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token:
+        return
+    credential_pool = auth_store.setdefault("credential_pool", {})
+    if not isinstance(credential_pool, dict):
+        return
+    provider_entries = credential_pool.setdefault("xai-oauth", [])
+    if not isinstance(provider_entries, list):
+        return
+    previous_access_token = (
+        previous_singleton_tokens.get("access_token")
+        if isinstance(previous_singleton_tokens, dict)
+        else None
+    )
+    updated_existing_entry = False
+    for provider_entry in provider_entries:
+        if not isinstance(provider_entry, dict):
+            continue
+        entry_source = provider_entry.get("source")
+        singleton_alias = entry_source == "device_code" or (
+            entry_source == "manual:device_code"
+            and previous_access_token
+            and provider_entry.get("access_token") == previous_access_token
+        )
+        if not singleton_alias:
+            continue
+        provider_entry["access_token"] = access_token
+        if isinstance(refresh_token, str) and refresh_token:
+            provider_entry["refresh_token"] = refresh_token
+        provider_entry["last_refresh"] = last_refresh
+        for status_field in (
+            "last_status",
+            "last_status_at",
+            "last_error_code",
+            "last_error_reason",
+            "last_error_message",
+            "last_error_reset_at",
+        ):
+            provider_entry[status_field] = None
+        updated_existing_entry = True
+    if not updated_existing_entry and not runtime_owns_oauth_refresh("xai-oauth"):
+        provider_entries.append({
+            "id": uuid.uuid4().hex[:6],
+            "label": "xAI OAuth",
+            "auth_type": "oauth",
+            "priority": len(provider_entries),
+            "source": "device_code",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "last_refresh": last_refresh,
+            "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+        })
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -4394,8 +4691,29 @@ def resolve_xai_oauth_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
-    data = _read_xai_oauth_tokens()
-    tokens = dict(data["tokens"])
+    runtime_refresh_allowed = runtime_owns_oauth_refresh("xai-oauth")
+    externally_managed_tokens = (
+        None if runtime_refresh_allowed else _selected_oauth_pool_tokens("xai-oauth")
+    )
+    if not runtime_refresh_allowed and not externally_managed_tokens:
+        raise AuthError(
+            "xAI has no usable scheduler-owned OAuth credential.",
+            provider="xai-oauth",
+            code="xai_external_pool_unavailable",
+            relogin_required=False,
+        )
+    if externally_managed_tokens:
+        try:
+            data = _read_xai_oauth_tokens()
+        except AuthError:
+            data = {"tokens": {}}
+        tokens = dict(data.get("tokens") or {})
+        tokens.update(externally_managed_tokens)
+        data["tokens"] = tokens
+        data["last_refresh"] = externally_managed_tokens.get("last_refresh")
+    else:
+        data = _read_xai_oauth_tokens()
+        tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
     discovery = dict(data.get("discovery") or {})
@@ -4407,9 +4725,11 @@ def resolve_xai_oauth_runtime_credentials(
         if refresh_skew_seconds is not None
         else _xai_proactive_refresh_skew_seconds(access_token)
     )
-    should_refresh = bool(force_refresh)
+    should_refresh = runtime_refresh_allowed and bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:
-        should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
+        should_refresh = runtime_refresh_allowed and _xai_access_token_is_expiring(
+            access_token, effective_skew
+        )
     if should_refresh:
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
@@ -4423,9 +4743,11 @@ def resolve_xai_oauth_runtime_credentials(
                 if refresh_skew_seconds is not None
                 else _xai_proactive_refresh_skew_seconds(access_token)
             )
-            should_refresh = bool(force_refresh)
+            should_refresh = runtime_refresh_allowed and bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
+                should_refresh = runtime_refresh_allowed and _xai_access_token_is_expiring(
+                    access_token, effective_skew
+                )
             if should_refresh:
                 if not token_endpoint:
                     token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]

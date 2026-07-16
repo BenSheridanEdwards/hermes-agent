@@ -123,6 +123,196 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     assert resolved["api_key"] == "access-forced"
 
 
+def test_resolve_codex_runtime_credentials_refuses_external_owner_refresh(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(
+        hermes_home,
+        access_token="access-current",
+        refresh_token="refresh-owned-by-scheduler",
+    )
+    (hermes_home / "config.yaml").write_text(
+        "oauth:\n  refresh_owner: external\n"
+    )
+    auth_payload = json.loads((hermes_home / "auth.json").read_text())
+    auth_payload["credential_pool"] = {
+        "openai-codex": [{
+            "id": "scheduler-selected",
+            "priority": 0,
+            "auth_type": "oauth",
+            "access_token": "access-from-scheduler",
+            "refresh_token": "refresh-rotated-by-scheduler",
+        }]
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_payload))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _refresh_must_not_run(*_args, **_kwargs):
+        raise AssertionError("runtime must not rotate externally managed OAuth")
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._refresh_codex_auth_tokens", _refresh_must_not_run
+    )
+
+    resolved = resolve_codex_runtime_credentials(
+        force_refresh=True, refresh_if_expiring=False
+    )
+    assert resolved["api_key"] == "access-from-scheduler"
+
+
+@pytest.mark.parametrize(
+    ("config_text", "runtime_owns_refresh"),
+    [
+        ("model: openrouter/test\n", True),
+        ("", True),
+        ("oauth:\n  refresh_owner: runtime\n", True),
+        ("oauth:\n  refresh_owner: external\n", False),
+        ("oauth:\n  refresh_owner: typo\n", False),
+        ("oauth: invalid\n", False),
+        ("oauth: [unterminated\n", False),
+    ],
+)
+def test_oauth_refresh_ownership_defaults_compatibly_but_fails_closed_when_explicit(
+    tmp_path, monkeypatch, config_text, runtime_owns_refresh
+):
+    from hermes_cli.auth import runtime_owns_oauth_refresh
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(config_text)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert runtime_owns_oauth_refresh("openai-codex") is runtime_owns_refresh
+    assert runtime_owns_oauth_refresh("xai-oauth") is runtime_owns_refresh
+    assert runtime_owns_oauth_refresh("anthropic") is True
+
+
+def test_external_refresh_owner_blocks_and_adopts_codex_pool_rotation(
+    tmp_path, monkeypatch
+):
+    from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
+
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(
+        hermes_home,
+        access_token="singleton-old",
+        refresh_token="singleton-refresh-old",
+    )
+    (hermes_home / "config.yaml").write_text(
+        "oauth:\n  refresh_owner: external\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _refresh_must_not_run(*_args, **_kwargs):
+        raise AssertionError("runtime must not rotate externally managed OAuth")
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure", _refresh_must_not_run
+    )
+
+    expiring_access = _jwt_with_exp(int(time.time()) - 10)
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="codex-selected",
+        label="test",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=-1,
+        source="manual:codex",
+        access_token=expiring_access,
+        refresh_token="refresh-old",
+        base_url=DEFAULT_CODEX_BASE_URL,
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    pool._persist(oauth_token_write_authority="external-scheduler")
+
+    assert pool._entry_needs_refresh(entry) is False
+    assert pool.select() is not None
+
+    auth_payload = json.loads((hermes_home / "auth.json").read_text())
+    scheduler_entry = next(
+        pool_entry
+        for pool_entry in auth_payload["credential_pool"]["openai-codex"]
+        if pool_entry["id"] == "codex-selected"
+    )
+    scheduler_entry["access_token"] = "access-from-scheduler"
+    scheduler_entry["refresh_token"] = "refresh-from-scheduler"
+    (hermes_home / "auth.json").write_text(json.dumps(auth_payload))
+
+    adopted = pool.try_refresh_current()
+    assert adopted is not None
+    assert adopted.access_token == "access-from-scheduler"
+    assert adopted.refresh_token == "refresh-from-scheduler"
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted_entry = next(
+        pool_entry
+        for pool_entry in persisted["credential_pool"]["openai-codex"]
+        if pool_entry["id"] == "codex-selected"
+    )
+    assert persisted_entry["refresh_token"] == "refresh-from-scheduler"
+
+
+def test_interactive_add_preserves_existing_scheduler_rotated_entry(
+    tmp_path, monkeypatch
+):
+    from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "auth.json").write_text(
+        json.dumps({"version": 1, "providers": {}})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "oauth:\n  refresh_owner: external\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    existing_entry = PooledCredential(
+        provider="openai-codex",
+        id="existing",
+        label="existing",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:existing",
+        access_token="access-old",
+        refresh_token="refresh-old",
+        base_url=DEFAULT_CODEX_BASE_URL,
+    )
+    pool = CredentialPool("openai-codex", [existing_entry])
+    pool._persist(oauth_token_write_authority="external-scheduler")
+
+    auth_payload = json.loads((hermes_home / "auth.json").read_text())
+    scheduler_entry = auth_payload["credential_pool"]["openai-codex"][0]
+    scheduler_entry["access_token"] = "access-from-scheduler"
+    scheduler_entry["refresh_token"] = "refresh-from-scheduler"
+    (hermes_home / "auth.json").write_text(json.dumps(auth_payload))
+
+    new_entry = PooledCredential(
+        provider="openai-codex",
+        id="new-login",
+        label="new login",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=1,
+        source="manual:device_code",
+        access_token="access-new-login",
+        refresh_token="refresh-new-login",
+        base_url=DEFAULT_CODEX_BASE_URL,
+    )
+    pool.add_entry(
+        new_entry,
+        oauth_token_write_authority="interactive-login",
+    )
+
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted_by_id = {
+        entry["id"]: entry
+        for entry in persisted["credential_pool"]["openai-codex"]
+    }
+    assert persisted_by_id["existing"]["access_token"] == "access-from-scheduler"
+    assert persisted_by_id["existing"]["refresh_token"] == "refresh-from-scheduler"
+    assert persisted_by_id["new-login"]["access_token"] == "access-new-login"
+
+
 def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_empty(tmp_path, monkeypatch):
     """Regression for #32992 — chat path returns 401 when singleton is empty but pool has creds.
 
@@ -1093,3 +1283,26 @@ def test_device_code_login_non_429_error_unchanged(monkeypatch):
         auth_mod._codex_device_code_login()
 
     assert exc_info.value.code == "device_code_request_error"
+
+
+def test_external_codex_owner_rejects_stale_singleton_when_pool_is_cooling(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(
+        hermes_home, access_token="stale-singleton", refresh_token="stale-refresh"
+    )
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    payload["credential_pool"] = {"openai-codex": [{
+        "id": "cooling", "priority": 0, "auth_type": "oauth",
+        "last_status": "exhausted", "last_error_reset_at": time.time() + 3600,
+        "access_token": "cooling-access", "refresh_token": "cooling-refresh",
+    }]}
+    (hermes_home / "auth.json").write_text(json.dumps(payload))
+    (hermes_home / "config.yaml").write_text("oauth:\n  refresh_owner: external\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert exc_info.value.code == "codex_external_pool_unavailable"

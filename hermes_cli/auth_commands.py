@@ -217,7 +217,7 @@ def auth_add_command(args) -> None:
             access_token=token,
             base_url=_provider_base_url(provider),
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
         print(f'Added {provider} credential #{len(pool.entries())}: "{label}"')
         return
 
@@ -243,7 +243,7 @@ def auth_add_command(args) -> None:
             expires_at_ms=creds.get("expires_at_ms"),
             base_url=_provider_base_url(provider),
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
@@ -335,7 +335,7 @@ def auth_add_command(args) -> None:
             last_refresh=creds.get("last_refresh"),
         )
         first_credential = not pool.entries()
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
         # Adding the first Codex credential should make it the active provider
         # (the old singleton save path did this implicitly via
         # _save_provider_state). Subsequent adds leave the active provider as-is.
@@ -381,7 +381,7 @@ def auth_add_command(args) -> None:
             access_token=creds["api_key"],
             base_url=creds.get("base_url"),
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
@@ -405,7 +405,7 @@ def auth_add_command(args) -> None:
             refresh_token=creds.get("refresh_token"),
             base_url=creds.get("inference_base_url"),
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 

@@ -978,6 +978,11 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    "oauth": {
+        # Runtime-owned preserves standalone Hermes behavior. Managed fleets
+        # can set "external" so one scheduler is the sole refresh-token writer.
+        "refresh_owner": "runtime",
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.

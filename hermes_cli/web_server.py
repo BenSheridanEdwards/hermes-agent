@@ -8836,7 +8836,7 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
             refresh_token=refresh_token,
             expires_at_ms=expires_at_ms,
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
 
@@ -11766,7 +11766,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
             source=SOURCE_MANUAL,
             access_token=api_key,
         )
-        pool.add_entry(entry)
+        pool.add_entry(entry, oauth_token_write_authority="interactive-login")
     except Exception as exc:
         _log.exception("POST /api/credentials/pool failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
