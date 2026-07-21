@@ -97,6 +97,7 @@ def test_generate_xai_tts_sends_auxiliary_rewriter_output_to_api(
 
     class FakeResponse:
         content = b"mp3"
+        status_code = 200
 
         def raise_for_status(self):
             pass

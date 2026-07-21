@@ -35,10 +35,12 @@ from agent.image_gen_provider import (
     success_response,
 )
 from tools.xai_http import (
+    XAI_AUTH_REJECTION_STATUSES,
     build_xai_storage_options,
     hermes_xai_user_agent,
     maybe_mark_xai_storage_notice_seen,
     read_xai_imagine_storage_config,
+    refresh_rejected_oauth_bearer,
     resolve_xai_http_credentials,
     xai_storage_notice_text,
 )
@@ -319,7 +321,7 @@ class XAIImageGenProvider(ImageGenProvider):
                 payload["image"] = image_fields[0]
             else:
                 payload["images"] = image_fields
-            endpoint_url = f"{base_url}/images/edits"
+            endpoint_path = "images/edits"
             model_id = edit_model
         else:
             payload = {
@@ -328,17 +330,32 @@ class XAIImageGenProvider(ImageGenProvider):
                 "aspect_ratio": xai_ar,
                 "resolution": xai_res,
             }
-            endpoint_url = f"{base_url}/images/generations"
+            endpoint_path = "images/generations"
         if storage_options is not None:
             payload["storage_options"] = storage_options
 
-        try:
-            response = requests.post(
-                endpoint_url,
-                headers=headers,
+        def _post_image_request(bearer: str, endpoint_base_url: str) -> "requests.Response":
+            return requests.post(
+                f"{endpoint_base_url}/{endpoint_path}",
+                headers={**headers, "Authorization": f"Bearer {bearer}"},
                 json=payload,
                 timeout=120,
             )
+
+        try:
+            response = _post_image_request(api_key, base_url)
+            if response.status_code in XAI_AUTH_REJECTION_STATUSES:
+                refreshed = refresh_rejected_oauth_bearer(
+                    status_code=response.status_code,
+                    provider=provider_name,
+                    rejected_bearer=api_key,
+                    context="xAI image generation",
+                )
+                if refreshed:
+                    response = _post_image_request(
+                        str(refreshed.get("api_key") or "").strip(),
+                        str(refreshed.get("base_url") or base_url).strip().rstrip("/"),
+                    )
             response.raise_for_status()
         except requests.HTTPError as exc:
             response = exc.response

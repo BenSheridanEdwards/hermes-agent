@@ -76,7 +76,11 @@ from tools.tool_backend_helpers import (
     prefers_gateway,
     resolve_openai_audio_api_key,
 )
-from tools.xai_http import hermes_xai_user_agent
+from tools.xai_http import (
+    XAI_AUTH_REJECTION_STATUSES,
+    hermes_xai_user_agent,
+    refresh_rejected_oauth_bearer,
+)
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- providers are imported only when actually used to avoid
@@ -1397,16 +1401,37 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     ):
         payload["optimize_streaming_latency"] = optimize_streaming_latency
 
-    response = requests.post(
-        f"{base_url}/tts",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": hermes_xai_user_agent(),
-        },
-        json=payload,
-        timeout=60,
-    )
+    def _post_tts(bearer: str, endpoint_base_url: str) -> "requests.Response":
+        return requests.post(
+            f"{endpoint_base_url}/tts",
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json",
+                "User-Agent": hermes_xai_user_agent(),
+            },
+            json=payload,
+            timeout=60,
+        )
+
+    response = _post_tts(api_key, base_url)
+    if response.status_code in XAI_AUTH_REJECTION_STATUSES:
+        refreshed = refresh_rejected_oauth_bearer(
+            status_code=response.status_code,
+            provider=str(creds.get("provider") or ""),
+            rejected_bearer=api_key,
+            context="xAI TTS",
+        )
+        if refreshed:
+            refreshed_base_url = str(
+                xai_config.get("base_url")
+                or refreshed.get("base_url")
+                or get_env_value("XAI_BASE_URL")
+                or DEFAULT_XAI_BASE_URL
+            ).strip().rstrip("/")
+            response = _post_tts(
+                str(refreshed.get("api_key") or "").strip(),
+                refreshed_base_url,
+            )
     response.raise_for_status()
 
     with open(output_path, "wb") as f:

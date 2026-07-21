@@ -768,3 +768,80 @@ def test_x_search_not_degraded_when_no_filters_active(monkeypatch):
     assert result["degraded"] is False
     assert result["degraded_reason"] is None
 
+
+
+# ---------------------------------------------------------------------------
+# OAuth stale-bearer refresh-and-retry (shared policy in tools.xai_http)
+# ---------------------------------------------------------------------------
+
+def test_x_search_retries_auth_rejection_with_refreshed_oauth_credentials(monkeypatch):
+    """A 403 on a stale pool bearer must refresh once and succeed.
+
+    Mirrors the live STT incident: a healthy account exists in the OAuth
+    pool but the selected bearer is stale. The retry feeds the rejected
+    bearer back into the shared resolver and repeats the request once.
+    """
+    from tools.x_search_tool import x_search_tool
+
+    _no_xai_env(monkeypatch)
+
+    resolver_calls = []
+
+    def _fake_resolve(*, force_refresh=False, api_key_hint=None):
+        resolver_calls.append({"force_refresh": force_refresh, "api_key_hint": api_key_hint})
+        if force_refresh:
+            return {
+                "provider": "xai-oauth",
+                "api_key": "fresh-oauth-token",
+                "base_url": "https://api.x.ai/v1",
+            }
+        return {
+            "provider": "xai-oauth",
+            "api_key": "stale-oauth-token",
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    # The initial resolve goes through the tools.x_search_tool import binding;
+    # the forced refresh goes through the shared helper inside tools.xai_http.
+    monkeypatch.setattr("tools.x_search_tool.resolve_xai_http_credentials", _fake_resolve)
+    monkeypatch.setattr("tools.xai_http.resolve_xai_http_credentials", _fake_resolve)
+
+    bearers = []
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        bearers.append(headers["Authorization"])
+        if len(bearers) == 1:
+            return _FakeResponse({"error": "OAuth2 access token could not be validated"}, status_code=403)
+        return _FakeResponse({"output_text": "posts found after refresh"})
+
+    monkeypatch.setattr("requests.post", _fake_post)
+
+    result = json.loads(x_search_tool(query="anything about xai"))
+
+    assert result["success"] is True
+    assert result["answer"] == "posts found after refresh"
+    assert bearers == ["Bearer stale-oauth-token", "Bearer fresh-oauth-token"]
+    assert resolver_calls == [
+        {"force_refresh": False, "api_key_hint": None},
+        {"force_refresh": True, "api_key_hint": "stale-oauth-token"},
+    ]
+
+
+def test_x_search_auth_rejection_on_api_key_path_does_not_retry(monkeypatch):
+    """Env-var credentials can't be refreshed — one request, structured error."""
+    from tools.x_search_tool import x_search_tool
+
+    monkeypatch.setenv("XAI_API_KEY", "static-env-key")
+
+    posts = []
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        posts.append(headers["Authorization"])
+        return _FakeResponse({"error": "unauthorized"}, status_code=401)
+
+    monkeypatch.setattr("requests.post", _fake_post)
+
+    result = json.loads(x_search_tool(query="anything"))
+
+    assert result["success"] is False
+    assert posts == ["Bearer static-env-key"]

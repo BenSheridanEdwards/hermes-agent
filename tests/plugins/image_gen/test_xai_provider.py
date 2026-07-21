@@ -539,3 +539,105 @@ class TestXAIImageFieldReadGuard:
 
         assert _xai_image_field("https://example.com/pic.png")["url"] == "https://example.com/pic.png"
         assert _xai_image_field("data:image/png;base64,eHl6")["url"].startswith("data:image/png")
+
+
+# ---------------------------------------------------------------------------
+# OAuth stale-bearer refresh-and-retry (shared policy in tools.xai_http)
+# ---------------------------------------------------------------------------
+
+
+class TestXAIOAuthRetry:
+    @pytest.mark.parametrize("rejected_status", [401, 403])
+    def test_auth_rejection_refreshes_oauth_and_retries(
+        self, monkeypatch, rejected_status
+    ):
+        """A stale pool bearer must trigger one refresh-and-retry.
+
+        Mirrors the live STT incident: a healthy account exists in the
+        OAuth pool but the selected bearer is stale, so the endpoint
+        rejects the first request.
+        """
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+        resolver_calls = []
+
+        def fake_resolve(*, force_refresh=False, api_key_hint=None):
+            resolver_calls.append(
+                {"force_refresh": force_refresh, "api_key_hint": api_key_hint}
+            )
+            if force_refresh:
+                return {
+                    "provider": "xai-oauth",
+                    "api_key": "fresh-oauth-token",
+                    "base_url": "https://api.x.ai/v1",
+                }
+            return {
+                "provider": "xai-oauth",
+                "api_key": "stale-oauth-token",
+                "base_url": "https://api.x.ai/v1",
+            }
+
+        rejected = MagicMock()
+        rejected.status_code = rejected_status
+        accepted = MagicMock()
+        accepted.status_code = 200
+        accepted.raise_for_status = MagicMock()
+        accepted.json.return_value = {
+            "data": [{"b64_json": "dGVzdC1pbWFnZS1kYXRh"}],
+        }
+
+        bearers = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            bearers.append(headers["Authorization"])
+            return rejected if len(bearers) == 1 else accepted
+
+        # The initial resolve goes through the plugin's import binding; the
+        # forced refresh goes through the shared helper inside tools.xai_http.
+        with patch(
+            "plugins.image_gen.xai.resolve_xai_http_credentials",
+            side_effect=fake_resolve,
+        ), patch(
+            "tools.xai_http.resolve_xai_http_credentials",
+            side_effect=fake_resolve,
+        ), patch(
+            "plugins.image_gen.xai.requests.post", side_effect=fake_post
+        ), patch(
+            "plugins.image_gen.xai.save_b64_image", return_value="/tmp/test.png"
+        ):
+            provider = XAIImageGenProvider()
+            result = provider.generate(prompt="A cat playing piano")
+
+        assert result["success"] is True
+        assert bearers == ["Bearer stale-oauth-token", "Bearer fresh-oauth-token"]
+        assert resolver_calls == [
+            {"force_refresh": False, "api_key_hint": None},
+            {"force_refresh": True, "api_key_hint": "stale-oauth-token"},
+        ]
+
+    def test_auth_rejection_on_static_key_does_not_retry(self, monkeypatch):
+        """Env-var credentials can't be refreshed — one request, api_error."""
+        import requests as req_lib
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        rejected = MagicMock()
+        rejected.status_code = 401
+        rejected.text = "Unauthorized"
+        rejected.json.return_value = {"error": {"message": "Invalid API key"}}
+        rejected.raise_for_status.side_effect = req_lib.HTTPError(response=rejected)
+
+        posts = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            posts.append(headers["Authorization"])
+            return rejected
+
+        with patch("plugins.image_gen.xai.requests.post", side_effect=fake_post):
+            provider = XAIImageGenProvider()
+            result = provider.generate(prompt="test")
+
+        assert result["success"] is False
+        assert result["error_type"] == "api_error"
+        assert posts == ["Bearer test-key-12345"]

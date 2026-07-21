@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _creds(api_key: str = "xai-test-key", base_url: str = "https://api.x.ai/v1") -> dict:
     return {"provider": "xai", "api_key": api_key, "base_url": base_url}
@@ -492,20 +494,26 @@ class TestXAIProviderSearchErrors:
         assert result["success"] is False
         assert "JSON" in result["error"]
 
-    def test_401_on_oauth_path_triggers_force_refresh_and_retry(self):
-        """OAuth credentials → 401 must force-refresh and retry once.
+    @pytest.mark.parametrize("rejected_status", [401, 403])
+    def test_auth_rejection_on_oauth_path_triggers_force_refresh_and_retry(
+        self, rejected_status
+    ):
+        """OAuth credentials → 401/403 must force-refresh and retry once.
 
-        Closes the two-gap scenario the resolver's JWT-exp shortcut doesn't
-        cover: opaque (non-JWT) tokens and mid-window revocation. We expect
-        ``httpx.post`` to be called twice with two different Bearer tokens.
+        Closes the gap scenarios the resolver's JWT-exp shortcut doesn't
+        cover: opaque (non-JWT) tokens, mid-window revocation, and a stale
+        selected pool bearer rejected with 403. We expect ``httpx.post`` to
+        be called twice with two different Bearer tokens.
         """
         import httpx
         from plugins.web.xai import provider as xai_provider
 
         bad = MagicMock()
-        bad.status_code = 401
+        bad.status_code = rejected_status
         bad.text = "Unauthorized"
-        unauthorized = httpx.HTTPStatusError("401", request=MagicMock(), response=bad)
+        unauthorized = httpx.HTTPStatusError(
+            str(rejected_status), request=MagicMock(), response=bad
+        )
 
         calls = {"posts": [], "refresh_count": 0}
 
@@ -531,6 +539,7 @@ class TestXAIProviderSearchErrors:
             }
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
+             patch("tools.xai_http.resolve_xai_http_credentials", side_effect=fake_resolve), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
              patch("httpx.post", side_effect=fake_post):
             result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
@@ -562,6 +571,7 @@ class TestXAIProviderSearchErrors:
             return {"provider": "xai", "api_key": "«redacted:sk-…»", "base_url": "https://api.x.ai/v1"}
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
+             patch("tools.xai_http.resolve_xai_http_credentials", side_effect=fake_resolve), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
              patch("httpx.post", side_effect=fake_post):
             result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
@@ -599,6 +609,7 @@ class TestXAIProviderSearchErrors:
             }
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
+             patch("tools.xai_http.resolve_xai_http_credentials", side_effect=fake_resolve), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
              patch("httpx.post", side_effect=fake_post):
             result = xai_provider.XAIWebSearchProvider().search("q", limit=5)

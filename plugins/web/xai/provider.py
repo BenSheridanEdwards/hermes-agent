@@ -41,6 +41,7 @@ from agent.web_search_provider import WebSearchProvider
 from tools.xai_http import (
     has_xai_credentials,
     hermes_xai_user_agent,
+    refresh_rejected_oauth_bearer,
     resolve_xai_http_credentials,
 )
 
@@ -239,18 +240,22 @@ class XAIWebSearchProvider(WebSearchProvider):
             base_url, query, limit, model,
         )
 
-        # Two-attempt loop: if the first call returns 401 and our creds came
-        # from the OAuth path, force-refresh the token once and retry. This
-        # closes two gaps the proactive resolver check doesn't cover:
+        # Two-attempt loop: if the first call is rejected with 401/403 and
+        # our creds came from the OAuth path, force-refresh the token once
+        # and retry (shared policy in
+        # :func:`tools.xai_http.refresh_rejected_oauth_bearer`). This closes
+        # gaps the proactive resolver check doesn't cover:
         # (1) opaque (non-JWT) access tokens — `_xai_access_token_is_expiring`
         #     can't decode them and returns False, so refresh never fires
-        #     until the server hands us a 401.
+        #     until the server rejects the bearer.
         # (2) mid-window revocation — admin revoke, refresh-token rotation,
         #     or clock skew can produce 401s on a token whose JWT `exp` claim
         #     is still in the future.
+        # (3) a stale selected pool bearer rejected with 403 ("OAuth2 access
+        #     token could not be validated") while a healthy account exists
+        #     in the pool.
         # Env-var (`XAI_API_KEY`) credentials skip the retry entirely — we
         # can't refresh those and an immediate retry would just burn quota.
-        is_oauth_path = (creds.get("provider") == "xai-oauth")
         resp = None
         for attempt in range(2):
             try:
@@ -264,28 +269,20 @@ class XAIWebSearchProvider(WebSearchProvider):
                 break
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
-                if status == 401 and attempt == 0 and is_oauth_path:
-                    logger.info(
-                        "xAI web search got 401 on first attempt; forcing OAuth "
-                        "refresh and retrying once.",
+                if attempt == 0:
+                    refreshed = refresh_rejected_oauth_bearer(
+                        status_code=status,
+                        provider=str(creds.get("provider") or ""),
+                        rejected_bearer=api_key,
+                        context="xAI web search",
                     )
-                    try:
-                        refreshed = resolve_xai_http_credentials(
-                            force_refresh=True,
-                            api_key_hint=api_key,
-                        )
-                        refreshed_key = str(refreshed.get("api_key") or "").strip()
-                        if refreshed_key and refreshed_key != api_key:
-                            api_key = refreshed_key
-                            headers["Authorization"] = f"Bearer {api_key}"
-                            continue
-                        # Refresh returned the same (or empty) token — no point
-                        # in retrying. Fall through to the error return below.
-                    except Exception as refresh_exc:  # noqa: BLE001
-                        logger.warning(
-                            "xAI web search OAuth refresh after 401 failed: %s",
-                            refresh_exc,
-                        )
+                    if refreshed:
+                        api_key = str(refreshed.get("api_key") or "").strip()
+                        headers["Authorization"] = f"Bearer {api_key}"
+                        base_url = str(
+                            refreshed.get("base_url") or base_url
+                        ).strip().rstrip("/")
+                        continue
                 body = ""
                 try:
                     body = exc.response.text[:300] if exc.response is not None else ""

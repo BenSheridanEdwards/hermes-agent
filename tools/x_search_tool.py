@@ -51,7 +51,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from tools.registry import registry, tool_error
-from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
+from tools.xai_http import (
+    XAI_AUTH_REJECTION_STATUSES,
+    hermes_xai_user_agent,
+    refresh_rejected_oauth_bearer,
+    resolve_xai_http_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +357,11 @@ def x_search_tool(
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
         response: Optional[requests.Response] = None
-        for attempt in range(max_retries + 1):
+        # The OAuth retry lives outside the transient-attempt budget: a
+        # stale bearer costs one extra request total, never a 5xx attempt.
+        oauth_retried = False
+        attempt = 0
+        while True:
             try:
                 response = requests.post(
                     f"{base_url}/responses",
@@ -368,6 +377,20 @@ def x_search_tool(
                 break
             except requests.HTTPError as e:
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
+                if status_code in XAI_AUTH_REJECTION_STATUSES and not oauth_retried:
+                    refreshed = refresh_rejected_oauth_bearer(
+                        status_code=status_code,
+                        provider=source,
+                        rejected_bearer=api_key,
+                        context="x_search",
+                    )
+                    if refreshed:
+                        oauth_retried = True
+                        api_key = str(refreshed.get("api_key") or "").strip()
+                        base_url = str(
+                            refreshed.get("base_url") or base_url
+                        ).strip().rstrip("/")
+                        continue
                 if status_code is None or status_code < 500 or attempt >= max_retries:
                     raise
                 logger.warning(
@@ -377,6 +400,7 @@ def x_search_tool(
                     _http_error_message(e),
                 )
                 time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                attempt += 1
             except (requests.ReadTimeout, requests.ConnectionError) as e:
                 if attempt >= max_retries:
                     raise
@@ -387,6 +411,7 @@ def x_search_tool(
                     e,
                 )
                 time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                attempt += 1
 
         if response is None:
             raise RuntimeError("x_search request did not return a response")

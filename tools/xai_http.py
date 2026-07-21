@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import uuid
 from typing import Any, Dict, Optional
 
+logger = logging.getLogger(__name__)
 
 MAX_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 30 * 24 * 60 * 60
 SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 2 * 24 * 60 * 60
+
+# HTTP statuses xAI returns for a rejected bearer. 401 covers expired /
+# revoked tokens; 403 covers tokens the gateway refuses to validate
+# (observed live as "OAuth2 access token could not be validated").
+XAI_AUTH_REJECTION_STATUSES = frozenset({401, 403})
 
 
 def has_xai_credentials() -> bool:
@@ -308,3 +315,62 @@ def resolve_xai_http_credentials(
         "api_key": api_key,
         "base_url": base_url,
     }
+
+
+def refresh_rejected_oauth_bearer(
+    *,
+    status_code: int,
+    provider: str,
+    rejected_bearer: str,
+    context: str,
+) -> Optional[Dict[str, str]]:
+    """Return refreshed credentials after an auth rejection, or ``None``.
+
+    Shared one-shot retry policy for direct xAI HTTP consumers (STT, TTS,
+    web search, X search, image generation). When a bearer issued by the
+    OAuth pool is rejected with HTTP 401/403, feeding it back to
+    :func:`resolve_xai_http_credentials` lets the pool refresh the issuing
+    entry or rotate to the next healthy account — closing the live failure
+    where a freshly authorized account exists in the pool but requests keep
+    using the stale selected bearer.
+
+    Returns ``None`` whenever a retry is NOT warranted, so callers can write
+    ``if refreshed := refresh_rejected_oauth_bearer(...)`` and retry exactly
+    once with ``refreshed["api_key"]`` / ``refreshed["base_url"]``:
+
+    * ``status_code`` is not an authentication rejection (401/403);
+    * ``provider`` is not ``"xai-oauth"`` — a static ``XAI_API_KEY`` cannot
+      be refreshed and an immediate retry would just burn quota;
+    * the forced refresh raises (logged as a warning, never propagated);
+    * the resolver hands back the same or an empty bearer — retrying the
+      rejected token again is pointless.
+
+    ``context`` names the calling endpoint in log lines (e.g. ``"xAI STT"``).
+    """
+    if status_code not in XAI_AUTH_REJECTION_STATUSES:
+        return None
+    if provider != "xai-oauth":
+        return None
+    rejected_key = str(rejected_bearer or "").strip()
+    logger.info(
+        "%s got HTTP %d; refreshing xAI OAuth credentials and retrying once",
+        context,
+        status_code,
+    )
+    try:
+        refreshed = resolve_xai_http_credentials(
+            force_refresh=True,
+            api_key_hint=rejected_key,
+        )
+    except Exception as refresh_exc:
+        logger.warning(
+            "%s: xAI OAuth refresh after HTTP %d failed: %s",
+            context,
+            status_code,
+            refresh_exc,
+        )
+        return None
+    refreshed_key = str(refreshed.get("api_key") or "").strip()
+    if not refreshed_key or refreshed_key == rejected_key:
+        return None
+    return refreshed
