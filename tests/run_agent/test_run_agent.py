@@ -4107,6 +4107,46 @@ class TestHandleMaxIterations:
             for item in input_items
         )
 
+    def test_codex_summary_strips_tool_controls_when_tools_are_removed(self, agent):
+        """A text-only max-iteration summary must not send tool_choice without tools."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent._cached_system_prompt = "You are helpful."
+        captured = {}
+
+        def fake_build_api_kwargs(_messages):
+            return {
+                "model": "grok-4.5",
+                "input": [],
+                "tools": [{"type": "function", "name": "terminal"}],
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+            }
+
+        def fake_run_codex_stream(kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text="Summary")],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_build_api_kwargs", side_effect=fake_build_api_kwargs), \
+             patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 24
+            )
+
+        assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
+
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
             {
