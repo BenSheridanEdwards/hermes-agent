@@ -588,7 +588,9 @@ class CredentialPool:
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
-        self._lock = threading.Lock()
+        # Refresh persistence can re-enter the pool lock from status/update
+        # paths; use RLock to match the reviewed external-owner implementation.
+        self._lock = threading.RLock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log, used to
