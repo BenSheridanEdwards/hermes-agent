@@ -380,6 +380,39 @@ def test_auth_add_xai_oauth_sets_active_provider(tmp_path, monkeypatch):
     assert entry["base_url"] == "https://api.x.ai/v1"
 
 
+def test_auth_add_xai_oauth_rejects_unattended_no_browser_login(tmp_path, monkeypatch):
+    """Detached monitors cannot mint a live xAI device approval."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    login_called = False
+
+    def _unexpected_login(**kwargs):
+        nonlocal login_called
+        login_called = True
+        raise AssertionError("device login must not start")
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_oauth_device_code_login",
+        _unexpected_login,
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "xai-oauth"
+        auth_type = "oauth"
+        api_key = None
+        label = "Grok Subscription"
+        timeout = 3600
+        no_browser = True
+
+    with pytest.raises(SystemExit, match="Refusing unattended xAI device login"):
+        auth_add_command(_Args())
+
+    assert login_called is False
+
+
 def test_auth_add_xai_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch):
     """Two ``hermes auth add xai-oauth`` runs must produce independent pool entries.
 
