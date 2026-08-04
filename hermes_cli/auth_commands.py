@@ -167,6 +167,21 @@ def auth_add_command(args) -> None:
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
 
+    # A detached Fleet monitor must never mint an xAI device approval on a
+    # user's messaging channel.  The re-auth notifier launches this command
+    # with --no-browser and stdin=/dev/null; treating that shape as a normal
+    # interactive login caused orphan approvals to be generated repeatedly.
+    # Keep deliberate terminal-driven device login available, but fail closed
+    # for unattended callers before loading or mutating the credential pool.
+    if (
+        provider == "xai-oauth"
+        and bool(getattr(args, "no_browser", False))
+        and not sys.stdin.isatty()
+    ):
+        raise SystemExit(
+            "Refusing unattended xAI device login: run the command from an interactive terminal."
+        )
+
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
         requested_type = AUTH_TYPE_API_KEY
