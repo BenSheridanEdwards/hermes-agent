@@ -253,6 +253,21 @@ def auth_add_command(args) -> None:
     if configured_provider is not None:
         _migrate_legacy_custom_pool_key(provider, configured_provider["pool_key"])
 
+    # A detached Fleet monitor must never mint an xAI device approval on a
+    # user's messaging channel.  The re-auth notifier launches this command
+    # with --no-browser and stdin=/dev/null; treating that shape as a normal
+    # interactive login caused orphan approvals to be generated repeatedly.
+    # Keep deliberate terminal-driven device login available, but fail closed
+    # for unattended callers before loading or mutating the credential pool.
+    if (
+        provider == "xai-oauth"
+        and bool(getattr(args, "no_browser", False))
+        and not sys.stdin.isatty()
+    ):
+        raise SystemExit(
+            "Refusing unattended xAI device login: run the command from an interactive terminal."
+        )
+
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
         requested_type = AUTH_TYPE_API_KEY
