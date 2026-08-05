@@ -484,6 +484,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # guarded read must never crash the guard, so treat either as
         # "nothing to scan" (mirrors the resolve() ValueError guard below).
         return None, False
+    except ValueError:
+        # A pseudo-path with an embedded NUL byte (tokenized from binary
+        # content) — nothing readable to scan; must never crash the guard.
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
