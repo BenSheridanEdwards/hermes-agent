@@ -56,6 +56,7 @@ from agent.secret_sources._cache import (
     DiskCache,
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
+    resolve_cache_home,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
 from agent.secret_sources.base import get_source_environment
@@ -112,6 +113,17 @@ def _cache_key_str(cache_key: _CacheKey) -> str:
 _DISK_CACHE: DiskCache = DiskCache(
     _DISK_CACHE_BASENAME, key_serializer=_cache_key_str
 )
+
+
+def _shared_cache_home(_home_path: Optional[Path] = None) -> Path:
+    """Return the per-user cache shared by all Hermes profiles.
+
+    Profile homes are intentionally isolated for runtime state, but the
+    Bitwarden project fetch is identical across them.  Keeping this cache at
+    the user's common Hermes home lets concurrent profile startups coalesce a
+    single API request without sharing profile configuration or session data.
+    """
+    return Path.home() / ".hermes"
 
 
 def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
@@ -523,6 +535,13 @@ def fetch_bitwarden_secrets(
     from the fresh-cache TTL so operators can set ``cache_ttl_seconds: 0``
     while still keeping an encrypted break-glass cache for offline startup.
 
+    For the default plaintext cache, the disk layer is additionally shared
+    at ``~/.hermes/cache/bws_cache.json`` across profile homes and protected
+    by a cross-process lock, so concurrent profile startups coalesce into a
+    single Bitwarden API request instead of a burst.  A per-profile copy is
+    still maintained for isolated/non-standard installs; pass ``home_path``
+    so profile-local disk cache lookups find the right directory in tests.
+
     Raises :class:`RuntimeError` for fatal conditions (missing binary,
     auth failure, unparseable output).  Callers in the env_loader path
     catch this and emit a single warning; callers in the user-facing
@@ -534,7 +553,19 @@ def fetch_bitwarden_secrets(
         raise RuntimeError("Bitwarden project_id is empty")
 
     cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
-    if use_cache and cache_ttl_seconds > 0:
+    profile_cache_home = resolve_cache_home(home_path)
+    shared_cache_home = _shared_cache_home(home_path)
+    cache_enabled = use_cache and cache_ttl_seconds > 0
+    # Cross-profile sharing applies only to the default plaintext disk cache:
+    # the encrypted cache is keyed off each profile's bootstrap token and is
+    # deliberately profile-local, so it never becomes the coordination point.
+    share_disk = (
+        cache_enabled
+        and not encrypted_cache_enabled
+        and shared_cache_home != profile_cache_home
+    )
+
+    if cache_enabled:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, []
@@ -547,12 +578,26 @@ def fetch_bitwarden_secrets(
                 home_path=home_path,
             )
         else:
-            disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
+            disk_cached = _DISK_CACHE.read(
+                cache_key, cache_ttl_seconds, profile_cache_home
+            )
         if disk_cached is not None:
             # Promote into in-process cache so subsequent fetches in the
             # same process skip the disk read too.
             _CACHE[cache_key] = disk_cached
             return disk_cached.secrets, []
+        if share_disk:
+            disk_cached = _DISK_CACHE.read(
+                cache_key, cache_ttl_seconds, shared_cache_home
+            )
+            if disk_cached is not None:
+                _CACHE[cache_key] = disk_cached
+                # Warm the profile-local cache too, preserving the old local
+                # cache behavior without making it the coordination point.
+                _DISK_CACHE.write(
+                    cache_key, disk_cached, cache_ttl_seconds, profile_cache_home
+                )
+                return disk_cached.secrets, []
 
     bws = binary or find_bws(install_if_missing=True)
     if bws is None:
@@ -563,6 +608,77 @@ def fetch_bitwarden_secrets(
             "`hermes secrets bitwarden setup`."
         )
 
+    if not share_disk:
+        return _live_fetch_and_cache(
+            bws=bws,
+            access_token=access_token,
+            project_id=project_id,
+            server_url=server_url,
+            cache_key=cache_key,
+            use_cache=use_cache,
+            cache_ttl_seconds=cache_ttl_seconds,
+            encrypted_cache_enabled=encrypted_cache_enabled,
+            encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
+            home_path=home_path,
+            profile_cache_home=profile_cache_home,
+            shared_cache_home=None,
+        )
+
+    try:
+        with _DISK_CACHE.lock(shared_cache_home):
+            # Double-check after waiting: another profile may have completed
+            # the cold fetch while this process was blocked on the lock.
+            disk_cached = _DISK_CACHE.read(
+                cache_key, cache_ttl_seconds, shared_cache_home
+            )
+            if disk_cached is not None:
+                _CACHE[cache_key] = disk_cached
+                _DISK_CACHE.write(
+                    cache_key, disk_cached, cache_ttl_seconds, profile_cache_home
+                )
+                return disk_cached.secrets, []
+
+            return _live_fetch_and_cache(
+                bws=bws,
+                access_token=access_token,
+                project_id=project_id,
+                server_url=server_url,
+                cache_key=cache_key,
+                use_cache=use_cache,
+                cache_ttl_seconds=cache_ttl_seconds,
+                encrypted_cache_enabled=encrypted_cache_enabled,
+                encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
+                home_path=home_path,
+                profile_cache_home=profile_cache_home,
+                shared_cache_home=shared_cache_home,
+            )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "timed out waiting for the shared Bitwarden cache lock"
+        ) from exc
+
+
+def _live_fetch_and_cache(
+    *,
+    bws: Path,
+    access_token: str,
+    project_id: str,
+    server_url: str,
+    cache_key: _CacheKey,
+    use_cache: bool,
+    cache_ttl_seconds: float,
+    encrypted_cache_enabled: bool,
+    encrypted_cache_max_stale_seconds: float,
+    home_path: Optional[Path],
+    profile_cache_home: Path,
+    shared_cache_home: Optional[Path],
+) -> Tuple[Dict[str, str], List[str]]:
+    """Run the live ``bws`` fetch and persist results to the cache layers.
+
+    ``shared_cache_home`` is non-None only when the caller holds the shared
+    cache lock; then results (and stale-fallback reads) also cover the
+    cross-profile cache.
+    """
     try:
         secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
     except RuntimeError as exc:
@@ -603,7 +719,11 @@ def fetch_bitwarden_secrets(
                         f"stale ENCRYPTED disk cache ({int(age)}s old)"
                     ]
             elif cache_ttl_seconds > 0:
-                stale = _DISK_CACHE.read(cache_key, float("inf"), home_path)
+                stale = _DISK_CACHE.read(cache_key, float("inf"), profile_cache_home)
+                if stale is None and shared_cache_home is not None:
+                    stale = _DISK_CACHE.read(
+                        cache_key, float("inf"), shared_cache_home
+                    )
                 if stale is not None:
                     age = max(0.0, time.time() - stale.fetched_at)
                     _CACHE[cache_key] = stale
@@ -627,7 +747,11 @@ def fetch_bitwarden_secrets(
                 home_path=home_path,
             )
         elif cache_ttl_seconds > 0:
-            _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
+            _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, profile_cache_home)
+            if shared_cache_home is not None:
+                _DISK_CACHE.write(
+                    cache_key, entry, cache_ttl_seconds, shared_cache_home
+                )
     return secrets, warnings
 
 
@@ -1032,6 +1156,11 @@ def clear_caches(home_path: Optional[Path] = None) -> None:
     """
     _CACHE.clear()
     _DISK_CACHE.clear(home_path)
+    shared_home = _shared_cache_home(home_path)
+    if shared_home != resolve_cache_home(home_path):
+        # The cross-profile shared cache holds the same secrets under the
+        # rotated token's fingerprint — drop it too.
+        _DISK_CACHE.clear(shared_home)
     try:
         _encrypted_disk_cache_path(home_path).unlink()
     except (FileNotFoundError, OSError):
