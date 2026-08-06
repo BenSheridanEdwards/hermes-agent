@@ -20,18 +20,31 @@ cache problem must never block Hermes startup.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Generic, Optional, TypeVar
+from typing import Callable, ContextManager, Dict, Generic, Iterator, Optional, TypeVar
+
+try:  # POSIX (macOS/Linux)
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows fallback
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised only on POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 __all__ = [
     "FetchResult",
     "CachedFetch",
     "DiskCache",
+    "file_lock",
     "is_valid_env_name",
     "resolve_cache_home",
 ]
@@ -91,6 +104,81 @@ def resolve_cache_home(home_path: Optional[Path] = None) -> Path:
 K = TypeVar("K")
 
 
+@contextlib.contextmanager
+def file_lock(path: Path, *, timeout_seconds: float = 30.0) -> Iterator[None]:
+    """Hold an advisory cross-process lock for ``path``.
+
+    Lock files are deliberately persistent: only the lock state is
+    process-owned, while the file itself remains a harmless 0600 marker.  A
+    timeout is preferable to falling through and recreating the API burst
+    this lock is meant to prevent.
+    """
+    lock_path = Path(path)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(lock_path.parent, 0o700)
+        except OSError:
+            pass
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        # Cache coordination is best-effort.  If the lock marker cannot be
+        # created, preserve the old behavior and let the caller fetch without
+        # coordination rather than blocking Hermes startup on cache I/O.
+        yield
+        return
+
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        if fcntl is not None:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for cache lock {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
+        elif msvcrt is not None:  # pragma: no cover - Windows-only branch
+            # msvcrt.locking works on a byte range, so ensure byte zero
+            # exists before competing processes try to lock it.
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            while True:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for cache lock {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
+        else:  # pragma: no cover - no supported platform reaches this
+            raise OSError("no supported file-lock implementation")
+
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows-only branch
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+
 class DiskCache(Generic[K]):
     """Best-effort, profile-aware on-disk cache for fetched secret values.
 
@@ -121,6 +209,17 @@ class DiskCache(Generic[K]):
 
     def path(self, home_path: Optional[Path] = None) -> Path:
         return resolve_cache_home(home_path) / "cache" / self._basename
+
+    def lock_path(self, home_path: Optional[Path] = None) -> Path:
+        """Return the persistent lock path associated with this cache file."""
+        cache_path = self.path(home_path)
+        return cache_path.with_name(f".{self._basename}.lock")
+
+    def lock(
+        self, home_path: Optional[Path] = None, *, timeout_seconds: float = 30.0
+    ) -> ContextManager[None]:
+        """Return a cross-process lock for this cache's home directory."""
+        return file_lock(self.lock_path(home_path), timeout_seconds=timeout_seconds)
 
     def read(
         self,
