@@ -12,7 +12,8 @@ DEFAULT_CONFIG = {
     "oauth": {
         # Runtime-owned preserves standalone Hermes behavior. Managed fleets
         # can set "external" so one scheduler is the sole refresh-token writer
-        # for xAI Grok subscription OAuth (oauth.refresh_owner=external).
+        # for Codex (ChatGPT) and xAI Grok subscription OAuth
+        # (oauth.refresh_owner=external).
         "refresh_owner": "runtime",
     },
     "toolsets": ["hermes-cli"],
