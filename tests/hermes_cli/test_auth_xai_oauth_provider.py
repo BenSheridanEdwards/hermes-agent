@@ -1009,27 +1009,34 @@ def test_runtime_owns_oauth_refresh_ownership_matrix(tmp_path, monkeypatch):
 
     # No config.yaml → standalone runtime-owned behavior.
     assert runtime_owns_oauth_refresh("xai-oauth") is True
-    # Non-xAI providers are unaffected by this contract.
     assert runtime_owns_oauth_refresh("openai-codex") is True
+    # Providers outside the ownership contract are always runtime-owned.
     assert runtime_owns_oauth_refresh("nous") is True
 
     (hermes_home / "config.yaml").write_text("model: grok-3\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is True
+    assert runtime_owns_oauth_refresh("openai-codex") is True
 
     (hermes_home / "config.yaml").write_text("oauth:\n  refresh_owner: runtime\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is True
+    assert runtime_owns_oauth_refresh("openai-codex") is True
 
     (hermes_home / "config.yaml").write_text("oauth:\n  refresh_owner: external\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is False
+    assert runtime_owns_oauth_refresh("openai-codex") is False
+    assert runtime_owns_oauth_refresh("nous") is True
 
     (hermes_home / "config.yaml").write_text("oauth:\n  refresh_owner: fleet\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is False
+    assert runtime_owns_oauth_refresh("openai-codex") is False
 
     (hermes_home / "config.yaml").write_text("oauth: []\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is False
+    assert runtime_owns_oauth_refresh("openai-codex") is False
 
     (hermes_home / "config.yaml").write_text("{]\n")
     assert runtime_owns_oauth_refresh("xai-oauth") is False
+    assert runtime_owns_oauth_refresh("openai-codex") is False
 
 
 def test_resolve_xai_runtime_credentials_refuses_external_owner_refresh(
