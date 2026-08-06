@@ -32,7 +32,11 @@ from agent.secret_sources import bitwarden as bw  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _reset_caches():
+def _reset_caches(tmp_path, monkeypatch):
+    # Keep the shared cross-profile cache out of the developer's real
+    # ~/.hermes while testing.
+    shared_home = tmp_path / ".shared-hermes"
+    monkeypatch.setattr(bw, "_shared_cache_home", lambda _home=None: shared_home)
     bw._reset_cache_for_tests()
     yield
     bw._reset_cache_for_tests()
@@ -328,6 +332,52 @@ def test_disk_cache_key_mismatch_triggers_refetch(monkeypatch, tmp_path):
     assert secrets == {"K1": "v1"}
     assert "OTHER" not in secrets
     assert call_count["n"] == 1
+
+
+def test_disk_cache_is_shared_and_locked_across_profile_processes(tmp_path):
+    """Concurrent profiles must coalesce one cold fetch into one bws call."""
+    if os.name == "nt":
+        pytest.skip("uses a POSIX executable fixture")
+
+    fake_binary = tmp_path / "bws"
+    count_file = tmp_path / "bws-calls"
+    fake_binary.write_text(
+        "#!/bin/sh\n"
+        "printf x >> \"$BWS_TEST_COUNT_FILE\"\n"
+        "sleep 0.2\n"
+        "printf '%s' '[{\"key\":\"K1\",\"value\":\"v1\"}]'\n"
+    )
+    fake_binary.chmod(0o700)
+
+    worker = (
+        "from pathlib import Path; "
+        "from agent.secret_sources.bitwarden import fetch_bitwarden_secrets; "
+        "fetch_bitwarden_secrets(access_token='0.t', project_id='proj-1', "
+        "binary=Path(__import__('sys').argv[1]), cache_ttl_seconds=300, "
+        "home_path=Path(__import__('sys').argv[2]))"
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "shared-user-home")
+    env["BWS_TEST_COUNT_FILE"] = str(count_file)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(ROOT), env.get("PYTHONPATH", "")) if part
+    )
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(fake_binary),
+             str(tmp_path / f"profile-{index}")],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(2)
+    ]
+    results = [process.communicate(timeout=10) for process in processes]
+
+    assert all(process.returncode == 0 for process in processes), results
+    assert count_file.read_text() == "x"
 
 
 
