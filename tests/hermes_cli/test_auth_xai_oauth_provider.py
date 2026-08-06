@@ -2,6 +2,7 @@
 
 import base64
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -1731,6 +1732,11 @@ def test_auth_add_xai_oauth_persists_under_external_owner(tmp_path, monkeypatch)
     (hermes_home / "config.yaml").write_text("oauth:\n  refresh_owner: external\n")
     (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    # Recovery runs this as a deliberate terminal-driven login; pytest's stdin
+    # is not a tty, which would trip the unattended device-login guard before
+    # the persistence path under test is reached.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
 
     access_token = "xai-interactive-access"
     refresh_token = "xai-interactive-refresh"
