@@ -936,9 +936,15 @@ class CredentialPool:
 
         Mirrors the Nous/Anthropic resync paths above.  Only applies to
         device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        auth.json shadow to sync from.  Under external refresh ownership the
+        pool row is scheduler-owned and authoritative — adopting singleton
+        tokens here would fight the scheduler's rotation.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if (
+            self.provider != "openai-codex"
+            or entry.source not in ("device_code", "manual:device_code")
+            or not auth_mod.runtime_owns_oauth_refresh(self.provider)
+        ):
             return entry
         try:
             with _auth_store_lock():
@@ -3267,7 +3273,7 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         if (
-            provider == "xai-oauth"
+            provider in ("openai-codex", "xai-oauth")
             and not auth_mod.runtime_owns_oauth_refresh(provider)
         ):
             singleton_changed = False
