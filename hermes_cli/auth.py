@@ -113,12 +113,13 @@ AUTH_LOCK_TIMEOUT_SECONDS = 15.0
 def runtime_owns_oauth_refresh(provider: str) -> bool:
     """Return whether this process may spend the provider's refresh token.
 
-    xAI-only ownership contract: missing ownership configuration preserves
+    Ownership contract for the externally schedulable OAuth providers
+    (openai-codex, xai-oauth): missing ownership configuration preserves
     standalone Hermes behavior. Once an ``oauth`` block is present, malformed
     or unknown ownership fails closed so a typo cannot silently create a second
-    refresh-token writer. Non-xAI providers remain runtime-owned.
+    refresh-token writer. Other providers remain runtime-owned.
     """
-    if provider != "xai-oauth":
+    if provider not in {"openai-codex", "xai-oauth"}:
         return True
     config_path = get_config_path()
     if not config_path.exists():
@@ -3966,10 +3967,10 @@ def _sync_codex_pool_entries(
     if not access_token:
         return
     refresh_token = tokens.get("refresh_token")
-    pool = auth_store.get("credential_pool")
+    pool = auth_store.setdefault("credential_pool", {})
     if not isinstance(pool, dict):
         return
-    entries = pool.get("openai-codex")
+    entries = pool.setdefault("openai-codex", [])
     if not isinstance(entries, list):
         return
     # Previous singleton access_token (before this re-auth overwrote it) —
@@ -3980,6 +3981,7 @@ def _sync_codex_pool_entries(
     prev_at = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+    updated_existing_entry = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -4012,6 +4014,23 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+        updated_existing_entry = True
+    if not updated_existing_entry and not runtime_owns_oauth_refresh("openai-codex"):
+        # Under external ownership the pool is the runtime's only credential
+        # source (singleton seeding is disabled in load_pool), so an
+        # interactive re-auth must land its row here or Fleet recovery ends
+        # at "no usable scheduler-owned OAuth credential".
+        entries.append({
+            "id": uuid.uuid4().hex[:6],
+            "label": "OpenAI Codex",
+            "auth_type": "oauth",
+            "priority": len(entries),
+            "source": "device_code",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "last_refresh": last_refresh,
+            "base_url": DEFAULT_CODEX_BASE_URL,
+        })
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
@@ -4064,7 +4083,16 @@ def refresh_codex_oauth_pure(
     *,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
-    """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+    """Refresh Codex OAuth tokens without mutating Hermes auth state.
+
+    WARNING: this is an unguarded network primitive. Every runtime caller MUST
+    gate with ``runtime_owns_oauth_refresh("openai-codex")`` (or an equivalent
+    external-owner check) before spending the refresh token. When
+    ``oauth.refresh_owner=external``, only the external scheduler may rotate;
+    unguarded calls create a second writer and can invalidate the fleet grant.
+    Production entrypoints that already gate include
+    ``_refresh_codex_auth_tokens`` and ``CredentialPool._refresh_entry``.
+    """
     del access_token  # Access token is only used by callers to decide whether to refresh.
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -4197,9 +4225,16 @@ def _refresh_codex_auth_tokens(
     timeout_seconds: float,
 ) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token.
-    
+
     Saves the new tokens to Hermes auth store automatically.
     """
+    if not runtime_owns_oauth_refresh("openai-codex"):
+        raise AuthError(
+            "Codex OAuth refresh is owned externally; this runtime must not spend the refresh token.",
+            provider="openai-codex",
+            code="codex_external_refresh_forbidden",
+            relogin_required=False,
+        )
     try:
         refreshed = refresh_codex_oauth_pure(
             str(tokens.get("access_token", "") or ""),
@@ -4287,23 +4322,43 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    runtime_refresh_allowed = runtime_owns_oauth_refresh("openai-codex")
+    externally_managed_tokens = (
+        None if runtime_refresh_allowed else _selected_oauth_pool_tokens("openai-codex")
+    )
+    if not runtime_refresh_allowed and not externally_managed_tokens:
+        raise AuthError(
+            "Codex has no usable scheduler-owned OAuth credential.",
+            provider="openai-codex",
+            code="codex_external_pool_unavailable",
+            relogin_required=False,
+        )
     read_error: Optional[AuthError] = None
-    try:
-        data = _read_codex_tokens()
-    except AuthError as exc:
-        read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+    if externally_managed_tokens:
+        # External ownership makes the scheduler-rotated pool row
+        # authoritative; the singleton and the Codex-CLI recovery import are
+        # both stale lanes the runtime must not adopt or rotate.
+        data = {
+            "tokens": externally_managed_tokens,
+            "last_refresh": externally_managed_tokens.get("last_refresh"),
+        }
+    else:
+        try:
+            data = _read_codex_tokens()
+        except AuthError as exc:
+            read_error = exc
+            if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+                "codex_auth_invalid_shape",
+            }:
+                imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
+                if imported:
+                    data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+                else:
+                    data = None
             else:
                 data = None
-        else:
-            data = None
 
     if data is None:
         pool_token = _pool_codex_access_token()
@@ -4381,9 +4436,11 @@ def resolve_codex_runtime_credentials(
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
 
-    should_refresh = bool(force_refresh)
+    should_refresh = runtime_refresh_allowed and bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:
-        should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+        should_refresh = runtime_refresh_allowed and _codex_access_token_is_expiring(
+            access_token, refresh_skew_seconds
+        )
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
@@ -4391,9 +4448,11 @@ def resolve_codex_runtime_credentials(
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
 
-            should_refresh = bool(force_refresh)
+            should_refresh = runtime_refresh_allowed and bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+                should_refresh = runtime_refresh_allowed and _codex_access_token_is_expiring(
+                    access_token, refresh_skew_seconds
+                )
 
             if should_refresh:
                 tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
@@ -4408,7 +4467,9 @@ def resolve_codex_runtime_credentials(
         "provider": "openai-codex",
         "base_url": base_url,
         "api_key": access_token,
-        "source": "hermes-auth-store",
+        "source": (
+            "credential_pool" if externally_managed_tokens else "hermes-auth-store"
+        ),
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
     }
