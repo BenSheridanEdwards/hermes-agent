@@ -948,6 +948,191 @@ _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 _REQUIRES_WAL_MARK = "requires_wal"
 
 
+# ── Live-checkout git guard ────────────────────────────────────────────────
+#
+# The existing subprocess guard blocks *spawning* ``hermes update``. It does
+# not block the update flow running IN-PROCESS: ``_cmd_update_impl`` calls
+# ``subprocess.run(["git", "fetch", "origin", "main"], cwd=PROJECT_ROOT)``
+# directly, so a test whose stubs miss their seam quietly drives real git
+# against the checkout pytest is running in.
+#
+# That happened. On 2026-08-05 a full-suite run inside a staging worktree
+# (two live gateways served from its editable venv) executed
+# ``git fetch origin main`` → ``git checkout main`` →
+# ``git merge --ff-only origin/main``, silently moving the worktree off its
+# release branch mid-flight. The tests still passed; the reflog's ``+0000``
+# stamps — the suite pins TZ=UTC while the operators were on +0100 — were the
+# only evidence of who did it.
+#
+# So: read-only git against the live checkout stays allowed (the banner and
+# diff tests legitimately shell out to it); anything that can WRITE refs,
+# objects, config or the working tree fails loudly. Sandboxed repos under
+# tmp_path are untouched — the guard keys on the resolved target repo, not on
+# the command alone.
+
+#: git subcommands that cannot modify a repository.
+_GIT_QUERY_SUBCOMMANDS = frozenset({
+    "annotate", "blame", "cat-file", "check-attr", "check-ignore",
+    "check-ref-format", "count-objects", "describe", "diff", "diff-files",
+    "diff-index", "diff-tree", "for-each-ref", "grep", "help", "log",
+    "ls-files", "ls-tree", "merge-base", "name-rev", "rev-list", "rev-parse",
+    "shortlog", "show", "show-ref", "status", "var", "verify-commit",
+    "verify-tag", "version", "whatchanged",
+})
+
+#: Subcommands that are read-only ONLY in their query form. Allowed when at
+#: least one of the listed selectors appears in argv — ``git config --get x``
+#: reads, ``git config x y`` writes; ``git branch --show-current`` reads,
+#: ``git branch -D x`` deletes.
+_GIT_QUERY_SELECTORS = {
+    "branch": ("--show-current", "--list", "-l", "--contains", "--points-at",
+               "--merged", "--no-merged"),
+    "config": ("--get", "--get-all", "--get-regexp", "--get-urlmatch",
+               "--list", "-l"),
+    "remote": ("get-url", "show", "-v", "--verbose"),
+    "stash": ("list", "show"),
+    "tag": ("-l", "--list"),
+    "worktree": ("list",),
+    "submodule": ("status",),
+    "notes": ("list", "show"),
+}
+
+#: git global options that consume the following argv token as their value.
+_GIT_GLOBAL_OPTS_WITH_VALUE = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--config-env", "--super-prefix",
+})
+
+#: Subcommands whose target repo is a positional destination, not the cwd.
+#: ``git clone <url> /tmp/dest`` run from the checkout writes to /tmp/dest.
+_GIT_DESTINATION_SUBCOMMANDS = frozenset({"clone", "init"})
+
+#: The checkout pytest itself is running out of.
+_LIVE_CHECKOUT_ROOT = PROJECT_ROOT.resolve()
+
+
+def _git_argv(cmd):
+    """Return argv for a DIRECT git invocation, else None.
+
+    Wrapper commands (``bash -c "git ..."``) are deliberately not unwrapped:
+    the live-system guard's whole-string scanning already covers the
+    ``hermes update`` spawn shape, and unwrapping shell strings here would
+    trade precision for false positives on unrelated commands.
+    """
+    import shlex as _shlex
+
+    if isinstance(cmd, (bytes, bytearray)):
+        try:
+            cmd = bytes(cmd).decode()
+        except Exception:
+            return None
+    if isinstance(cmd, str):
+        try:
+            argv = _shlex.split(cmd)
+        except ValueError:
+            return None
+    elif isinstance(cmd, (list, tuple)):
+        argv = [str(tok) for tok in cmd]
+    else:
+        return None
+    if not argv:
+        return None
+    head = argv[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    if head not in ("git", "git.exe"):
+        return None
+    return argv
+
+
+def _git_guard_violation(cmd, cwd=None):
+    """Message describing a repo-mutating git call at the live checkout.
+
+    Returns None when the call is a query, or when it targets a repository
+    outside the checkout (every tmp_path fixture repo in the suite).
+    """
+    import os as _os
+
+    argv = _git_argv(cmd)
+    if argv is None:
+        return None
+
+    # Walk past global options to find the subcommand, recording any
+    # explicit repo redirection on the way.
+    target_override = None
+    subcommand = None
+    rest = []
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _GIT_GLOBAL_OPTS_WITH_VALUE:
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+            if tok in ("-C", "--git-dir", "--work-tree"):
+                target_override = value
+            i += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            opt, _, value = tok.partition("=")
+            if opt in ("--git-dir", "--work-tree"):
+                target_override = value
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        subcommand = tok
+        rest = argv[i + 1:]
+        break
+
+    if subcommand is None:  # `git --version`, `git --help`
+        return None
+    if subcommand in _GIT_QUERY_SUBCOMMANDS:
+        return None
+    selectors = _GIT_QUERY_SELECTORS.get(subcommand)
+    if selectors is not None and any(sel in rest for sel in selectors):
+        return None
+
+    try:
+        base = Path(_os.fsdecode(cwd)) if cwd is not None else Path(_os.getcwd())
+        if subcommand in _GIT_DESTINATION_SUBCOMMANDS:
+            positionals = [tok for tok in rest if not tok.startswith("-")]
+            target = base / positionals[-1] if positionals else base
+        elif target_override is not None:
+            # Relative `-C`/`--git-dir` values resolve against cwd; absolute
+            # ones replace it (Path.__truediv__ already does exactly that).
+            target = base / target_override
+        else:
+            target = base
+        resolved = target.resolve()
+    except (OSError, TypeError, ValueError):
+        # Unresolvable target — the guard has nothing trustworthy to compare
+        # against, and guessing would mean blocking innocent commands.
+        return None
+    if not (
+        resolved == _LIVE_CHECKOUT_ROOT
+        or _LIVE_CHECKOUT_ROOT in resolved.parents
+        or resolved in _LIVE_CHECKOUT_ROOT.parents
+    ):
+        return None
+
+    where = (
+        "the checkout this test run is executing from"
+        if resolved == _LIVE_CHECKOUT_ROOT
+        else f"inside/above the checkout this test run is executing from ({_LIVE_CHECKOUT_ROOT})"
+    )
+    return (
+        f"tests/conftest.py live-checkout git guard: blocked "
+        f"`{' '.join(argv)}` targeting {resolved} — that is {where}, and "
+        f"`git {subcommand}` can rewrite its refs, objects or working tree. "
+        "A full-suite run did exactly this on 2026-08-05 and moved a "
+        "staging worktree onto `main` underneath two live gateways. "
+        "Point the command at a tmp_path repo, mock subprocess at the "
+        "seam the code under test actually resolves (production code reads "
+        "its globals through `hermes_cli.update_cmd._m()`, NOT through a "
+        "module alias captured at import time), or mark the test with "
+        "@pytest.mark.live_system_guard_bypass if it genuinely needs real "
+        "git writes against a dedicated throwaway repo."
+    )
+
+
 def _wal_is_usable() -> bool:
     """True when Hermes will actually put a database into WAL mode here.
 
@@ -1431,7 +1616,11 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
-    def _check_subprocess_cmd(name, cmd):
+    def _check_subprocess_cmd(name, cmd, cwd=None):
+        violation = _git_guard_violation(cmd, cwd)
+        if violation:
+            raise RuntimeError(f"{violation} (via subprocess.{name})")
+
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -1484,9 +1673,17 @@ def _live_system_guard(request, monkeypatch):
                 "flow against a dedicated throwaway repo)."
             )
 
+    # ``cwd`` decides WHICH repo a bare `git ...` touches, so the git guard
+    # needs it. ``subprocess.run`` & friends take cwd keyword-only; ``Popen``
+    # also accepts it 9th positionally (index 8 after ``args``), so read both.
+    def _cwd_of(args, kwargs):
+        if "cwd" in kwargs:
+            return kwargs["cwd"]
+        return args[8] if len(args) > 8 else None
+
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
-            _check_subprocess_cmd(name, cmd)
+            _check_subprocess_cmd(name, cmd, _cwd_of(args, kwargs))
             return real(cmd, *args, **kwargs)
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
@@ -1504,7 +1701,7 @@ def _live_system_guard(request, monkeypatch):
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
+                _check_subprocess_cmd("Popen", cmd, _cwd_of(args, kwargs))
                 super().__init__(cmd, *args, **kwargs)
 
         _GuardedPopen.__name__ = "Popen"
@@ -1548,7 +1745,7 @@ def _live_system_guard(request, monkeypatch):
         return real_os_system(command)
 
     def _guarded_os_popen(cmd, *args, **kwargs):
-        _check_subprocess_cmd("os.popen", cmd)
+        _check_subprocess_cmd("os.popen", cmd, kwargs.get("cwd"))
         return real_os_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(_os, "system", _guarded_os_system)
@@ -1576,12 +1773,16 @@ def _live_system_guard(request, monkeypatch):
 
         async def _guarded_async_exec(program, *args, **kwargs):
             _check_subprocess_cmd(
-                "asyncio.create_subprocess_exec", [program, *args]
+                "asyncio.create_subprocess_exec",
+                [program, *args],
+                kwargs.get("cwd"),
             )
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
-            _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
+            _check_subprocess_cmd(
+                "asyncio.create_subprocess_shell", cmd, kwargs.get("cwd")
+            )
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
