@@ -719,3 +719,25 @@ class TestSkillIgnore:
             (junk / f"f{i}.txt").write_text("x")
         result = scan_skill(skill_dir, source="community")
         assert not any(fi.pattern_id == "too_many_files" for fi in result.findings)
+
+
+# ---------------------------------------------------------------------------
+# Bundled skill credential hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_skills_do_not_ship_openai_key_shaped_examples():
+    """Every current and future bundled skill must avoid live-key-shaped samples."""
+    skills_root = Path(__file__).resolve().parents[2] / "skills"
+    findings = []
+    for path in skills_root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative_path = str(path.relative_to(skills_root))
+        findings.extend(
+            finding
+            for finding in scan_file(path, relative_path)
+            if finding.pattern_id == "openai_key_leaked"
+        )
+
+    assert findings == []
