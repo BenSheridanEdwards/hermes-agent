@@ -15,7 +15,7 @@ they run on any host (same approach as test_update_concurrent_quarantine).
 
 from __future__ import annotations
 
-import subprocess
+import importlib
 import sys
 import types
 from types import SimpleNamespace
@@ -23,7 +23,63 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hermes_cli import main as cli_main
+# NOTE: deliberately no module-level ``from hermes_cli import main as
+# cli_main``. Everything here goes through ``_live_main()`` — see its
+# docstring for the incident that binding caused.
+
+
+def _live_main():
+    """Resolve ``hermes_cli.main`` the way production code does, at CALL time.
+
+    ``from hermes_cli import main as cli_main`` at module scope binds the
+    module object that existed when the file was *collected*. That binding can
+    go stale:
+    ``tests/hermes_cli/test_skills_subparser.py`` deletes
+    ``sys.modules['hermes_cli.main']`` and re-imports it, so every test file
+    collected before it keeps an alias to a module object nothing in
+    production resolves any more.
+
+    Production code reaches its own globals through
+    ``hermes_cli.update_cmd._m()``, which imports ``hermes_cli.main``
+    *freshly*. Patching the stale alias therefore silently no-ops: the guard
+    stubs below never take effect and ``_cmd_update_impl`` runs the REAL
+    update flow — ``git fetch origin main`` → ``git checkout main`` →
+    ``git merge --ff-only origin/main`` — against whatever checkout pytest
+    happens to be running in. That is exactly how a staging worktree was
+    flipped onto ``main`` underneath two live gateways (2026-08-05).
+
+    Always patch the object this returns, never a module-scope alias.
+
+    Resolution deliberately mirrors ``_m()`` exactly — ``from hermes_cli
+    import main`` reads the *package attribute*, which a re-import rebinds
+    independently of the ``sys.modules`` entry. ``importlib.import_module``
+    reads ``sys.modules`` and could hand back a different object again.
+    """
+    from hermes_cli import main as live_main
+
+    return live_main
+
+
+class _NoSubprocess:
+    """Stand-in for ``update_cmd.subprocess`` — every entry point explodes.
+
+    A correctly-stubbed ``_cmd_update_impl`` run reaches the venv-holder
+    guard (``SystemExit(2)``) or the ``PROJECT_ROOT`` sentinel *before* it
+    shells out to anything. So any subprocess call from this file means the
+    stubs missed their seam, and the test must fail loudly rather than quietly
+    running a real ``hermes update`` against the developer's checkout.
+    """
+
+    def __getattr__(self, name):
+        def _blocked(*args, **kwargs):
+            raise AssertionError(
+                f"test_update_venv_health: subprocess.{name}({args!r}) escaped "
+                "the stubs in _run_update_until_guard — _cmd_update_impl got "
+                "past the venv-holder guard with unpatched module globals. "
+                "See _live_main() for the stale-alias failure mode."
+            )
+
+        return _blocked
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +118,7 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
 
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
-def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
+def test_detect_venv_python_excludes_self_and_ancestors(tmp_path):
     import os as _os
 
     venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
@@ -80,10 +135,11 @@ def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
         ),
         Process=lambda *a, **k: me,
     )
-    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
-        sys.modules, {"psutil": fake_psutil}
-    ):
-        assert cli_main._detect_venv_python_processes() == []
+    main_mod = _live_main()
+    with patch.object(main_mod, "_is_windows", return_value=True), patch.object(
+        main_mod, "PROJECT_ROOT", tmp_path
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert main_mod._detect_venv_python_processes() == []
 
 
 
@@ -114,7 +170,15 @@ def _run_update_until_guard(args):
     Everything before the guard is stubbed; the guard firing is observed via
     SystemExit(2). The first statement AFTER the guard is
     ``git_dir = PROJECT_ROOT / ".git"`` — a PROJECT_ROOT sentinel whose
-    ``__truediv__`` raises marks 'guard passed'."""
+    ``__truediv__`` raises marks 'guard passed'.
+
+    The stubs are applied to ``_live_main()`` — the module object production
+    code actually resolves — not to the import-time ``cli_main`` alias, and
+    ``update_cmd.subprocess`` is swapped for a tripwire. Between them, a stub
+    that misses its seam fails the test instead of shelling out to real git.
+    """
+    main_mod = _live_main()
+    update_cmd = importlib.import_module("hermes_cli.update_cmd")
 
     class _PastGuard(Exception):
         pass
@@ -123,14 +187,14 @@ def _run_update_until_guard(args):
         def __truediv__(self, _other):
             raise _PastGuard
 
-    with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
-        cli_main, "_venv_scripts_dir", return_value=None
-    ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
-        cli_main, "_pause_windows_gateways_for_update", return_value=None
+    with patch.object(main_mod, "_is_windows", return_value=True), patch.object(
+        main_mod, "_venv_scripts_dir", return_value=None
+    ), patch.object(main_mod, "_run_pre_update_backup"), patch.object(
+        main_mod, "_pause_windows_gateways_for_update", return_value=None
     ), patch.object(
-        cli_main, "_resume_windows_gateways_after_update"
+        main_mod, "_resume_windows_gateways_after_update"
     ), patch.object(
-        cli_main,
+        main_mod,
         "_detect_venv_python_processes",
         return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
     ), patch.object(
@@ -141,9 +205,11 @@ def _run_update_until_guard(args):
         cli_main, "_orphaned_desktop_backend_pids", return_value=None
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
+    ), patch.object(
+        update_cmd, "subprocess", _NoSubprocess()
     ):
         try:
-            cli_main._cmd_update_impl(args, gateway_mode=False)
+            main_mod._cmd_update_impl(args, gateway_mode=False)
         except _PastGuard:
             return "past_guard"
         except SystemExit as exc:
