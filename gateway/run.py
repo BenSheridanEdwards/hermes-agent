@@ -19046,6 +19046,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             adapter = self._adapter_for_source(event.source)
+            voice_chat_id = event.source.chat_id
+            reply_anchor = self._reply_anchor_for_event(event)
+            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+
+            # Webhook routes often deliver:telegram (or another chat platform).
+            # Auto-TTS must target that adapter/chat — webhook has no native
+            # send_voice and the base fallback poisons Chief's Telegram with
+            # "Couldn't deliver the audio attachment." (Jarvis PR gate 2026-08-07)
+            # Resolve Platform enum used by this module (imported lazily elsewhere).
+            try:
+                from gateway.config import Platform as _GwPlatform
+            except Exception:
+                from gateway.platforms.base import Platform as _GwPlatform  # type: ignore
+
+            if (
+                adapter is not None
+                and getattr(event.source, "platform", None) is not None
+                and str(getattr(event.source.platform, "value", event.source.platform)) == "webhook"
+                and hasattr(adapter, "_delivery_info")
+            ):
+                delivery = (getattr(adapter, "_delivery_info", {}) or {}).get(event.source.chat_id) or {}
+                deliver_type = str(delivery.get("deliver") or "log")
+                if deliver_type and deliver_type not in {"log", "github_comment"}:
+                    target_adapter = None
+                    try:
+                        target_platform = _GwPlatform(deliver_type)
+                        target_adapter = self.adapters.get(target_platform)
+                    except Exception:
+                        target_adapter = None
+                    if target_adapter is None:
+                        for _prof, amap in (getattr(self, "_profile_adapters", None) or {}).items():
+                            if not isinstance(amap, dict):
+                                continue
+                            for key, cand in amap.items():
+                                if str(getattr(key, "value", key)) == deliver_type:
+                                    target_adapter = cand
+                                    break
+                            if target_adapter is not None:
+                                break
+                    extra = delivery.get("deliver_extra") or {}
+                    target_chat = str(extra.get("chat_id") or "").strip()
+                    if not target_chat and hasattr(self, "config"):
+                        try:
+                            home = self.config.get_home_channel(_GwPlatform(deliver_type))
+                            if home:
+                                target_chat = str(home.chat_id)
+                        except Exception:
+                            pass
+                    if target_adapter is not None and target_chat:
+                        adapter = target_adapter
+                        voice_chat_id = target_chat
+                        reply_anchor = None
+                        thread_meta = None
+                        if extra.get("message_thread_id") or extra.get("thread_id"):
+                            thread_meta = {
+                                "message_thread_id": extra.get("message_thread_id")
+                                or extra.get("thread_id")
+                            }
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
@@ -19055,8 +19113,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
             elif adapter and hasattr(adapter, "send_voice"):
-                reply_anchor = self._reply_anchor_for_event(event)
-                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
                 # final-text path in gateway/platforms/base.py which sets
                 # ``notify=True`` so platform adapters that gate push
@@ -19070,7 +19126,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     thread_meta = {"notify": True}
                 send_kwargs: Dict[str, Any] = {
-                    "chat_id": event.source.chat_id,
+                    "chat_id": voice_chat_id,
                     "audio_path": actual_path,
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
