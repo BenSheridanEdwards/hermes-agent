@@ -115,3 +115,54 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
+
+    def test_skill_view_prefers_local_over_same_named_external_skill(
+        self, hermes_home, external_skills_dir
+    ):
+        local_skills = hermes_home / "skills"
+        local_skill = local_skills / "my-external-skill"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: my-external-skill\ndescription: Local version\n---\n\nLocal.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+            result = json.loads(skill_view("my-external-skill"))
+
+        assert result["success"] is True
+        assert "Local." in result["content"]
+        assert "external things" not in result["content"]
+
+    def test_skill_view_rejects_same_named_skills_across_external_dirs(
+        self, hermes_home, external_skills_dir, tmp_path
+    ):
+        second_external_dir = tmp_path / "second-external-skills"
+        second_skill = second_external_dir / "my-external-skill"
+        second_skill.mkdir(parents=True)
+        (second_skill / "SKILL.md").write_text(
+            "---\nname: my-external-skill\ndescription: Second external version\n---\n\nSecond.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            "skills:\n  external_dirs:\n"
+            f"    - {external_skills_dir}\n"
+            f"    - {second_external_dir}\n"
+        )
+        local_skills = hermes_home / "skills"
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+            result = json.loads(skill_view("my-external-skill"))
+
+        assert result["success"] is False
+        assert "Ambiguous skill name" in result["error"]
+        assert len(result["matches"]) == 2

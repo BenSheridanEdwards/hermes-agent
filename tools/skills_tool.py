@@ -1180,6 +1180,20 @@ def skill_view(
                 ):
                     _record(None, found_md)
 
+        # Local skills are the primary source of truth. When a local candidate
+        # exists, discard same-named external candidates before collision
+        # grading so skill_view agrees with discovery and documented local
+        # precedence. Multiple candidates inside the winning local root remain
+        # ambiguous and still fail loudly below.
+        local_root = active_skills_dir.absolute()
+        local_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[1].absolute().is_relative_to(local_root)
+        ]
+        if local_candidates:
+            candidates = local_candidates
+
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
