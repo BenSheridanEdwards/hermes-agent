@@ -1355,6 +1355,76 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
 
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict | None = None,
+        **kwargs,
+    ):
+        """Route voice to the session's deliver target (webhook has no audio).
+
+        Auto-TTS and tool voice calls hit the *source* adapter. For webhook
+        sessions that ``deliver:telegram`` (Jarvis PR-gate, etc.), the base
+        adapter fallback turns a failed ``send_voice`` into a Telegram text
+        error ("Couldn't deliver the audio attachment"). Prefer the real
+        chat platform instead. Log/github-only delivers succeed quietly.
+        """
+        from gateway.platforms.base import SendResult
+
+        delivery = (self._delivery_info or {}).get(chat_id) or {}
+        deliver_type = str(delivery.get("deliver") or "log")
+        if deliver_type in {"", "log", "github_comment"}:
+            return SendResult(success=True)
+
+        if not self.gateway_runner:
+            return SendResult(success=False, error="No gateway runner for webhook voice")
+
+        try:
+            target_platform = Platform(deliver_type)
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Unknown deliver platform: {deliver_type}: {exc}",
+            )
+
+        adapter = self.gateway_runner.adapters.get(target_platform)
+        if adapter is None:
+            for _prof, amap in (getattr(self.gateway_runner, "_profile_adapters", None) or {}).items():
+                if isinstance(amap, dict) and target_platform in amap:
+                    adapter = amap[target_platform]
+                    break
+        if adapter is None or not hasattr(adapter, "send_voice"):
+            return SendResult(success=False, error=f"No voice adapter for {deliver_type}")
+
+        extra = delivery.get("deliver_extra") or {}
+        target_chat = str(extra.get("chat_id") or "").strip()
+        if not target_chat and getattr(self.gateway_runner, "config", None) is not None:
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if home:
+                target_chat = str(home.chat_id)
+        if not target_chat:
+            return SendResult(
+                success=False,
+                error=f"No chat_id for webhook voice deliver:{deliver_type}",
+            )
+
+        meta = dict(metadata or {})
+        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if thread_id is not None:
+            meta.setdefault("message_thread_id", thread_id)
+        meta.setdefault("notify", True)
+        return await adapter.send_voice(
+            chat_id=target_chat,
+            audio_path=audio_path,
+            caption=caption,
+            reply_to=None,
+            metadata=meta or None,
+            **kwargs,
+        )
+
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict
     ) -> SendResult:
