@@ -73,6 +73,14 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
 
+    def test_local_resource_block_does_not_advance(self):
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._block_provider_fallback = True
+        assert agent._try_activate_fallback() is False
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},

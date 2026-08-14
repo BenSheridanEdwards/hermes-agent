@@ -2400,6 +2400,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if getattr(agent, "_block_provider_fallback", False):
+        logger.warning(
+            "Fallback blocked: local resource exhaustion (EMFILE / errno 24); "
+            "staying on primary"
+        )
+        return False
+    if reason is not None and getattr(reason, "value", reason) == "local_resource":
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

@@ -47,6 +47,10 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    # Local resource exhaustion (EMFILE / errno 24). The host cannot open
+    # another socket. Jumping providers does not close FDs and stains the
+    # session with a fallback model after /new. Fail closed; do not fallback.
+    local_resource = "local_resource"
     # TLS certificate verification failure — deterministic for the host
     # (TLS-inspecting proxy, missing/expired CA bundle, self-signed cert).
     # Retrying reproduces the identical handshake failure, so fail fast
@@ -1089,6 +1093,24 @@ def classify_api_error(
             FailoverReason.timeout,
             retryable=False,
             should_fallback=True,
+        )
+
+    # ── 8. Local resource exhaustion (before generic transport) ──────
+    # EMFILE / errno 24 / "Too many open files": the process cannot open
+    # another socket. Retrying and provider-jumping both fail the same way
+    # and the fallback path rewrites the session model (Neo 2026-08-14).
+    _local_resource = (
+        "too many open files" in error_msg
+        or "errno 24" in error_msg
+        or "emfile" in error_msg
+        or getattr(error, "errno", None) == 24
+        or getattr(getattr(error, "__cause__", None), "errno", None) == 24
+    )
+    if _local_resource:
+        return _result(
+            FailoverReason.local_resource,
+            retryable=False,
+            should_fallback=False,
         )
 
     # ── 8. Transport / timeout heuristics ───────────────────────────

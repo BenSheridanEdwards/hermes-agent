@@ -4433,6 +4433,8 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                if classified.reason == FailoverReason.local_resource:
+                    agent._block_provider_fallback = True
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
