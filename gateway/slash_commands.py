@@ -292,6 +292,24 @@ class GatewaySlashCommandsMixin:
             new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
 
+        # /new is a conversation boundary: stamp the config primary onto the
+        # new session row so a later fallback cannot be the first model the
+        # dashboard sees (Neo 2026-08-14: /new started on Sol, EMFILE then
+        # wrote Luna into sessions.model).
+        if new_entry and getattr(self, "_session_db", None):
+            try:
+                from gateway.run import _resolve_gateway_model
+
+                _primary = _resolve_gateway_model()
+                if _primary:
+                    await asyncio.to_thread(
+                        self._session_db.update_session_model,
+                        new_entry.session_id,
+                        _primary,
+                    )
+            except Exception:
+                logger.debug("/new failed to stamp config primary on session", exc_info=True)
+
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
         _title_note = ""
