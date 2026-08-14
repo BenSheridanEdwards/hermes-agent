@@ -535,6 +535,29 @@ def _run_agent_tool_execution_middleware(
     )
 
 
+def _resolve_sequential_tool_timeout() -> float | None:
+    """Deadline for one sequential tool call (#85125 Phase 2a).
+
+    ``timeouts.tools.sequential_call`` in config.yaml wins; when unset, the
+    sequential path inherits the concurrent batch deadline (same value, same
+    ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` legacy bridge) so the two executor
+    paths cannot drift apart by default. ``0``/negative disables the bound.
+
+    NOTE: this path deliberately does NOT use ``agent.deadline.run_bounded_sync``.
+    The sequential/concurrent executors extend their deadline dynamically while
+    a human approval prompt is open (``_ConcurrentToolAuthorizationGate``
+    excluded seconds — a MUST-preserve invariant) and touch agent activity
+    mid-wait; the shared primitive is fixed-deadline by design. Simpler call
+    sites migrate onto the primitive; these two stay symmetric with each other.
+    """
+    from agent.deadline import resolve_timeout
+
+    return resolve_timeout(
+        "tools.sequential_call",
+        default=_resolve_concurrent_tool_timeout(),
+    )
+
+
 def _run_sequential_tool_execution_middleware(
     agent,
     *,
@@ -547,8 +570,14 @@ def _run_sequential_tool_execution_middleware(
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
 ) -> _ManagedToolResult:
-    """Run one sequential call with the concurrent executor's deadline."""
-    timeout_s = _resolve_concurrent_tool_timeout()
+    """Run one sequential call with the concurrent executor's deadline.
+
+    Interactive input tools such as ``clarify`` wait on a human. Their own
+    timeout (``agent.clarify_timeout``: default 3600s, or unlimited when
+    ``<= 0``) owns that wait. Applying the generic tool deadline here would
+    return ``tool_timeout`` while the prompt and worker stay active.
+    """
+    timeout_s = _resolve_sequential_tool_timeout()
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
