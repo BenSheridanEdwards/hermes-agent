@@ -22085,6 +22085,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+
+    def _resolve_auto_tts_delivery(self, event: "MessageEvent"):
+        """Pick adapter/chat for auto-TTS, including webhook deliver: targets.
+
+        Returns ``(adapter, chat_id, reply_to, thread_meta)``. Webhook sources
+        that deliver to a human chat platform must not use the webhook adapter
+        for voice (no native audio; base fallback poisons Telegram).
+        """
+        adapter = self._adapter_for_source(event.source)
+        chat_id = event.source.chat_id
+        reply_to = self._reply_anchor_for_event(event)
+        thread_meta = self._thread_metadata_for_source(event.source, reply_to)
+
+        platform = getattr(event.source, "platform", None)
+        platform_value = str(getattr(platform, "value", platform) or "")
+        if platform_value != "webhook" or adapter is None:
+            return adapter, chat_id, reply_to, thread_meta
+        if not hasattr(adapter, "_delivery_info"):
+            return adapter, chat_id, reply_to, thread_meta
+
+        delivery = (getattr(adapter, "_delivery_info", {}) or {}).get(event.source.chat_id) or {}
+        deliver_type = str(delivery.get("deliver") or "log")
+        if not deliver_type or deliver_type in {"log", "github_comment"}:
+            return adapter, chat_id, reply_to, thread_meta
+
+        try:
+            from gateway.config import Platform as _Platform
+            target_platform = _Platform(deliver_type)
+        except Exception:
+            return adapter, chat_id, reply_to, thread_meta
+
+        target_adapter = self.adapters.get(target_platform)
+        if target_adapter is None:
+            for _prof, amap in (getattr(self, "_profile_adapters", None) or {}).items():
+                if not isinstance(amap, dict):
+                    continue
+                if target_platform in amap:
+                    target_adapter = amap[target_platform]
+                    break
+                for key, cand in amap.items():
+                    if str(getattr(key, "value", key)) == deliver_type:
+                        target_adapter = cand
+                        break
+                if target_adapter is not None:
+                    break
+
+        extra = delivery.get("deliver_extra") or {}
+        target_chat = str(extra.get("chat_id") or "").strip()
+        if not target_chat and getattr(self, "config", None) is not None:
+            try:
+                home = self.config.get_home_channel(target_platform)
+                if home:
+                    target_chat = str(home.chat_id)
+            except Exception:
+                pass
+
+        if target_adapter is None or not target_chat:
+            return adapter, chat_id, reply_to, thread_meta
+
+        thread_meta = None
+        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if thread_id is not None:
+            thread_meta = {"message_thread_id": thread_id}
+        return target_adapter, target_chat, None, thread_meta
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -22126,7 +22191,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            adapter = self._adapter_for_source(event.source)
+            adapter, voice_chat_id, reply_anchor, thread_meta = self._resolve_auto_tts_delivery(event)
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
@@ -22139,8 +22204,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and callable(is_in_voice_channel)
                 and is_in_voice_channel(guild_id)
             )
-            reply_anchor = self._reply_anchor_for_event(event)
-            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            # reply_anchor/thread_meta come from _resolve_auto_tts_delivery
+            # above. Re-deriving them from the event here would send the
+            # voice reply back at the webhook source instead of the
+            # deliver: target.
             if not in_voice_channel and callable(send_voice):
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
                 # final-text path in gateway/platforms/base.py which sets
@@ -22161,7 +22228,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
                     send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
+                        "chat_id": voice_chat_id,
                         "audio_path": actual_path,
                         "reply_to": reply_anchor,
                         "metadata": thread_meta,
