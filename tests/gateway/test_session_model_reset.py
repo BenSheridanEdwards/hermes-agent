@@ -100,3 +100,16 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_new_stamps_config_primary_on_session_row(monkeypatch):
+    """/new must write the config primary onto the new session row."""
+    runner = _make_runner()
+    db = MagicMock()
+    runner._session_db = db
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol")
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    db.update_session_model.assert_called_once_with("sess-1", "gpt-5.6-sol")

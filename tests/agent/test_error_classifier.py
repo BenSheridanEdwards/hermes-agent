@@ -55,6 +55,7 @@ class TestFailoverReason:
             "auth", "auth_permanent", "billing", "rate_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
+            "local_resource",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
@@ -493,6 +494,21 @@ class TestClassifyApiError:
         e = TimeoutError("timed out")
         result = classify_api_error(e)
         assert result.reason == FailoverReason.timeout
+
+    def test_emfile_message_is_local_resource(self):
+        e = OSError(24, "Too many open files")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.local_resource
+        assert result.should_fallback is False
+        assert result.retryable is False
+
+    def test_emfile_wrapped_connection_error_is_local_resource(self):
+        cause = OSError(24, "Too many open files")
+        e = ConnectionError("Connection error.")
+        e.__cause__ = cause
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.local_resource
+        assert result.should_fallback is False
 
 
 
