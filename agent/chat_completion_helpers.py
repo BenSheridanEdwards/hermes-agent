@@ -2436,7 +2436,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if getattr(agent, "_block_provider_fallback", False):
+    if getattr(agent, "_block_provider_fallback", False) is True:
         logger.warning(
             "Fallback blocked: local resource exhaustion (EMFILE / errno 24); "
             "staying on primary"

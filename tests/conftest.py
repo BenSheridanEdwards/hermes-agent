@@ -1143,8 +1143,38 @@ def _git_guard_violation(cmd, cwd=None):
     try:
         base = Path(_os.fsdecode(cwd)) if cwd is not None else Path(_os.getcwd())
         if subcommand in _GIT_DESTINATION_SUBCOMMANDS:
-            positionals = [tok for tok in rest if not tok.startswith("-")]
-            target = base / positionals[-1] if positionals else base
+            # `git init -b main` and `git init --initial-branch=main` take the
+            # branch name as an option value, not a destination directory.
+            # `git -C /tmp/repo init -q` has no positional dest: the -C target
+            # is the repo, not process cwd.
+            dest_opts_with_value = {
+                "-b",
+                "--initial-branch",
+                "--template",
+                "--separate-git-dir",
+                "--object-format",
+                "--ref-format",
+            }
+            positionals = []
+            skip_next = False
+            for tok in rest:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in dest_opts_with_value:
+                    skip_next = True
+                    continue
+                if tok.startswith("--") and "=" in tok:
+                    continue
+                if tok.startswith("-"):
+                    continue
+                positionals.append(tok)
+            if positionals:
+                target = base / positionals[-1]
+            elif target_override is not None:
+                target = base / target_override
+            else:
+                target = base
         elif target_override is not None:
             # Relative `-C`/`--git-dir` values resolve against cwd; absolute
             # ones replace it (Path.__truediv__ already does exactly that).
