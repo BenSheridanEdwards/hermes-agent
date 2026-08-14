@@ -202,9 +202,9 @@ def _run_update_until_guard(args):
         # gating, not orphan detection (covered in
         # test_update_orphan_backend_reap.py). None = "not provably orphaned"
         # → the guard refuses exactly as before the orphan-reap addition.
-        cli_main, "_orphaned_desktop_backend_pids", return_value=None
+        main_mod, "_orphaned_desktop_backend_pids", return_value=None
     ), patch.object(
-        cli_main, "PROJECT_ROOT", _RootSentinel()
+        main_mod, "PROJECT_ROOT", _RootSentinel()
     ), patch.object(
         update_cmd, "subprocess", _NoSubprocess()
     ):

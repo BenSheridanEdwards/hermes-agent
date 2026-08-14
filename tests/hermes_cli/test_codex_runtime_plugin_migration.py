@@ -222,7 +222,16 @@ class TestMigrate:
                 },
             }
         }
-        report = migrate(hermes_cfg, codex_home=tmp_path, expose_hermes_tools=False)
+        # discover_plugins=False: this test asserts config.toml rendering, not
+        # plugin discovery. Left at its default of True it spawns the real codex
+        # CLI, which runs `git ls-remote https://github.com/openai/plugins.git`
+        # — a live network call to a third-party repo, from a unit test.
+        report = migrate(
+            hermes_cfg,
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
         assert report.written
         text = (tmp_path / "config.toml").read_text()
         assert "[mcp_servers.filesystem]" in text
@@ -269,9 +278,11 @@ class TestMigrate:
 
 
     def test_summary_reports_migration_count(self, tmp_path):
+        # discover_plugins=False — see the note in the round-trip test above:
+        # the default spawns the real codex CLI and reaches the network.
         report = migrate({
             "mcp_servers": {"a": {"command": "x"}, "b": {"command": "y"}}
-        }, codex_home=tmp_path, expose_hermes_tools=False)
+        }, codex_home=tmp_path, discover_plugins=False, expose_hermes_tools=False)
         summary = report.summary()
         assert "Migrated 2 MCP server(s)" in summary
         assert "- a" in summary
