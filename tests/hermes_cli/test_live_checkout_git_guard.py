@@ -97,6 +97,21 @@ class TestPredicate:
             cwd=str(_LIVE_CHECKOUT_ROOT),
         ) is None
 
+    def test_init_dash_b_main_is_not_a_destination(self, tmp_path):
+        """`git init -b main` names a branch, not a path under the checkout."""
+        assert _git_guard_violation(
+            ["git", "-C", str(tmp_path), "init", "-q", "-b", "main"],
+            cwd=str(_LIVE_CHECKOUT_ROOT),
+        ) is None
+        assert _git_guard_violation(
+            ["git", "-C", str(tmp_path), "init", "-q"],
+            cwd=str(_LIVE_CHECKOUT_ROOT),
+        ) is None
+        assert _git_guard_violation(
+            ["git", "init", "-b", "main"],
+            cwd=str(tmp_path),
+        ) is None
+
     def test_defaults_to_process_cwd_when_unset(self, monkeypatch):
         """A bare ``subprocess.run(["git", ...])`` inherits pytest's cwd."""
         monkeypatch.chdir(_LIVE_CHECKOUT_ROOT)
