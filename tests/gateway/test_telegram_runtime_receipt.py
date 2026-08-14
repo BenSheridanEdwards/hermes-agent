@@ -96,6 +96,7 @@ def test_polling_progress_refreshes_transport_readiness(monkeypatch):
     adapter._polling_teardown_started = False
     adapter._polling_progress_accepting = True
     adapter._polling_generation = 7
+    adapter._polling_conflict_recovery_generation = None
     adapter._polling_progress_event = asyncio.Event()
     adapter._polling_network_error_count = 1
     adapter._polling_conflict_count = 1
