@@ -774,7 +774,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        oauth_token_write_authority: Optional[str] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -782,6 +787,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                oauth_token_write_authority=oauth_token_write_authority,
             )
 
     def _is_terminal_auth_failure(
@@ -2397,11 +2403,16 @@ class CredentialPool:
                 return None, None, f"No credential #{index}."
             return None, None, f'No credential matching "{raw}".'
 
-    def add_entry(self, entry: PooledCredential) -> PooledCredential:
+    def add_entry(
+        self,
+        entry: PooledCredential,
+        *,
+        oauth_token_write_authority: Optional[str] = None,
+    ) -> PooledCredential:
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
-            self._persist()
+            self._persist(oauth_token_write_authority=oauth_token_write_authority)
             return entry
 
 
