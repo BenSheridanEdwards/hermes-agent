@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
+
+
+def _jwt_with_exp(exp_epoch: int) -> str:
+    import base64
+
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": exp_epoch}).encode("utf-8")
+    ).rstrip(b"=")
+    return f"h.{payload.decode('utf-8')}.s"
 
 
 def _xai_entry(*, access_token: str, refresh_token: str, label: str = "Neo Grok Sub") -> dict:
@@ -112,6 +122,129 @@ def test_standalone_xai_pool_write_remains_compatible(tmp_path, monkeypatch):
     [persisted] = read_credential_pool("xai-oauth")
     assert persisted["access_token"] == "standalone-access"
     assert persisted["refresh_token"] == "standalone-refresh"
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "oauth:\n  refresh_owner: external\n",
+        "oauth:\n  refresh_owner: fleet\n",
+        "oauth: []\n",
+        "{]\n",
+    ],
+)
+def test_legacy_singleton_refresh_fails_closed_without_spending_external_token(
+    tmp_path,
+    monkeypatch,
+    config_text,
+):
+    from hermes_cli.auth import AuthError, _refresh_xai_oauth_tokens
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+    (hermes_home / "auth.json").write_text(
+        json.dumps({"version": 1, "providers": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    refresh_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: refresh_calls.append(True),
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        _refresh_xai_oauth_tokens(
+            {"access_token": "stale-access", "refresh_token": "fleet-refresh"},
+            token_endpoint="https://auth.x.ai/oauth2/token",
+            timeout_seconds=5.0,
+        )
+
+    assert exc_info.value.code == "xai_external_refresh_forbidden"
+    assert exc_info.value.relogin_required is False
+    assert refresh_calls == []
+
+
+def test_runtime_resolver_adopts_scheduler_pool_without_refreshing_singleton(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+    hermes_home = tmp_path / "hermes"
+    _write_external_store(hermes_home)
+    payload = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    payload["providers"]["xai-oauth"] = {
+        "tokens": {
+            "access_token": _jwt_with_exp(int(time.time()) - 60),
+            "refresh_token": "stale-singleton-refresh",
+        },
+        "discovery": {"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    }
+    scheduler_access = _jwt_with_exp(int(time.time()) + 7200)
+    payload["credential_pool"]["xai-oauth"][0].update(
+        access_token=scheduler_access,
+        refresh_token="scheduler-refresh",
+    )
+    (hermes_home / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    refresh_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: refresh_calls.append(True),
+    )
+
+    credentials = resolve_xai_oauth_runtime_credentials(force_refresh=True)
+
+    assert credentials["api_key"] == scheduler_access
+    assert refresh_calls == []
+
+
+def test_external_pool_proactive_and_reactive_refresh_only_adopt_disk_tokens(
+    tmp_path,
+    monkeypatch,
+):
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    hermes_home = tmp_path / "hermes"
+    _write_external_store(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    expiring_access = _jwt_with_exp(int(time.time()) + 30)
+    payload = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    payload["credential_pool"]["xai-oauth"][0]["access_token"] = expiring_access
+    (hermes_home / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
+    entry = PooledCredential.from_dict(
+        "xai-oauth", payload["credential_pool"]["xai-oauth"][0]
+    )
+    pool = CredentialPool("xai-oauth", [entry])
+    refresh_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: refresh_calls.append(True),
+    )
+
+    selected = pool.select()
+    assert selected is not None
+    assert selected.access_token == expiring_access
+    assert refresh_calls == []
+
+    assert pool.try_refresh_current() is None
+    assert refresh_calls == []
+
+    scheduler_access = _jwt_with_exp(int(time.time()) + 7200)
+    payload = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    payload["credential_pool"]["xai-oauth"][0].update(
+        access_token=scheduler_access,
+        refresh_token="scheduler-rotated-refresh",
+    )
+    (hermes_home / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    adopted = pool.try_refresh_current()
+    assert adopted is not None
+    assert adopted.access_token == scheduler_access
+    assert adopted.refresh_token == "scheduler-rotated-refresh"
+    assert refresh_calls == []
 
 
 @pytest.mark.parametrize("requested_label", [None, "Neo Grok Sub", "generic lane"])
