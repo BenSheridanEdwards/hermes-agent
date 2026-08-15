@@ -82,6 +82,22 @@ def test_process_telegram_token_is_attributed_to_process_env(monkeypatch):
     assert telegram.credential_source == "process_env"
 
 
+def test_process_token_inside_empty_profile_scope_is_attributed_to_process_env(
+    monkeypatch,
+):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "process-secret")
+    scope_token = set_secret_scope({})
+    try:
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+    finally:
+        reset_secret_scope(scope_token)
+
+    telegram = config.platforms[Platform.TELEGRAM]
+    assert telegram.token == "process-secret"
+    assert telegram.credential_source == "process_env"
+
+
 def test_polling_progress_refreshes_transport_readiness(monkeypatch):
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM

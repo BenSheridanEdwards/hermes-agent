@@ -1918,8 +1918,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if telegram_token:
         telegram_config = _enable_from_env(Platform.TELEGRAM)
         telegram_config.token = telegram_token
+        active_secret_scope = current_secret_scope()
         telegram_config.credential_source = (
-            "profile_env" if current_secret_scope() is not None else "process_env"
+            "profile_env"
+            if active_secret_scope and active_secret_scope.get("TELEGRAM_BOT_TOKEN")
+            else "process_env"
         )
     
     # Reply threading mode for Telegram (off/first/all)
