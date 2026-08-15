@@ -1311,6 +1311,16 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if self.provider == "xai-oauth" and not auth_mod.runtime_owns_oauth_refresh(
+            self.provider
+        ):
+            synced = self._sync_xai_oauth_entry_from_pool_store(entry)
+            if synced is not entry:
+                return synced
+            logger.warning(
+                "credential pool: refusing xAI OAuth refresh because ownership is external"
+            )
+            return None
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1767,6 +1777,10 @@ class CredentialPool:
 
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
         if entry.auth_type != AUTH_TYPE_OAUTH:
+            return False
+        if self.provider == "xai-oauth" and not auth_mod.runtime_owns_oauth_refresh(
+            self.provider
+        ):
             return False
         if self.provider == "anthropic":
             if entry.expires_at_ms is None:
