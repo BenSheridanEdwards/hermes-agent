@@ -99,6 +99,7 @@ def test_polling_progress_refreshes_transport_readiness(monkeypatch):
     adapter._polling_progress_event = asyncio.Event()
     adapter._polling_network_error_count = 1
     adapter._polling_conflict_count = 1
+    adapter._polling_conflict_recovery_generation = None
     adapter._send_path_degraded = True
     status_writer = MagicMock()
     monkeypatch.setattr(adapter, "_write_runtime_status_safe", status_writer)
