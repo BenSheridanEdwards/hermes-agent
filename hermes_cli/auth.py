@@ -109,6 +109,38 @@ except Exception:
 AUTH_STORE_VERSION = 1
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
 
+
+def runtime_owns_oauth_refresh(provider: str) -> bool:
+    """Return whether Hermes owns refresh-token writes for ``provider``.
+
+    Standalone xAI behavior remains runtime-owned when no ownership setting is
+    present. Once the setting exists, malformed or unknown values fail closed
+    so a typo cannot create a second refresh-token writer.
+    """
+    if provider != "xai-oauth":
+        return True
+    config_path = get_config_path()
+    if not config_path.exists():
+        return True
+    try:
+        config = read_raw_config()
+    except Exception:
+        logger.warning("OAuth refresh ownership unreadable; refusing runtime writes")
+        return False
+    if not isinstance(config, dict) or "oauth" not in config:
+        return True
+    oauth_config = config.get("oauth")
+    if not isinstance(oauth_config, dict):
+        logger.warning("OAuth refresh ownership is invalid; refusing runtime writes")
+        return False
+    refresh_owner = oauth_config.get("refresh_owner")
+    if refresh_owner == "runtime":
+        return True
+    if refresh_owner == "external":
+        return False
+    logger.warning("OAuth refresh owner must be runtime or external; refusing runtime writes")
+    return False
+
 # Nous Portal defaults
 DEFAULT_NOUS_PORTAL_URL = "https://portal.nousresearch.com"
 DEFAULT_NOUS_INFERENCE_URL = "https://inference-api.nousresearch.com/v1"
@@ -1717,6 +1749,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    oauth_token_write_authority: Optional[str] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1735,6 +1768,11 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    Under external xAI ownership, only the exact ``external-scheduler``
+    authority may mutate existing OAuth rows. A genuine interactive login may
+    append a new row, but cannot overwrite or remove scheduler-owned rows.
+    Other writers preserve the OAuth material already on disk.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
@@ -1750,6 +1788,48 @@ def write_credential_pool(
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
+        if (
+            oauth_token_write_authority != "external-scheduler"
+            and not runtime_owns_oauth_refresh(provider_id)
+        ):
+            existing_by_id_for_protection = {
+                entry.get("id"): entry
+                for entry in existing_list
+                if isinstance(entry, dict) and entry.get("id")
+            }
+            protected_oauth_ids = {
+                entry_id
+                for entry_id, entry in existing_by_id_for_protection.items()
+                if entry.get("auth_type") == "oauth" or entry.get("refresh_token")
+            }
+            allow_new_interactive = (
+                oauth_token_write_authority == "interactive-login"
+            )
+            protected_entries: List[Dict[str, Any]] = []
+            for incoming in sanitized_entries:
+                if not isinstance(incoming, dict):
+                    protected_entries.append(incoming)
+                    continue
+                incoming_id = incoming.get("id")
+                disk_entry = existing_by_id_for_protection.get(incoming_id)
+                incoming_is_oauth = (
+                    incoming.get("auth_type") == "oauth"
+                    or bool(incoming.get("refresh_token"))
+                )
+                if incoming_id in protected_oauth_ids:
+                    protected_entries.append(
+                        sanitize_borrowed_credential_payload(disk_entry, provider_id)
+                    )
+                elif incoming_is_oauth and not allow_new_interactive:
+                    continue
+                else:
+                    protected_entries.append(incoming)
+            sanitized_entries = protected_entries
+            removed = {
+                entry_id
+                for entry_id in removed
+                if entry_id not in protected_oauth_ids
+            }
         existing_by_id = {
             entry.get("id"): entry
             for entry in existing_list
