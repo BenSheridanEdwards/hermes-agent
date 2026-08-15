@@ -84,6 +84,12 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
+        # The assertion below is about persisted plugin prompt sections, not
+        # the intentionally live git workspace snapshot. Build both process
+        # prompts from the same marker-free directory so unrelated CI merge
+        # ref metadata cannot make the byte comparison nondeterministic.
+        os.chdir(os.environ["TEST_CWD"])
+
         db = SessionDB(db_path=Path(os.environ["TEST_DB"]))
         session_id = "resume-plugin-section"
         db.ensure_session(session_id, source="cli", model="test/model")
@@ -143,6 +149,7 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
             HERMES_HOME=str(tmp_path / "hermes-home"),
             TEST_DB=str(db_path),
             TEST_CALLS=str(calls_path),
+            TEST_CWD=str(tmp_path),
             TEST_PHASE=phase,
         )
         proc = subprocess.run(
