@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -2311,15 +2312,48 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=script_timeout,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
+        if sys.platform == "win32":
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=script_timeout,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+        else:
+            process = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=script_timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
+                raise
+            result = subprocess.CompletedProcess(
+                argv,
+                process.returncode,
+                stdout,
+                stderr,
+            )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 

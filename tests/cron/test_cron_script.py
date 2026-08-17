@@ -94,6 +94,43 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group regression")
+    @pytest.mark.live_system_guard_bypass
+    def test_timed_out_shell_script_reaps_descendants(self, cron_env, monkeypatch):
+        from cron.scheduler import _run_job_script
+
+        child_pid_path = cron_env / "child.pid"
+        script = cron_env / "scripts" / "spawn-child.sh"
+        script.write_text(
+            f"sleep 60 &\necho $! > {child_pid_path!s}\nwait\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "1")
+
+        child_pid = None
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out after 1s" in output
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            for _ in range(20):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                import time
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"timed-out script descendant {child_pid} survived")
+        finally:
+            if child_pid is None and child_pid_path.exists():
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, 9)
+                except ProcessLookupError:
+                    pass
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 
@@ -182,13 +219,20 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        class FakeProcess:
+            returncode = 0
+            pid = 12345
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                captured["timeout"] = timeout
+                return "ok\n", ""
 
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakeProcess)
 
         success, output = _run_job_script("probe.py")
 
@@ -196,7 +240,7 @@ class TestRunJobScript:
         assert output == "ok"
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
-        assert "creationflags" not in captured["kwargs"]
+        assert captured["kwargs"]["start_new_session"] is True
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
