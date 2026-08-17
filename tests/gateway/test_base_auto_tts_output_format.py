@@ -12,6 +12,7 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -84,6 +85,17 @@ def _hold_typing():
 def test_output_path_is_mp3_for_non_opus_platforms(platform):
     path = build_auto_tts_output_path(platform)
     assert path.endswith(".mp3"), path
+
+
+def test_output_path_uses_profile_audio_cache(monkeypatch, tmp_path):
+    """Auto-TTS must stay inside the active profile's media-safe cache."""
+    profile_home = tmp_path / "profiles" / "neo"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    path = Path(build_auto_tts_output_path(Platform.TELEGRAM))
+
+    assert path.parent == profile_home / "audio_cache"
+    assert path.suffix == ".ogg"
 
 
 # ---------------------------------------------------------------------------
