@@ -239,8 +239,10 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
         return True
 
     # zipfile.write() follows file symlinks, so skip links before any archive
-    # write can copy data from outside HERMES_HOME.
-    if abs_path.is_symlink():
+    # write can copy data from outside HERMES_HOME. os.walk also reports Unix
+    # sockets, FIFOs, and device nodes in filenames; only regular files belong
+    # in a portable backup archive.
+    if abs_path.is_symlink() or not abs_path.is_file():
         return True
 
     try:

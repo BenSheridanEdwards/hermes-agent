@@ -2,7 +2,10 @@
 
 import json
 import os
+import shutil
+import socket
 import sqlite3
+import tempfile
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -139,6 +142,33 @@ class TestShouldExclude:
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+
+    @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+    def test_skips_unix_socket_files(self, tmp_path, monkeypatch, capsys):
+        """Full backups must ignore runtime sockets instead of blocking on open."""
+        short_root = Path(tempfile.mkdtemp(prefix="hb-", dir="/tmp"))
+        hermes_home = short_root / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        socket_path = hermes_home / "home" / "Library" / "Caches" / "cua-driver.sock"
+        socket_path.parent.mkdir(parents=True)
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+            monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+            out_zip = tmp_path / "backup.zip"
+            from hermes_cli.backup import run_backup
+            run_backup(Namespace(output=str(out_zip)))
+
+            assert "Backup complete:" in capsys.readouterr().out
+            with zipfile.ZipFile(out_zip, "r") as zf:
+                assert "home/Library/Caches/cua-driver.sock" not in zf.namelist()
+        finally:
+            listener.close()
+            shutil.rmtree(short_root)
 
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
