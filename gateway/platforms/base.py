@@ -162,7 +162,7 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
 
 
 def build_auto_tts_output_path(platform) -> str:
-    """Return a unique temp output path for gateway auto-TTS synthesis.
+    """Return a unique profile-scoped output path for gateway auto-TTS.
 
     Platform-awareness lives HERE (the caller knows its platform), not in the
     TTS tool's ``HERMES_SESSION_PLATFORM`` contextvar — that contextvar is
@@ -174,17 +174,19 @@ def build_auto_tts_output_path(platform) -> str:
     (``_repair_ogg_container``) then guarantees real Ogg/Opus bytes for every
     provider, including MP3-only backends like Edge TTS. Everything else
     keeps the MP3 default.
+
+    Auto-TTS output belongs under the active profile's ``audio_cache`` rather
+    than the OS temporary directory. Besides isolating concurrent profiles,
+    this keeps generated media inside Hermes' approved profile-owned path.
     """
+    from hermes_constants import get_hermes_home
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
-        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
-    )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
+    audio_dir = get_hermes_home() / "audio_cache"
+    audio_path = audio_dir / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    return str(audio_path)
 
 
 def utf16_len(s: str) -> int:
