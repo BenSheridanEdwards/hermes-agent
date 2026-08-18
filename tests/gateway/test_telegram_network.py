@@ -169,6 +169,120 @@ class TestFallbackTransport:
         assert [c["url_host"] for c in calls] == ["149.154.167.220", "api.telegram.org", "149.154.167.221"]
         assert transport._sticky_ip == "149.154.167.221"
 
+    @pytest.mark.asyncio
+    async def test_get_file_read_timeout_rotates_to_fallback(self, monkeypatch):
+        """Bot API getFile is idempotent, so a header stall can use another pool."""
+        calls = []
+        behavior = {
+            "api.telegram.org": httpx.ReadTimeout("response headers stalled"),
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx,
+            "AsyncHTTPTransport",
+            _fake_transport_factory(calls, behavior),
+        )
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        request = httpx.Request(
+            "POST",
+            "https://api.telegram.org/botTOKEN/getFile",
+            content=b"file_id=voice-id",
+        )
+
+        response = await transport.handle_async_request(request)
+
+        assert response.status_code == 200
+        assert [call["url_host"] for call in calls] == [
+            "api.telegram.org",
+            "149.154.167.220",
+        ]
+        assert transport._sticky_ip == "149.154.167.220"
+
+    @pytest.mark.asyncio
+    async def test_send_message_read_timeout_is_never_retried(self, monkeypatch):
+        """A retry after an ambiguous send response could duplicate user-visible output."""
+        calls = []
+        behavior = {
+            "api.telegram.org": httpx.ReadTimeout("response headers stalled"),
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx,
+            "AsyncHTTPTransport",
+            _fake_transport_factory(calls, behavior),
+        )
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        request = httpx.Request(
+            "POST",
+            "https://api.telegram.org/botTOKEN/sendMessage",
+            content=b"chat_id=1&text=hello",
+        )
+
+        with pytest.raises(httpx.ReadTimeout):
+            await transport.handle_async_request(request)
+
+        assert [call["url_host"] for call in calls] == ["api.telegram.org"]
+        assert transport._sticky_ip is None
+
+    @pytest.mark.asyncio
+    async def test_get_updates_read_timeout_is_never_retried(self, monkeypatch):
+        calls = []
+        behavior = {
+            "api.telegram.org": httpx.ReadTimeout("long poll response stalled"),
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx,
+            "AsyncHTTPTransport",
+            _fake_transport_factory(calls, behavior),
+        )
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        request = httpx.Request(
+            "GET",
+            "https://api.telegram.org/botTOKEN/getUpdates",
+        )
+
+        with pytest.raises(httpx.ReadTimeout):
+            await transport.handle_async_request(request)
+
+        assert [call["url_host"] for call in calls] == ["api.telegram.org"]
+        assert transport._sticky_ip is None
+
+    @pytest.mark.asyncio
+    async def test_file_download_read_timeout_rotates_without_closing_pool(
+        self, monkeypatch
+    ):
+        calls = []
+        behavior = {
+            "149.154.167.220": httpx.ReadTimeout("file body stalled"),
+            "api.telegram.org": httpx.ReadTimeout("primary file body stalled"),
+            "149.154.167.221": "ok",
+        }
+        factory = _fake_transport_factory(calls, behavior)
+        instances = factory.instances  # type: ignore[attr-defined]
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "149.154.167.221"]
+        )
+        transport._sticky_ip = "149.154.167.220"
+        request = httpx.Request(
+            "GET",
+            "https://api.telegram.org/file/botTOKEN/voice/file.ogg",
+        )
+
+        response = await transport.handle_async_request(request)
+
+        assert response.status_code == 200
+        assert [call["url_host"] for call in calls] == [
+            "149.154.167.220",
+            "api.telegram.org",
+            "149.154.167.221",
+        ]
+        # Instance zero is the primary pool; instance one is the timed-out
+        # sticky fallback. Read stalls rotate the request but retain the pool.
+        assert instances[1].closed is False
+        assert transport._sticky_ip == "149.154.167.221"
+
 
 class TestFallbackTransportPassthrough:
     """Requests that don't need fallback behavior."""

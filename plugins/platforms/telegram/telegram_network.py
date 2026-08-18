@@ -54,7 +54,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
     Requests continue to target https://api.telegram.org/... logically, but on
     connect failures the underlying TCP connection is retried against a known
-    reachable IP. This is effectively the programmatic equivalent of
+    reachable IP. Idempotent inbound-media requests also rotate after response
+    read failures; ambiguous outbound sends never do. This is effectively the
+    programmatic equivalent of
     ``curl --resolve api.telegram.org:443:<ip>``.
     """
 
@@ -131,7 +133,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 return response
             except Exception as exc:
                 last_error = exc
-                if not _is_retryable_connect_error(exc):
+                if not _is_retryable_transport_error(request, exc):
                     raise
                 if ip is not None and ip == self._sticky_ip:
                     async with self._sticky_lock:
@@ -149,7 +151,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                     )
                     continue
                 logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
-                await self._reset_fallback(ip)
+                # Connect failures can leave poisoned/CLOSE_WAIT sockets behind,
+                # so discard that pool. A read timeout on an idempotent media
+                # request only rotates this request: closing a healthy shared
+                # pool here would create avoidable connection churn across the
+                # Fleet during a Telegram response stall.
+                if _is_retryable_connect_error(exc):
+                    await self._reset_fallback(ip)
                 continue
 
         if last_error is None:
@@ -303,3 +311,28 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
 
 def _is_retryable_connect_error(exc: Exception) -> bool:
     return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+
+
+def _is_idempotent_media_request(request: httpx.Request) -> bool:
+    """Identify Telegram operations safe to repeat after an ambiguous response."""
+    path = request.url.path.rstrip("/").lower()
+    if path.endswith("/getfile"):
+        return True
+    return request.method.upper() in {"GET", "HEAD"} and path.startswith("/file/")
+
+
+def _is_retryable_transport_error(
+    request: httpx.Request, exc: Exception
+) -> bool:
+    """Retry connection failures, plus read failures for inbound media only."""
+    if _is_retryable_connect_error(exc):
+        return True
+    return _is_idempotent_media_request(request) and isinstance(
+        exc,
+        (
+            httpx.PoolTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+        ),
+    )
