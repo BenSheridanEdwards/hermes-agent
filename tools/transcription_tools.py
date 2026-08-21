@@ -2521,8 +2521,18 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
     }
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """Safely validate, preprocess supported inputs, and dispatch transcription."""
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely validate, preprocess supported inputs, and dispatch transcription.
+
+    ``source`` is an optional caller-surface label (e.g. ``"gateway"``).
+    Live gateways started before the 2026-08-15 fork/main reset still call
+    ``transcribe_audio(path, None, "gateway")``. Accept and ignore it so
+    inbound Telegram STT does not TypeError. Not used for dispatch.
+    """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
     # preprocessing, so the refusal names the real reason rather than a
