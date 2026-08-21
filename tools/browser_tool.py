@@ -2159,6 +2159,19 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
+def _browser_local_fallback_enabled() -> bool:
+    """Return whether a failed cloud session may degrade to local Chromium."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        browser_config = read_raw_config().get("browser", {})
+        if isinstance(browser_config, dict):
+            return browser_config.get("local_fallback", True) is not False
+    except Exception as error:
+        logger.debug("Could not read browser.local_fallback: %s", error)
+    return True
+
+
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Get or create session info for the given session key.
@@ -2241,6 +2254,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
                 provider_name = type(provider).__name__
+                if not _browser_local_fallback_enabled():
+                    raise RuntimeError(
+                        f"Cloud provider {provider_name} failed and "
+                        f"browser.local_fallback is false: {e}"
+                    ) from e
                 logger.warning(
                     "Cloud provider %s failed (%s); attempting fallback to local "
                     "Chromium for task %s",

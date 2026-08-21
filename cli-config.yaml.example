@@ -385,6 +385,11 @@ browser:
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
 
+  # When true (default), a cloud session creation failure falls back to local Chromium.
+  # Set false when remote execution is a safety or isolation boundary. Cloud failures
+  # then fail closed instead of launching a browser on this machine.
+  local_fallback: true
+
 # =============================================================================
 # Tool Loop Guardrails
 # =============================================================================

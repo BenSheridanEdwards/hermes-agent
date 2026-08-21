@@ -11,6 +11,21 @@ import pytest
 import tools.browser_tool as browser_tool
 
 
+@pytest.mark.parametrize(
+    ("browser_config", "expected"),
+    [
+        ({}, True),
+        ({"local_fallback": True}, True),
+        ({"local_fallback": False}, False),
+    ],
+)
+def test_browser_local_fallback_policy(monkeypatch, browser_config, expected):
+    import hermes_cli.config
+
+    monkeypatch.setattr(hermes_cli.config, "read_raw_config", lambda: {"browser": browser_config})
+    assert browser_tool._browser_local_fallback_enabled() is expected
+
+
 def _reset_session_state(monkeypatch):
     """Clear caches so each test starts fresh."""
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
@@ -18,6 +33,7 @@ def _reset_session_state(monkeypatch):
     monkeypatch.setattr(browser_tool, "_cloud_provider_resolved", False)
     monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
     monkeypatch.setattr(browser_tool, "_update_session_activity", lambda t: None)
+    monkeypatch.setattr(browser_tool, "_browser_local_fallback_enabled", lambda: True)
 
 
 class TestCloudProviderRuntimeFallback:
@@ -39,6 +55,22 @@ class TestCloudProviderRuntimeFallback:
         assert session["fallback_provider"] == "Mock"
         assert session["features"]["local"] is True
         assert session["cdp_url"] is None
+
+    def test_cloud_failure_fails_closed_when_local_fallback_is_disabled(self, monkeypatch):
+        _reset_session_state(monkeypatch)
+
+        provider = Mock()
+        provider.create_session.side_effect = RuntimeError("402 insufficient credits")
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(browser_tool, "_browser_local_fallback_enabled", lambda: False)
+        local_session = Mock(side_effect=AssertionError("local browser must not launch"))
+        monkeypatch.setattr(browser_tool, "_create_local_session", local_session)
+
+        with pytest.raises(RuntimeError, match=r"local_fallback is false.*402 insufficient credits"):
+            browser_tool._get_session_info("task-remote-only")
+
+        local_session.assert_not_called()
 
 
     def test_no_provider_uses_local_directly(self, monkeypatch):
