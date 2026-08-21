@@ -437,6 +437,33 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 # Dispatch
 # ---------------------------------------------------------------------------
 
+def _computer_use_background_only() -> bool:
+    """Return whether visible foreground delivery is disabled by policy.
+
+    ``computer_use.background_only`` is intentionally opt-in for backwards
+    compatibility. When enabled, every path that can raise or briefly front a
+    window is refused before approval and before the cua-driver backend starts.
+    This is stronger than relying on the model to keep the default background
+    rung, and stronger than approval scoping in unattended/YOLO sessions.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("computer_use") or {}
+        return bool(cfg.get("background_only", False))
+    except Exception:
+        return False
+
+
+def _requests_foreground(action: str, args: Dict[str, Any]) -> bool:
+    """True for every computer-use request that can visibly front a window."""
+    return bool(
+        args.get("delivery_mode") == "foreground"
+        or args.get("bring_to_front")
+        or (action == "focus_app" and args.get("raise_window"))
+    )
+
+
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point — dispatched by tools.registry.
 
@@ -451,6 +478,19 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     session_id = str(kwargs.get("session_id") or "")
 
     # Safety: validate actions before approval prompt.
+    if _computer_use_background_only() and _requests_foreground(action, args):
+        return json.dumps({
+            "ok": False,
+            "status": "refused",
+            "code": "foreground_disabled",
+            "effect": "suspected_noop",
+            "message": (
+                "Foreground computer use is disabled by "
+                "computer_use.background_only. Use background delivery, an "
+                "isolated typed-browser target, or a separate desktop session."
+            ),
+        })
+
     if action in {"type", "cua_browser_type"}:
         text = args.get("text", "")
         pat = _is_blocked_type(text)
