@@ -1575,6 +1575,84 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _fallback_route_identity(entry: Any) -> tuple:
+    """Normalised route identity for a fallback entry.
+
+    Mirrors ``_fallback_entry_key`` in ``agent.chat_completion_helpers`` so a
+    fallback entry is considered the *same* backend when its provider (lowered),
+    model, and base_url (trailing slash stripped) all match.  This is the axis
+    on which a delegated primary is an "exact duplicate" of an inherited entry.
+    """
+    return (
+        str(entry.get("provider") or "").strip().lower(),
+        str(entry.get("model") or "").strip(),
+        str(entry.get("base_url") or "").strip().rstrip("/"),
+    )
+
+
+def _build_delegated_fallback_chain(
+    parent_fallback: Optional[List[dict]],
+    *,
+    delegated_primary: dict,
+    parent_primary_runtime: Optional[dict],
+) -> Optional[List[dict]]:
+    """Build a child's fallback chain when it is delegated to a distinct route.
+
+    A child that is routed to its own provider:model must never "fall back"
+    onto that same route — that would loop the failure it was supposed to
+    recover from (e.g. a child delegated to OpenRouter must not treat an
+    OpenRouter entry inherited from its parent as a fallback).  So:
+
+      1. Drop any entry in ``parent_fallback`` whose route identity exactly
+         matches ``delegated_primary``.
+      2. Keep the surviving entries in their original order.
+      3. Append the parent's own ``_primary_runtime`` (provider / model /
+         base_url / api_mode / api_key) as a terminal route, but only when it
+         is distinct from every surviving entry AND from the delegated primary
+         itself.  This hands the child a last-resort route back into the
+         parent's own credentials without resurrecting the route being used.
+
+    Returns ``None`` when no fallback route remains (matching the
+    ``fallback_model`` contract where ``None`` means "nothing to fall back to").
+    ``delegated_primary`` may carry only the keys it has; missing keys compare
+    as empty so a narrow entry still dedups against a richer one.
+
+    This helper has no side effects and emits nothing. It copies the parent's
+    runtime credential into the terminal route for internal use, but never
+    logs or returns it through an external readback surface.
+    """
+    parent_primary_runtime = parent_primary_runtime or {}
+    delegated_identity = _fallback_route_identity(delegated_primary)
+
+    chain = []
+    for entry in parent_fallback or []:
+        if not isinstance(entry, dict):
+            # Malformed entries are already ignored by agent_init when it
+            # builds _fallback_chain; skip defensively rather than crash.
+            continue
+        if _fallback_route_identity(entry) == delegated_identity:
+            # Exact duplicate of the delegated primary — drop.
+            continue
+        chain.append(entry)
+
+    terminal = {
+        "provider": parent_primary_runtime.get("provider"),
+        "model": parent_primary_runtime.get("model"),
+        "base_url": parent_primary_runtime.get("base_url"),
+        "api_mode": parent_primary_runtime.get("api_mode"),
+        "api_key": parent_primary_runtime.get("api_key"),
+    }
+    if terminal.get("provider") and terminal.get("model"):
+        terminal_identity = _fallback_route_identity(terminal)
+        blocked = {
+            _fallback_route_identity(e) for e in chain
+        } | {delegated_identity}
+        if terminal_identity not in blocked:
+            chain.append(terminal)
+
+    return chain if chain else None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1841,23 +1919,43 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    #
-    # EXCEPT when the user pinned delegation.provider: an explicit pin means
-    # "children run on THIS provider".  Inheriting the parent chain would let
-    # a mid-run auth/429 failure silently reroute the quiet-mode child onto
-    # the parent's fallback models with no surfaced signal (#80450) — the
-    # same class of silent-drag the override_provider filter-clearing below
-    # already prevents for OpenRouter routing preferences.  Predictability >
-    # liveness for explicit pins: the pinned child fails loudly instead.
+    # A pinned delegation.provider fails loudly by default (#80450). Operators
+    # who deliberately prefer liveness may opt into the explicit
+    # ``inherit_then_parent`` policy: keep the parent's ordered fallback chain
+    # and append its primary runtime as the final recovery route.
+    fallback_policy = str(delegation_cfg.get("fallback_policy") or "pinned").strip().lower()
+    inherit_pinned_fallbacks = fallback_policy == "inherit_then_parent"
     parent_fallback = (
         None
-        if override_provider
+        if override_provider and not inherit_pinned_fallbacks
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
+
+    # When a delegation override routes the child onto a distinct provider:model
+    # (delegation.provider / delegation.base_url / delegation.model), the child
+    # must never "fall back" onto its own delegated route — that would loop the
+    # failure it is meant to recover from. Under the explicit fallback policy,
+    # strip any exact duplicate, keep the rest in order, and append the parent's
+    # primary runtime as a terminal route when distinct. With no override active
+    # the parent chain is passed through untouched; pinned providers remain
+    # fail-loudly unless the operator opted in.
+    _delegation_override_active = bool(override_provider) or bool(override_base_url) or (
+        model is not None and model != getattr(parent_agent, "model", None)
+    )
+    if _delegation_override_active and (
+        not override_provider or inherit_pinned_fallbacks
+    ):
+        parent_fallback = _build_delegated_fallback_chain(
+            parent_fallback,
+            delegated_primary={
+                "provider": effective_provider,
+                "model": effective_model,
+                "base_url": effective_base_url,
+                "api_mode": effective_api_mode,
+                "api_key": effective_api_key,
+            },
+            parent_primary_runtime=getattr(parent_agent, "_primary_runtime", None),
+        )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing

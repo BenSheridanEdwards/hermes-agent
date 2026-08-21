@@ -30,6 +30,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _fallback_route_identity,
+    _build_delegated_fallback_chain,
 )
 from hermes_state import SessionDB
 
@@ -1947,6 +1949,230 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestDelegatedFallbackChainBuilder(unittest.TestCase):
+    """Generic fallback-chain builder for delegated children.
+
+    Uses relationship-based arbitrary models (distinct / overlapping / equal
+    routes) rather than hardcoding any real provider:model pair, so the
+    behaviour is tested generically.  Approved runtime behaviour:
+
+      * When a delegation override routes the child onto a distinct route, the
+        child must not fall back onto that same route (would loop the failure).
+        -> drop exact duplicates of the delegated primary, keep rest in order,
+           then append the parent's own primary runtime as terminal if distinct.
+      * When no override is active, the parent chain is passed through as-is.
+    """
+
+    def test_empty_parent_chain_with_override_returns_none(self):
+        # An override is active but the parent has no fallback chain and no
+        # primary runtime -> nothing to inherit or append, so None is returned.
+        result = _build_delegated_fallback_chain(
+            None,
+            delegated_primary={"provider": "prov-b", "model": "model-b"},
+            parent_primary_runtime=None,
+        )
+        self.assertIsNone(result)
+
+    def test_drops_exact_duplicate_of_delegated_primary(self):
+        # Delegate to route B, which is ALSO the parent's fallback entry.
+        chain = [
+            {"provider": "prov-a", "model": "model-a"},
+            {"provider": "prov-b", "model": "model-b"},  # exact duplicate of primary
+            {"provider": "prov-c", "model": "model-c"},
+        ]
+        result = _build_delegated_fallback_chain(
+            chain,
+            delegated_primary={"provider": "prov-b", "model": "model-b"},
+            parent_primary_runtime=None,
+        )
+        self.assertEqual(
+            [entry["provider"] for entry in result] if result else [],
+            ["prov-a", "prov-c"],
+        )
+
+    def test_retains_remaining_entries_in_order(self):
+        # Delegate to a route not in the chain -> all entries kept in original
+        # order, and the parent primary runtime appended as terminal.
+        chain = [
+            {"provider": "prov-a", "model": "model-a"},
+            {"provider": "prov-b", "model": "model-b"},
+        ]
+        result = _build_delegated_fallback_chain(
+            chain,
+            delegated_primary={"provider": "prov-z", "model": "model-z"},
+            parent_primary_runtime={
+                "provider": "prov-parent",
+                "model": "model-parent",
+                "base_url": "https://parent.example/v1",
+                "api_mode": "chat_completions",
+                "api_key": "sk-parent-secret",
+            },
+        )
+        self.assertEqual(
+            [_["provider"] for _ in result],
+            ["prov-a", "prov-b", "prov-parent"],
+        )
+        # The appended terminal route carries the parent runtime's full fields.
+        self.assertEqual(result[-1]["model"], "model-parent")
+        self.assertEqual(result[-1]["api_mode"], "chat_completions")
+        self.assertEqual(result[-1]["api_key"], "sk-parent-secret")
+
+    def test_terminal_skipped_when_same_as_retained_entry(self):
+        # Parent's own primary runtime matches an entry already retained -> the
+        # terminal duplicate must NOT be appended.
+        chain = [
+            {"provider": "prov-a", "model": "model-a"},
+            {"provider": "prov-parent", "model": "model-parent"},
+        ]
+        result = _build_delegated_fallback_chain(
+            chain,
+            delegated_primary={"provider": "prov-z", "model": "model-z"},
+            parent_primary_runtime={
+                "provider": "prov-parent",
+                "model": "model-parent",
+            },
+        )
+        self.assertEqual(
+            [_["provider"] for _ in result],
+            ["prov-a", "prov-parent"],
+        )
+
+    def test_terminal_skipped_when_same_as_delegated_primary(self):
+        # Parent's primary runtime is the SAME route we delegated to -> appending
+        # it would resurrect the very route we removed.  Must stay dropped.
+        result = _build_delegated_fallback_chain(
+            [{"provider": "prov-a", "model": "model-a"}],
+            delegated_primary={"provider": "prov-b", "model": "model-b"},
+            parent_primary_runtime={
+                "provider": "prov-b",
+                "model": "model-b",
+            },
+        )
+        self.assertEqual([_["provider"] for _ in result], ["prov-a"])
+
+    def test_dedup_is_provider_model_url_identity(self):
+        # Same provider+model but DIFFERENT base_url are distinct routes -> the
+        # delegated entry must NOT be dropped, and terminal is appended.
+        chain = [
+            {"provider": "prov-b", "model": "model-b", "base_url": "https://alt.example/v1"},
+        ]
+        result = _build_delegated_fallback_chain(
+            chain,
+            delegated_primary={
+                "provider": "prov-b",
+                "model": "model-b",
+                "base_url": "https://primary.example/v1",
+            },
+            parent_primary_runtime={
+                "provider": "prov-parent",
+                "model": "model-parent",
+            },
+        )
+        self.assertEqual(
+            [_["provider"] for _ in result],
+            ["prov-b", "prov-parent"],
+        )
+
+    def test_provider_cased_variants_dedup(self):
+        # Provider matching is case-insensitive; model matching is exact.
+        chain = [
+            {"provider": "PROV-B", "model": "model-b", "base_url": "https://x/v1/"},
+        ]
+        result = _build_delegated_fallback_chain(
+            chain,
+            delegated_primary={"provider": "prov-b", "model": "model-b", "base_url": "https://x/v1"},
+            parent_primary_runtime=None,
+        )
+        # Exact duplicate across case + trailing slash -> removed; terminal
+        # absent so nothing survives (empty chain returns None).
+        self.assertIsNone(result)
+
+    def test_none_returned_when_chain_emptied(self):
+        # Only exact duplicate present and no distinct terminal -> nothing left.
+        result = _build_delegated_fallback_chain(
+            [{"provider": "prov-b", "model": "model-b"}],
+            delegated_primary={"provider": "prov-b", "model": "model-b"},
+            parent_primary_runtime=None,
+        )
+        self.assertIsNone(result)
+
+    def test_no_override_preserves_parent_chain_in_child_builder(self):
+        # `_build_child_agent` must pass the parent chain through untouched when
+        # no delegation override is active.
+        parent = _make_mock_parent(depth=0)
+        fallback_entry = {"provider": "prov-a", "model": "model-a", "api_key": "sk-x"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="no override",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    def test_override_strips_duplicate_and_appends_terminal_in_child_builder(self):
+        # With a delegation provider override active, `_build_child_agent` must
+        # hand the child a chain that excludes the delegated route and ends with
+        # the parent's own primary runtime.
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "prov-override", "model": "model-child", "base_url": "https://delegate.example/v1"},
+            {"provider": "prov-other", "model": "model-other"},
+        ]
+        parent._primary_runtime = {
+            "provider": "prov-parent",
+            "model": "model-parent",
+            "base_url": "https://parent.example/v1",
+            "api_mode": "chat_completions",
+            "api_key": "sk-parent-secret",
+        }
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "inherit_then_parent"},
+        ):
+            with patch("run_agent.AIAgent") as MockAgent:
+                MockAgent.return_value = MagicMock()
+                _build_child_agent(
+                    task_index=0,
+                    goal="override",
+                    context=None,
+                    toolsets=None,
+                    model="model-child",
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    override_provider="prov-override",
+                    override_base_url="https://delegate.example/v1",
+                )
+
+        _, kwargs = MockAgent.call_args
+        chain = kwargs["fallback_model"]
+        self.assertEqual(
+            [_["provider"] for _ in chain],
+            ["prov-other", "prov-parent"],
+        )
+        # No secret must leak into the fallback_model chain from the overridden
+        # child route itself (the delegated primary route must not appear).
+        providers = {_["provider"] for _ in chain}
+        self.assertNotIn("prov-override", providers)
+
+    def test_identity_helper_normalises(self):
+        self.assertEqual(
+            _fallback_route_identity({"provider": "  PROV-A ", "model": " m ", "base_url": "https://x/v1/"}),
+            ("prov-a", "m", "https://x/v1"),
+        )
 
 
 if __name__ == "__main__":
