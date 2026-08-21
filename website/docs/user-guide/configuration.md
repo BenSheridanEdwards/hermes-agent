@@ -2231,6 +2231,9 @@ Configure subagent behavior for the delegate tool:
 delegation:
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
+  # fallback_providers:                     # Optional child-only fallback chain. Omit to inherit the parent; [] disables child fallback.
+  #   - provider: "openrouter"
+  #     model: "openai/gpt-5.5-mini"
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
@@ -2240,6 +2243,8 @@ delegation:
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+**Subagent fallback override:** By default, subagents also inherit the parent's ordered fallback chain. Set `delegation.fallback_providers` to an ordered list to give children their own recovery chain without changing the parent. Set it to `[]` to disable child fallback explicitly. Each entry uses the same `provider`, `model`, optional `base_url`, and credential fields as top-level `fallback_providers`.
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
 

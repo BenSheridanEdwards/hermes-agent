@@ -1456,11 +1456,20 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Inherit the parent's fallback provider chain by default so subagents can
+    # recover exactly like the top-level agent. An explicit delegation-specific
+    # chain overrides that inheritance without mutating the parent. An explicit
+    # empty list disables fallback for children.
+    child_fallback: Any
+    configured_child_fallbacks = delegation_cfg.get("fallback_providers")
+    if configured_child_fallbacks is None:
+        child_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    else:
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        child_fallback = get_fallback_chain(
+            {"fallback_providers": configured_child_fallbacks}
+        ) or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1515,7 +1524,7 @@ def _build_child_agent(
 
             reasoning_config=child_reasoning,
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
+            fallback_model=child_fallback,
             enabled_toolsets=child_toolsets,
             disabled_toolsets=child_disabled_toolsets,
             quiet_mode=True,

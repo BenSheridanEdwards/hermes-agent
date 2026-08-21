@@ -1677,6 +1677,80 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
 
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "fallback_providers": [
+                {
+                    "provider": "opencode-go",
+                    "model": "deepseek-v4-flash-vision-exp",
+                }
+            ]
+        },
+    )
+    def test_child_uses_delegation_specific_fallback_chain(self, _mock_config):
+        """An explicit child chain overrides, rather than mutates, the parent chain."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=50,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["fallback_model"],
+            [
+                {
+                    "provider": "opencode-go",
+                    "model": "deepseek-v4-flash-vision-exp",
+                }
+            ],
+        )
+        self.assertEqual(
+            parent._fallback_chain,
+            [{"provider": "openai-codex", "model": "gpt-5.6-luna"}],
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"fallback_providers": []},
+    )
+    def test_explicit_empty_delegation_chain_disables_parent_fallback(
+        self, _mock_config
+    ):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=50,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
+
 
 if __name__ == "__main__":
     unittest.main()
