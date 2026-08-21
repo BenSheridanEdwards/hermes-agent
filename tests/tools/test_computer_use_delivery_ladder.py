@@ -233,6 +233,72 @@ def test_dispatcher_threads_delivery_mode_to_backend():
         assert clicks and clicks[-1].get("delivery_mode") == "foreground"
 
 
+@pytest.mark.parametrize(
+    "action_args",
+    [
+        {"action": "click", "element": 5, "delivery_mode": "foreground"},
+        {
+            "action": "click",
+            "element": 5,
+            "delivery_mode": "foreground",
+            "bring_to_front": True,
+        },
+        {"action": "focus_app", "app": "Safari", "raise_window": True},
+    ],
+)
+def test_background_only_refuses_every_foreground_path_before_backend(action_args):
+    from tools.computer_use import tool as cu
+
+    with (
+        patch.object(cu, "_computer_use_background_only", return_value=True),
+        patch.object(cu, "_get_backend") as get_backend,
+        patch.object(cu, "_request_approval") as request_approval,
+    ):
+        result = json.loads(cu.handle_computer_use(action_args))
+
+    assert result["status"] == "refused"
+    assert result["code"] == "foreground_disabled"
+    get_backend.assert_not_called()
+    request_approval.assert_not_called()
+
+
+def test_background_only_still_allows_background_delivery():
+    from tools.computer_use import tool as cu
+
+    with (
+        patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False),
+        patch.object(cu, "_computer_use_background_only", return_value=True),
+    ):
+        cu.reset_backend_for_tests()
+        be = cu._get_backend()
+        cu.handle_computer_use({
+            "action": "click",
+            "element": 5,
+            "delivery_mode": "background",
+        })
+        clicks = [kw for (name, kw) in be.calls if name == "click"]  # type: ignore[attr-defined]
+
+    assert clicks and clicks[-1].get("delivery_mode") == "background"
+
+
+def test_background_only_policy_uses_readonly_config_loader():
+    from hermes_cli import config
+    from tools.computer_use import tool as cu
+
+    with (
+        patch.object(
+            config,
+            "load_config_readonly",
+            return_value={"computer_use": {"background_only": True}},
+        ) as load_readonly,
+        patch.object(config, "load_config") as load_mutable,
+    ):
+        assert cu._computer_use_background_only() is True
+
+    load_readonly.assert_called_once_with()
+    load_mutable.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Phase C — foreground approval scoping (action + delivery_mode + session)
 # ---------------------------------------------------------------------------
