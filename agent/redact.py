@@ -163,6 +163,7 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 # Lowercase / dotted / hyphenated config keys from config files
 # (application.properties, .env, YAML-ish dumps): ``spring.datasource.password=secret``,
 # ``app.api.key=xyz``, ``password=secret``. The uppercase _ENV_ASSIGN_RE above
@@ -183,9 +184,8 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
-# can never match either pattern, so the (potentially backtrack-heavy) subs
-# are skipped entirely for such text. See the call site in
-# redact_sensitive_text().
+# can never match either pattern, so the subs are skipped entirely. See the
+# call site in redact_sensitive_text().
 _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 
 # Programmatic env lookups (``os.getenv(...)``, ``os.environ[...]``,
@@ -195,15 +195,15 @@ _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 _ENV_LOOKUP_VALUE_RE = re.compile(
     r"^(?:os\.(?:getenv|environ)|process\.env|\$ENV\{)"
 )
-# Namespaced (dotted) key: the secret word may sit anywhere in a dotted path.
-# NOTE(perf): possessive quantifiers (py3.11+) replace the nested quantifier
-# ``(?:[A-Za-z0-9_\-]+\.)+`` (exponential backtracking on long dotted runs).
-# The ``*`` runs bordering {_SECRET_CFG_NAMES} must stay backtrackable
-# (secret words are matchable by the class, e.g. ``app.api.key=…``).
+# Namespaced (dotted) assignment candidate. Keyword validation happens in the
+# replacement callback so this regex never needs ambiguous wildcards around a
+# secret-word alternation. The left boundary makes the engine enter the long
+# key scan only once per key-like run; the possessive key/value scans cannot
+# retry from every character in an opaque base64/hex payload.
 _CFG_DOTTED_RE = re.compile(
-    rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
-    rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
-    rf"={_CFG_VALUE}",
+    r"(?<![A-Za-z0-9_.\-])"
+    r"((?=[A-Za-z0-9_.\-]*\.)[A-Za-z0-9_\-][A-Za-z0-9_.\-]*+)"
+    r"=([^\s&]++)",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
@@ -874,15 +874,30 @@ def redact_sensitive_text(
             # near the bottom of this function); _DB_CONNSTR_RE still guards
             # connection-string passwords.
             #
-            # Extra gate: every _CFG_*_RE match requires a secret keyword in
-            # the key, so a text without any secret keyword cannot match —
-            # skipping is exact. This matters because _CFG_DOTTED_RE
-            # backtracks quadratically on long unbroken [A-Za-z0-9_.\-] runs
-            # (e.g. base64/hex blobs in compaction payloads); the linear
-            # keyword scan prevents that pathological path on secret-free
-            # text.
+            # Extra gate: every _CFG_*_RE replacement requires a secret
+            # keyword in the key, so a text without one can be skipped exactly.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
+                def _redact_dotted_config(m):
+                    name, raw_value = m.group(1), m.group(2)
+                    # A dotted path must have a non-empty final segment. The
+                    # regex keeps candidate discovery linear and delegates the
+                    # semantic checks to this callback.
+                    if name.endswith(".") or not _key_has_secret_keyword(name):
+                        return m.group(0)
+                    quote = ""
+                    value = raw_value
+                    if (
+                        len(raw_value) >= 2
+                        and raw_value[0] in "'\""
+                        and raw_value[-1] == raw_value[0]
+                    ):
+                        quote = raw_value[0]
+                        value = raw_value[1:-1]
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    return f"{name}={quote}{_mask_token(value)}{quote}"
+
+                text = _CFG_DOTTED_RE.sub(_redact_dotted_config, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
