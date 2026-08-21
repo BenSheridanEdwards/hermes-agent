@@ -281,6 +281,24 @@ def test_background_only_still_allows_background_delivery():
     assert clicks and clicks[-1].get("delivery_mode") == "background"
 
 
+def test_background_only_policy_uses_readonly_config_loader():
+    from hermes_cli import config
+    from tools.computer_use import tool as cu
+
+    with (
+        patch.object(
+            config,
+            "load_config_readonly",
+            return_value={"computer_use": {"background_only": True}},
+        ) as load_readonly,
+        patch.object(config, "load_config") as load_mutable,
+    ):
+        assert cu._computer_use_background_only() is True
+
+    load_readonly.assert_called_once_with()
+    load_mutable.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Phase C — foreground approval scoping (action + delivery_mode + session)
 # ---------------------------------------------------------------------------

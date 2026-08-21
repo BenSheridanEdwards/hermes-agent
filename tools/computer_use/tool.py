@@ -447,9 +447,12 @@ def _computer_use_background_only() -> bool:
     rung, and stronger than approval scoping in unattended/YOLO sessions.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        cfg = (load_config() or {}).get("computer_use") or {}
+        # This hot path only reads one feature flag. The readonly loader keeps
+        # mtime-aware config reloads while avoiding load_config()'s defensive
+        # deepcopy on every computer-use request.
+        cfg = (load_config_readonly() or {}).get("computer_use") or {}
         return bool(cfg.get("background_only", False))
     except Exception:
         return False
