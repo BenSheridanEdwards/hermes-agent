@@ -5,6 +5,7 @@ model auto-correction, config loading, validation edge cases, and
 end-to-end dispatch.  All external dependencies are mocked.
 """
 
+import inspect
 import os
 import sys
 import struct
@@ -847,9 +848,119 @@ class TestTranscribeAudioXAIDispatch:
 
         assert mock_xai.call_args[0][1] == "grok-stt"
 
+
 # ============================================================================
-# _transcribe_elevenlabs
+# Scar locks (2026-08-16): inbound arity + official xAI STT door
 # ============================================================================
+
+XAI_STT_FORBIDDEN_PATH = "/audio/transcriptions"
+XAI_STT_REQUIRED_URL = "https://api.x.ai/v1/stt"
+
+
+class TestInboundSttNeverRegressesToTypeErrorOrWrongDoor:
+    """Live miss was TypeError on a 3-arg salvage caller, plus a 404 from
+    the OpenAI-shaped path. Official xAI REST is POST /v1/stt."""
+
+    def test_signature_accepts_gateway_source_label(self):
+        from tools.transcription_tools import transcribe_audio
+
+        params = list(inspect.signature(transcribe_audio).parameters)
+        assert params[:3] == ["file_path", "model", "source"]
+
+    def test_salvage_three_arg_caller_does_not_typeerror(self, sample_ogg):
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"provider": "xai"},
+        ), patch(
+            "tools.transcription_tools._get_provider",
+            return_value="xai",
+        ), patch(
+            "tools.transcription_tools._transcribe_xai",
+            return_value={"success": True, "transcript": "hi", "provider": "xai"},
+        ):
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_ogg, None, "gateway")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hi"
+
+    def test_api_key_path_posts_official_stt_door_not_openai_shaped(
+        self, monkeypatch, sample_ogg, mock_xai_http_module
+    ):
+        monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "text": "test",
+            "language": "en",
+            "duration": 1.0,
+        }
+
+        with patch(
+            "tools.transcription_tools._load_stt_config", return_value={}
+        ), patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_xai
+
+            result = _transcribe_xai(sample_ogg, "grok-stt")
+
+        assert result["success"] is True
+        url = mock_post.call_args[0][0]
+        assert url == XAI_STT_REQUIRED_URL
+        assert XAI_STT_FORBIDDEN_PATH not in url
+
+    def test_oauth_path_never_uses_openai_shaped_transcriptions(
+        self, monkeypatch, sample_ogg, mock_xai_http_module
+    ):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        mock_xai_http_module.resolve_xai_http_credentials.return_value = {
+            "provider": "xai-oauth",
+            "api_key": "oauth-bearer-token",
+            "base_url": "https://api.x.ai/v1",
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "text": "test",
+            "language": "en",
+            "duration": 1.0,
+        }
+
+        with patch(
+            "tools.transcription_tools._load_stt_config", return_value={}
+        ), patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_xai
+
+            result = _transcribe_xai(sample_ogg, "grok-stt")
+
+        assert result["success"] is True
+        url = mock_post.call_args[0][0]
+        assert url == XAI_STT_REQUIRED_URL
+        assert XAI_STT_FORBIDDEN_PATH not in url
+
+    def test_live_gateway_caller_stays_arity_safe(self):
+        """The gateway's inbound-STT call must bind against the live signature.
+
+        This guards the failure that took inbound Telegram voice notes down:
+        the gateway calling transcribe_audio(path, None, "gateway") against a
+        signature that did not accept a third argument, raising TypeError.
+
+        v0.20.5 made ``source`` a real parameter forwarded to the
+        pre_transcription hook, so that call is now correct. The invariant is
+        arity compatibility, not one particular spelling, so bind the real
+        call shapes against the real signature rather than grepping source.
+        """
+        from tools.transcription_tools import transcribe_audio
+
+        sig = inspect.signature(transcribe_audio)
+        sig.bind("/tmp/clip.ogg")
+        sig.bind("/tmp/clip.ogg", None)
+        sig.bind("/tmp/clip.ogg", None, "gateway")
+
+        run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+        src = run_py.read_text()
+        assert "transcribe_audio" in src, "gateway no longer routes inbound STT here"
+
 
 class TestTranscribeElevenLabs:
     def test_successful_transcription(self, monkeypatch, sample_ogg):
