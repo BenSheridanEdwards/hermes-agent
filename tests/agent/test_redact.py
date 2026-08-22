@@ -4,7 +4,14 @@ import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    _ENV_ASSIGN_LOWER_RE,
+    _is_lower_env_secret_key,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -636,6 +643,97 @@ class TestLowercaseDottedConfigKeys:
 
 
 
+
+
+class TestLowercaseEnvAssignScan:
+    """The lowercase env-assign pass must stay linear AND keep its match set.
+
+    v0.20.5 shipped this pass as
+    ``[a-z0-9_]+(?:_|^)(?:key|pass|...)(?=[^a-z0-9_]|$)``, which restarts a
+    greedy run scan at every offset of a long ``[a-z0-9_]`` payload. That is
+    the ReDoS shape this suite exists to prevent, and it reached the gateway
+    hot path where a CPU-bound regex holds the GIL. Discovery is now anchored
+    and possessive, with the key rule moved into a string-only validator.
+    """
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            ("my_api_key", True),
+            ("openai_token", True),
+            ("db_password", True),
+            ("x_pw", True),
+            ("service_credential", True),
+            ("MY_API_KEY", True),
+            # No prefix before the secret word: the original pattern required
+            # ``<something>_<word>`` and could never match these.
+            ("token", False),
+            ("key", False),
+            ("_token", False),
+            # Secret word not at the end of the key.
+            ("api_key2", False),
+            ("key_material", False),
+            ("token_bucket_size", False),
+            # Prose that merely embeds a keyword.
+            ("my_keyboard", False),
+            ("press_secretary", False),
+            ("", False),
+            ("_", False),
+        ],
+    )
+    def test_key_rule_matches_the_pattern_it_replaced(self, key, expected):
+        assert _is_lower_env_secret_key(key) is expected
+
+    def test_validator_cannot_backtrack_on_a_long_key(self):
+        """String ops only, so even a pathological key stays cheap."""
+        import time
+
+        key = "a_" * 200_000
+        start = time.perf_counter()
+        _is_lower_env_secret_key(key)
+        assert time.perf_counter() - start < 0.1
+
+    def test_long_opaque_value_completes_fast(self):
+        """The exact shape that measured 1364 ms on stock v0.20.5."""
+        import time
+
+        text = "token=" + "a" * 16_384
+        start = time.perf_counter()
+        _ENV_ASSIGN_LOWER_RE.sub(lambda m: m.group(0), text)
+        assert time.perf_counter() - start < 0.25
+
+    def test_pattern_scaling_is_not_quadratic(self):
+        """Doubling the payload must not multiply the time by ~4."""
+        import time
+
+        def elapsed(size):
+            text = "my_api_key=" + "a" * size
+            start = time.perf_counter()
+            _ENV_ASSIGN_LOWER_RE.sub(lambda m: m.group(0), text)
+            return time.perf_counter() - start
+
+        elapsed(8_192)  # warm caches so the first call is not the baseline
+        small = min(elapsed(8_192) for _ in range(3))
+        large = min(elapsed(32_768) for _ in range(3))
+        assert large < max(small * 8, 0.05)
+
+    def test_underscore_runs_do_not_reintroduce_backtracking(self):
+        """Underscores are in the key class, so a long ``a_b_c`` run is the
+        adversarial input for an anchored key scan specifically."""
+        import time
+
+        text = "x=1 " + "a_" * 20_000 + "=payload"
+        start = time.perf_counter()
+        redact_sensitive_text(text)
+        assert time.perf_counter() - start < 1.0
+
+    def test_secrets_are_still_masked(self):
+        assert "supersecret" not in redact_sensitive_text("my_api_key=supersecret")
+        assert "hunter2" not in redact_sensitive_text("db_password=hunter2")
+
+    def test_prose_is_left_alone(self):
+        for probe in ("author=Smith", "my_keyboard=mechanical"):
+            assert redact_sensitive_text(probe) == probe
 
 
 class TestConfigKeyRedosResistance:

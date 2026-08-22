@@ -49,6 +49,47 @@ from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
+
+# Free OpenCode Zen models are capacity-shared: the router shuffles sessions
+# on and off them constantly, and an operator can do nothing about it. Two
+# transitions are therefore kept off the operator-visible surface. Every other
+# provider/model switch is a durable state change and stays announced.
+_FREE_ZEN_PROVIDER = "opencode-zen"
+_FREE_ZEN_MODELS = frozenset({"x-preview-f-free", "mimo-v2.5-free"})
+
+
+def _is_routine_free_zen_hop(
+    *,
+    old_provider: "str | None",
+    old_model: "str | None",
+    new_provider: "str | None",
+    new_model: "str | None",
+    primary_provider: "str | None",
+    primary_model: "str | None",
+) -> bool:
+    """True for a capacity shuffle an operator cannot act on.
+
+    Two shapes qualify:
+
+    1. Hopping ONTO a free Zen model.
+    2. Hopping OFF a free Zen model back to the configured primary.
+
+    Landing anywhere other than the primary stays visible, because that is a
+    real routing change rather than the router handing the session back.
+    """
+
+    def _provider(value: "str | None") -> str:
+        return str(value or "").strip().lower()
+
+    if _provider(new_provider) == _FREE_ZEN_PROVIDER and new_model in _FREE_ZEN_MODELS:
+        return True
+
+    return (
+        _provider(old_provider) == _FREE_ZEN_PROVIDER
+        and old_model in _FREE_ZEN_MODELS
+        and _provider(new_provider) == _provider(primary_provider)
+        and new_model == str(primary_model or "").strip()
+    )
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
@@ -2822,22 +2863,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        _free_zen = {"x-preview-f-free", "mimo-v2.5-free"}
-        _fb_p = (fb_provider or "").strip().lower()
-        _old_p = (old_provider or "").strip().lower()
-        _primary = getattr(agent, "_primary_runtime", None) or {}
-        _pri_p = str(_primary.get("provider") or "").strip().lower()
-        _pri_m = str(_primary.get("model") or "").strip()
-        _quiet = (
-            (_fb_p == "opencode-zen" and fb_model in _free_zen)
-            or (
-                _old_p == "opencode-zen"
-                and old_model in _free_zen
-                and _fb_p == _pri_p
-                and fb_model == _pri_m
-            )
-        )
-        if not _quiet:
+        primary_runtime = getattr(agent, "_primary_runtime", None) or {}
+        if not _is_routine_free_zen_hop(
+            old_provider=old_provider,
+            old_model=old_model,
+            new_provider=fb_provider,
+            new_model=fb_model,
+            primary_provider=primary_runtime.get("provider"),
+            primary_model=primary_runtime.get("model"),
+        ):
             agent._buffer_status(
                 f"🔄 Primary model failed — switching to fallback: "
                 f"{fb_model} via {fb_provider}"

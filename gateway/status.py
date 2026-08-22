@@ -1083,6 +1083,32 @@ def write_pid_file() -> None:
         raise
 
 
+def _is_process_rollover(
+    payload: "dict[str, Any]", current_record: "dict[str, Any]"
+) -> bool:
+    """True when ``payload`` was written by a different process incarnation.
+
+    Volatile authentication and readiness evidence belongs to one exact
+    process. Rebinding an old receipt to a new pid/start_time would report a
+    dead process's Telegram auth as the live one's, so a rollover discards the
+    payload rather than updating it.
+
+    A payload recording neither pid nor start_time makes no incarnation claim,
+    so there is nothing to invalidate and this returns False. That case is
+    load-bearing: ``clear_profile_platforms`` expects primary-profile entries
+    to survive a write, and its callers may hand over a payload with no
+    process identity stamped on it yet.
+    """
+    recorded_pid = payload.get("pid")
+    recorded_start = payload.get("start_time")
+    if recorded_pid is None and recorded_start is None:
+        return False
+    return (
+        recorded_pid != current_record["pid"]
+        or recorded_start != current_record["start_time"]
+    )
+
+
 def write_runtime_status(
     *,
     gateway_state: Any = _UNSET,
@@ -1108,22 +1134,7 @@ def write_runtime_status(
         if payload is not None
         else _build_runtime_status_record()
     )
-    _recorded_pid = payload.get("pid") if payload is not None else None
-    _recorded_start = payload.get("start_time") if payload is not None else None
-    if payload is None or (
-        (_recorded_pid is not None or _recorded_start is not None)
-        and (
-            _recorded_pid != current_record["pid"]
-            or _recorded_start != current_record["start_time"]
-        )
-    ):
-        # Volatile authentication/readiness evidence belongs to one exact
-        # process incarnation. Never rebind an old receipt to a new PID/start.
-        #
-        # Gated on the file actually recording a prior identity. A payload
-        # with no pid/start_time makes no incarnation claim to invalidate,
-        # and discarding it would break the clear_profile_platforms
-        # contract, which expects primary-profile entries to survive a write.
+    if payload is None or _is_process_rollover(payload, current_record):
         payload = _build_runtime_status_record()
     payload.setdefault("platforms", {})
     if clear_profile_platforms:

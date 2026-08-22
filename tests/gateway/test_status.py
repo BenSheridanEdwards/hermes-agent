@@ -1485,3 +1485,52 @@ class TestResolveGatewayLiveness:
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
 
+
+
+class TestProcessRolloverDetection:
+    """Which stored payloads count as a previous process incarnation.
+
+    Volatile receipts (Telegram auth, transport readiness) are only true of
+    the exact process that wrote them. The rule has two failure directions:
+    too loose rebinds a dead process's evidence onto a live pid, too strict
+    discards payloads that `clear_profile_platforms` expects to survive.
+    """
+
+    def _current(self, pid=4242, start_time=1000):
+        return {"pid": pid, "start_time": start_time}
+
+    def test_same_pid_and_start_is_not_a_rollover(self):
+        assert status._is_process_rollover(
+            {"pid": 4242, "start_time": 1000}, self._current()
+        ) is False
+
+    def test_different_pid_is_a_rollover(self):
+        assert status._is_process_rollover(
+            {"pid": 99999, "start_time": 1000}, self._current()
+        ) is True
+
+    def test_same_pid_but_different_start_is_a_rollover(self):
+        """A recycled pid is the case a pid-only check would miss."""
+        assert status._is_process_rollover(
+            {"pid": 4242, "start_time": 17}, self._current()
+        ) is True
+
+    def test_payload_with_no_process_identity_is_not_a_rollover(self):
+        """The boundary that keeps clear_profile_platforms working.
+
+        A payload claiming no incarnation has no stale receipt to invalidate,
+        so its platform entries must survive rather than being discarded.
+        """
+        assert status._is_process_rollover(
+            {"platforms": {"telegram": {"state": "connected"}}}, self._current()
+        ) is False
+        assert status._is_process_rollover({}, self._current()) is False
+
+    def test_partial_identity_still_counts_as_a_claim(self):
+        """Half a stamp is still a claim about some other process."""
+        assert status._is_process_rollover({"pid": 99999}, self._current()) is True
+        assert status._is_process_rollover({"start_time": 17}, self._current()) is True
+
+    def test_matching_pid_without_a_start_time_is_still_a_rollover(self):
+        """A pid alone cannot prove same-incarnation: pids get recycled."""
+        assert status._is_process_rollover({"pid": 4242}, self._current()) is True

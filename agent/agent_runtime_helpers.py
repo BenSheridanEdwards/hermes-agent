@@ -939,6 +939,20 @@ def sync_credential_pool_entry_id(agent) -> None:
         agent._credential_pool_entry_id = None
 
 
+_OPENCODE_GO_POOL = "opencode-go"
+_OPENCODE_GO_URL_MARKER = "opencode.ai/zen/go"
+
+
+def _is_official_opencode_go_url(base_url) -> bool:
+    """True when ``base_url`` points at the official OpenCode Go host.
+
+    Used to recognise a delegation child that reports ``provider=custom``
+    while still on the Go host, so credential rotation targets the Go pool
+    instead of falling through to a model hop.
+    """
+    return _OPENCODE_GO_URL_MARKER in str(base_url or "").lower()
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -1010,17 +1024,19 @@ def recover_with_credential_pool(
                 )
             except Exception:
                 _custom_match = False
-        # Delegation kids often log provider=custom while still on the
-        # official OpenCode Go host. That used to skip the Go pool and hop
-        # model (ox-alpha → deepseek) instead of rotating CodeWalnut →
-        # personal. Treat the official Go URL as the Go pool.
+        # Delegation kids often log provider=custom while still pointed at
+        # the official OpenCode Go host. Read literally that is a pool/agent
+        # mismatch, so rotation was skipped and the agent hopped model
+        # (ox-alpha -> deepseek) instead of rotating CodeWalnut -> personal.
+        # Recognise the official Go URL as the Go pool.
         if (
             not _custom_match
             and current_provider == "custom"
-            and pool_provider == "opencode-go"
+            and pool_provider == _OPENCODE_GO_POOL
         ):
-            _agent_base = (getattr(agent, "base_url", "") or "").lower()
-            _custom_match = "opencode.ai/zen/go" in _agent_base
+            _custom_match = _is_official_opencode_go_url(
+                getattr(agent, "base_url", "")
+            )
         if not _custom_match:
             _ra().logger.warning(
                 "Credential pool provider mismatch: pool=%s, agent=%s — "
