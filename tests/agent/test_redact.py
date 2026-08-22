@@ -696,6 +696,69 @@ class TestConfigKeyRedosResistance:
         assert result.endswith("A" * 100_000 + "=")
         assert elapsed < 3.0
 
+    def test_long_undotted_value_completes_fast(self):
+        """The long run is the VALUE of the secret key, not a separate payload.
+
+        Complements test_secret_keyword_with_large_opaque_payload_completes_fast,
+        where the payload sits on its own line away from the keyword.  Here the
+        unbroken run is what the secret key is assigned to, which is the shape
+        that took a production gateway down for 35 minutes: the sub is quadratic
+        in the run length, and because redact_sensitive_text runs on a worker
+        thread it holds the GIL throughout, stopping the gateway event loop
+        (Telegram polling, cron ticks, heartbeat) with no error and no log line.
+
+        Before the linear-scanning rewrite this cost ~95s at 32 KB.
+        """
+        import time
+
+        text = "token=" + "a" * 32_768
+        t0 = time.perf_counter()
+        redact_sensitive_text(text)
+        assert time.perf_counter() - t0 < 2.0
+
+    def test_undotted_value_scaling_is_not_quadratic(self):
+        """Doubling the run must not multiply the time by ~4.
+
+        Every other timing test here asserts a budget at one fixed size, which
+        only fails once a regression is already catastrophic at that size.
+        Asserting on the growth RATE catches a reintroduced quadratic while it
+        is still cheap.
+        """
+        import time
+
+        def elapsed(size):
+            text = "token=" + "a" * size
+            t0 = time.perf_counter()
+            redact_sensitive_text(text)
+            return time.perf_counter() - t0
+
+        elapsed(8_192)  # warm caches so the first call is not the baseline
+        small = min(elapsed(8_192) for _ in range(3))
+        large = min(elapsed(32_768) for _ in range(3))
+        # 4x the input. Linear predicts ~4x, quadratic predicts ~16x.
+        # Generous headroom for a loaded CI box but still well under
+        # quadratic; the floor keeps timer noise on tiny durations from
+        # failing the ratio.
+        assert large < max(small * 8, 0.05)
+
+    def test_long_undotted_secret_still_redacted(self):
+        """Linear scanning must not stop a real long secret being masked."""
+        secret = "b" * 4_096
+        text = f"token={secret}"
+        result = redact_sensitive_text(text)
+        assert secret not in result
+        assert result != text
+
+    def test_midtoken_keyword_still_not_matched(self):
+        """A key that merely embeds a keyword must stay untouched.
+
+        ``xtoken`` is not a secret key, and a bare (undotted) one must not be
+        redacted.  Guards the candidate-scanning rewrite against widening what
+        counts as a config key.
+        """
+        text = "value_xtoken=plainvalue"
+        assert redact_sensitive_text(text) == text
+
     def test_yaml_assign_redos_resistance(self):
         """_YAML_ASSIGN_RE must not backtrack excessively on long inputs."""
         import time
