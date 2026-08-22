@@ -1911,6 +1911,9 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # Pinned delegation providers fail loudly by default. Opt in to
+        # inheriting the parent's ordered fallback chain and terminal primary.
+        "fallback_policy": "pinned",  # "pinned" | "inherit_then_parent"
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these

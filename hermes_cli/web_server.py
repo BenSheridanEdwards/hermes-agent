@@ -1159,6 +1159,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     },
+    "delegation.fallback_policy": {
+        "type": "select",
+        "description": "Fallback behavior for a pinned delegated model",
+        "options": ["pinned", "inherit_then_parent"],
+    },
     "updates.non_interactive_local_changes": {
         "type": "select",
         "description": (

@@ -1965,6 +1965,11 @@ class TestDelegatedFallbackChainBuilder(unittest.TestCase):
       * When no override is active, the parent chain is passed through as-is.
     """
 
+    def test_shipped_default_preserves_fail_loud_pinning(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["delegation"]["fallback_policy"], "pinned")
+
     def test_empty_parent_chain_with_override_returns_none(self):
         # An override is active but the parent has no fallback chain and no
         # primary runtime -> nothing to inherit or append, so None is returned.
