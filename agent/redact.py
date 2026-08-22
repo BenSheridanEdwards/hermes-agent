@@ -158,10 +158,42 @@ _ENV_ASSIGN_RE = re.compile(
 # Lowercase env names: only underscore-boundary forms (``openai_key=…``,
 # ``FAL_KEY=…``, ``db_pw=…``) — NOT bare ``password=``/``token=``/``secret=``,
 # which appear in prose, URLs, and form bodies (issue #77484).
+# NOTE(perf): the previous inline form,
+# ``[a-z0-9_]+(?:_|^)(?:key|pass|...)(?=[^a-z0-9_]|$)``, restarted a full
+# greedy run scan at every offset of a long ``[a-z0-9_]`` payload, so an
+# opaque base64/hex blob cost O(n^2). That is the same shape that GIL-locked
+# the gateway on compaction payloads. Candidate discovery is now anchored at a
+# left boundary with a possessive key scan, and the
+# ``<prefix>_<secret word>`` rule the old pattern encoded is enforced by
+# _is_lower_env_secret_key below, so matches are unchanged.
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    r"(?<![A-Za-z0-9_])([A-Za-z0-9_]++)\s*=\s*(['\"]?)(\S+)\2",
     re.IGNORECASE,
 )
+_ENV_ASSIGN_LOWER_WORDS = frozenset(
+    {
+        "key",
+        "pass",
+        "pw",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "auth",
+    }
+)
+
+
+def _is_lower_env_secret_key(key: str) -> bool:
+    """True for ``<prefix>_<secret word>`` keys.
+
+    The exact rule the lowercase env-assign pattern used to encode inline:
+    a non-empty prefix, an underscore, then a secret word at the end of the
+    key. String operations only, so it cannot backtrack.
+    """
+    head, sep, tail = key.rpartition("_")
+    return bool(sep) and bool(head) and tail.lower() in _ENV_ASSIGN_LOWER_WORDS
 
 
 # Lowercase / dotted / hyphenated config keys from config files
@@ -868,7 +900,15 @@ def redact_sensitive_text(
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
             if "://" not in text:
-                text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
+                def _redact_env_lower(m):
+                    # Key-shape gate first: the pattern above now matches any
+                    # key-like token, so the <prefix>_<secret word> rule is
+                    # enforced here before _redact_env's own validation.
+                    if not _is_lower_env_secret_key(m.group(1)):
+                        return m.group(0)
+                    return _redact_env(m)
+
+                text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env_lower, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
