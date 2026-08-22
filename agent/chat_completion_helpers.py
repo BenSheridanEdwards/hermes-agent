@@ -2959,21 +2959,40 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        notice = (
-            f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-            f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
+        # Free-zen shuttle hops (fleet patch): a bounce onto or off the free
+        # OpenCode Zen lane is routine churn operators cannot act on. Suppress
+        # the notice for those hops only; every other switch stays loud.
+        _free_zen = {"x-preview-f-free", "mimo-v2.5-free"}
+        _fb_p = (fb_provider or "").strip().lower()
+        _old_p = (old_provider or "").strip().lower()
+        _primary = getattr(agent, "_primary_runtime", None) or {}
+        _pri_p = str(_primary.get("provider") or "").strip().lower()
+        _pri_m = str(_primary.get("model") or "").strip()
+        _quiet = (
+            (_fb_p == "opencode-zen" and fb_model in _free_zen)
+            or (
+                _old_p == "opencode-zen"
+                and old_model in _free_zen
+                and _fb_p == _pri_p
+                and fb_model == _pri_m
+            )
         )
-        # The buffered switch is surfaced on terminal failure. A successful
-        # fallback clears retry chatter, so retain every switch as a durable
-        # one-shot notice for _emit_pending_fallback_notice (run_agent.py).
-        agent._buffer_status(notice)
-        pending = getattr(agent, "_pending_fallback_notice", None)
-        if isinstance(pending, list):
-            pending.append(notice)
-        elif pending:
-            agent._pending_fallback_notice = [str(pending), notice]
-        else:
-            agent._pending_fallback_notice = [notice]
+        if not _quiet:
+            notice = (
+                f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+                f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
+            )
+            # The buffered switch is surfaced on terminal failure. A successful
+            # fallback clears retry chatter, so retain every switch as a durable
+            # one-shot notice for _emit_pending_fallback_notice (run_agent.py).
+            agent._buffer_status(notice)
+            pending = getattr(agent, "_pending_fallback_notice", None)
+            if isinstance(pending, list):
+                pending.append(notice)
+            elif pending:
+                agent._pending_fallback_notice = [str(pending), notice]
+            else:
+                agent._pending_fallback_notice = [notice]
         # ``_fallback_activated`` is also reused by temporary `/model --once`
         # restoration. Keep separate provenance so the restore path only emits
         # a fallback-recovery notice after an actual provider fallback.
