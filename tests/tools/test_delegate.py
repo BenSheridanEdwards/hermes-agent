@@ -2121,6 +2121,32 @@ class TestDelegatedFallbackChainBuilder(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
 
+    def test_model_only_override_keeps_parent_chain_without_opt_in_policy(self):
+        parent = _make_mock_parent(depth=0)
+        fallback_entry = {"provider": "prov-a", "model": "model-a"}
+        parent._fallback_chain = [fallback_entry]
+        parent._primary_runtime = {
+            "provider": "prov-parent",
+            "model": "model-parent",
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            with patch("run_agent.AIAgent") as MockAgent:
+                MockAgent.return_value = MagicMock()
+                _build_child_agent(
+                    task_index=0,
+                    goal="model-only override",
+                    context=None,
+                    toolsets=None,
+                    model="model-child",
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
     def test_override_strips_duplicate_and_appends_terminal_in_child_builder(self):
         # With a delegation provider override active, `_build_child_agent` must
         # hand the child a chain that excludes the delegated route and ends with

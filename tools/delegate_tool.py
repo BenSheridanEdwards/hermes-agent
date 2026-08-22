@@ -1942,9 +1942,7 @@ def _build_child_agent(
     _delegation_override_active = bool(override_provider) or bool(override_base_url) or (
         model is not None and model != getattr(parent_agent, "model", None)
     )
-    if _delegation_override_active and (
-        not override_provider or inherit_pinned_fallbacks
-    ):
+    if _delegation_override_active and inherit_pinned_fallbacks:
         parent_fallback = _build_delegated_fallback_chain(
             parent_fallback,
             delegated_primary={
