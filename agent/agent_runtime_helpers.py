@@ -1010,6 +1010,17 @@ def recover_with_credential_pool(
                 )
             except Exception:
                 _custom_match = False
+        # Delegation kids often log provider=custom while still on the
+        # official OpenCode Go host. That used to skip the Go pool and hop
+        # model (ox-alpha → deepseek) instead of rotating CodeWalnut →
+        # personal. Treat the official Go URL as the Go pool.
+        if (
+            not _custom_match
+            and current_provider == "custom"
+            and pool_provider == "opencode-go"
+        ):
+            _agent_base = (getattr(agent, "base_url", "") or "").lower()
+            _custom_match = "opencode.ai/zen/go" in _agent_base
         if not _custom_match:
             _ra().logger.warning(
                 "Credential pool provider mismatch: pool=%s, agent=%s — "
