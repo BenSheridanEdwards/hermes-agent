@@ -296,6 +296,11 @@ class _ManagedToolResult:
     args: dict[str, Any]
     middleware_trace: list[dict[str, Any]]
     blocked: bool
+    # Backport note: upstream declares this without a default and threads it
+    # through every construction site (part of a wider executor refactor that
+    # is not in this tree). Defaulting to False keeps the existing call sites
+    # unchanged while the sequential timeout path can still set it explicitly.
+    dispatched: bool = False
 
 
 class _ToolTimeoutResult(str):
