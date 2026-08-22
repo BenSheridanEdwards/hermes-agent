@@ -2044,20 +2044,36 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+        _free_zen = {"x-preview-f-free", "mimo-v2.5-free"}
+        _fb_p = (fb_provider or "").strip().lower()
+        _old_p = (old_provider or "").strip().lower()
+        _primary = getattr(agent, "_primary_runtime", None) or {}
+        _pri_p = str(_primary.get("provider") or "").strip().lower()
+        _pri_m = str(_primary.get("model") or "").strip()
+        _quiet = (
+            (_fb_p == "opencode-zen" and fb_model in _free_zen)
+            or (
+                _old_p == "opencode-zen"
+                and old_model in _free_zen
+                and _fb_p == _pri_p
+                and fb_model == _pri_m
+            )
         )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        if not _quiet:
+            agent._buffer_status(
+                f"🔄 Primary model failed — switching to fallback: "
+                f"{fb_model} via {fb_provider}"
+            )
+            # The buffered line above is dropped on successful recovery, but a
+            # provider/model switch is a durable state change operators must see
+            # even when the fallback succeeds.  Record a one-shot notice that the
+            # success path surfaces exactly once via _emit_pending_fallback_notice
+            # (see run_agent.py); it is discarded on terminal failure since the
+            # buffered line is flushed instead.  See fallback-observability fix.
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
