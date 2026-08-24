@@ -171,7 +171,14 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        path = Path(candidate).expanduser()
+    except ValueError:
+        # Token contains an embedded NUL byte (tokenized out of a binary's
+        # decoded contents, #76762 family): not a real path. Return a
+        # nonexistent sentinel so downstream reads treat it as "nothing to
+        # scan" instead of crashing the guard mid-generation.
+        return Path("/nonexistent/lifecycle-guard-nul-token")
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path

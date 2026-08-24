@@ -2545,6 +2545,13 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Binaries (ELF/Mach-O/PE) are not shell scripts:
+                                # scanning their decoded contents would feed junk
+                                # NUL-bearing paths back into the guard's walker
+                                # (#76762). Same rule as lifecycle_guard's own
+                                # reader: treat as "nothing to scan".
+                                if b"\x00" in data[:8192]:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
