@@ -699,6 +699,44 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     return resolved_command, resolved_env
 
 
+def _watchdog_interpreter() -> str:
+    """Return the interpreter that should run ``mcp_stdio_watchdog.py``.
+
+    Normally this is just ``sys.executable``. When Hermes itself runs from a
+    macOS .app-bundled interpreter (per-agent gateway identity bundles under
+    e.g. ``~/Tools/tcc-identity/apps/<Name>.app``), that binary is a bare
+    CPython copy with no ``pyvenv.cfg`` next to it: it can only boot when
+    ``PYTHONHOME``/``PYTHONPATH`` are preset, and the gateway's bootstrap
+    deliberately unsets those for children (and ``_build_safe_env`` strips
+    them anyway). Spawning the watchdog via such a binary crashes before any
+    code runs — "Fatal Python error: init_fs_encoding … No module named
+    'encodings'" with a build-time prefix like ``/install`` — which parks
+    every stdio MCP server at startup.
+
+    An out-of-bundle interpreter sibling (``<sys.base_prefix>/bin/python3``)
+    locates its own stdlib without env help, so prefer one when we detect a
+    bundled executable. Falls back to ``sys.executable`` when no sibling
+    exists.
+    """
+    executable = sys.executable or ""
+    if ".app/Contents/MacOS/" not in executable:
+        return executable
+    base_prefix = getattr(sys, "base_prefix", "") or sys.prefix or ""
+    if not base_prefix:
+        return executable
+    for name in ("python3", "python"):
+        candidate = os.path.join(base_prefix, "bin", name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # No usable sibling: keep legacy behavior rather than failing the spawn.
+    logger.warning(
+        "MCP watchdog: .app-bundled interpreter %s has no usable sibling in "
+        "%s/bin; spawning with it anyway (may fail to boot).",
+        executable, base_prefix,
+    )
+    return executable
+
+
 def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     """Wrap a stdio MCP server command in the parent-death watchdog supervisor.
 
@@ -724,7 +762,7 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         command,
         *args,
     ]
-    return sys.executable, watchdog_args
+    return _watchdog_interpreter(), watchdog_args
 
 
 # ---------------------------------------------------------------------------
