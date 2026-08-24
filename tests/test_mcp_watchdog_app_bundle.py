@@ -108,11 +108,38 @@ class WatchdogInterpreterTests(unittest.TestCase):
         bundled = BUNDLED
         with context_stack(_bundled_env(bundled, lambda p: False)):
             with mock.patch.object(mcp_tool.logger, "warning") as warn:
+                original = mcp_tool._warned_bundled_watchdog_fallback
+                self.addCleanup(
+                    setattr,
+                    mcp_tool,
+                    "_warned_bundled_watchdog_fallback",
+                    original,
+                )
                 mcp_tool._warned_bundled_watchdog_fallback = False
                 _watchdog_interpreter()
                 _watchdog_interpreter()
                 _watchdog_interpreter()
         self.assertEqual(warn.call_count, 1)
+
+    def test_watchdog_script_is_stdlib_only(self):
+        """Round-2 missing-test 4: the sibling interpreter may be a different
+        patch build than the gateway's venv. The watchdog must therefore
+        import only the standard library, or the re-homed spawn could fail
+        on a ModuleNotFoundError after this fix "succeeds".
+        """
+        import ast
+        tree = ast.parse(open(WATCHDOG_SCRIPT).read(), filename=WATCHDOG_SCRIPT)
+        stdlib = set(sys.stdlib_module_names)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    self.assertIn(root, stdlib, alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:  # relative import within tools/ — fine
+                    continue
+                root = (node.module or "").split(".")[0]
+                self.assertIn(root, stdlib, node.module)
 
     def test_case_insensitive_bundle_detection(self):
         """Advisor nonblocking 2: .App/Contents/macos/ also matches."""
@@ -162,22 +189,23 @@ class WatchdogInterpreterTests(unittest.TestCase):
         self.assertTrue(os.path.exists(WATCHDOG_SCRIPT))
 
     @unittest.skipUnless(
-        os.environ.get("HERMES_TEST_REAL_BOOT") == "1",
-        "real-boot check needs the fleet interpreter layout; "
-        "set HERMES_TEST_REAL_BOOT=1",
+        sys.platform == "darwin" and os.path.isfile(
+            os.path.join(
+                getattr(sys, "base_prefix", "") or sys.prefix, "bin", "python3"
+            )
+        ),
+        "real-boot check needs macOS + the fleet interpreter layout",
     )
     def test_real_boot_under_sibling_interpreter(self):
-        """Advisor blocking 3 / missing-test 1: the ACTUAL incident shape.
-
-        Boots the watchdog under the out-of-bundle uv CPython with a fully
-        stripped environment — exactly what gateway children receive. A
-        wrong-but-plausible sibling (non-bootable binary, wrong prefix) fails
-        this while passing every mocked test above.
+        """Round-1 blocking 3 / round-2 blocking 2: runs by default on macOS
+        hosts with a usable sibling; skips elsewhere. Boots the watchdog via
+        the out-of-bundle CPython with a fully stripped environment — exactly
+        what gateway children receive. A wrong-but-plausible sibling
+        (non-bootable binary, wrong prefix) fails this while passing every
+        mocked test above.
         """
         base_prefix = getattr(sys, "base_prefix", "") or sys.prefix
         sibling = os.path.join(base_prefix, "bin", "python3")
-        if not os.path.isfile(sibling):
-            self.skipTest(f"no sibling interpreter at {sibling}")
         result = subprocess.run(
             [
                 sibling,
@@ -194,6 +222,15 @@ class WatchdogInterpreterTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BOOT-OK", result.stdout)
+
+    def test_linux_app_shaped_path_untouched(self):
+        """Round-2 blocking 1: Linux interpreters under .app-shaped paths
+        are never re-homed — bundle identity is a macOS convention."""
+        linux_bundled = "/opt/bundle/My.App/Contents/MacOS/myproc"
+        with mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(sys, "executable", linux_bundled), \
+             mock.patch.object(sys, "base_prefix", "/fake/base"):
+            self.assertEqual(_watchdog_interpreter(), linux_bundled)
 
     def test_wrap_command_non_posix_noop(self):
         """Non-POSIX platforms keep the no-op passthrough."""

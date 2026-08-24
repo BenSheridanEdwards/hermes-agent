@@ -1096,6 +1096,9 @@ def _watchdog_interpreter() -> str:
     that surface is intentionally untouched.
     """
     executable = sys.executable or ""
+    # macOS-only concern: bundle identity layouts are a macOS convention.
+    if sys.platform != "darwin":
+        return executable
     # Case-insensitive: macOS filesystems are commonly case-insensitive and
     # bundle layouts vary (.App/Contents/macos/).
     if ".app/contents/macos/" not in executable.lower():
