@@ -1066,6 +1066,11 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     return resolved_command, resolved_env
 
 
+# One-shot latch for the bundled-interpreter fallback warning (see
+# _watchdog_interpreter): reconnect cycles must not re-emit it forever.
+_warned_bundled_watchdog_fallback = False
+
+
 def _watchdog_interpreter() -> str:
     """Return the interpreter that should run ``mcp_stdio_watchdog.py``.
 
@@ -1082,11 +1087,18 @@ def _watchdog_interpreter() -> str:
 
     An out-of-bundle interpreter sibling (``<sys.base_prefix>/bin/python3``)
     locates its own stdlib without env help, so prefer one when we detect a
-    bundled executable. Falls back to ``sys.executable`` when no sibling
-    exists.
+    bundled executable. Falls back to ``sys.executable`` when no usable
+    sibling exists.
+
+    Boundary: this re-homes ONLY the internal watchdog runner spawn. A
+    user-configured stdio server whose ``command`` IS a .app-bundled bare
+    interpreter still needs PYTHONHOME-style env wiring in its config block;
+    that surface is intentionally untouched.
     """
     executable = sys.executable or ""
-    if ".app/Contents/MacOS/" not in executable:
+    # Case-insensitive: macOS filesystems are commonly case-insensitive and
+    # bundle layouts vary (.App/Contents/macos/).
+    if ".app/contents/macos/" not in executable.lower():
         return executable
     base_prefix = getattr(sys, "base_prefix", "") or sys.prefix or ""
     if not base_prefix:
@@ -1096,11 +1108,17 @@ def _watchdog_interpreter() -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     # No usable sibling: keep legacy behavior rather than failing the spawn.
-    logger.warning(
-        "MCP watchdog: .app-bundled interpreter %s has no usable sibling in "
-        "%s/bin; spawning with it anyway (may fail to boot).",
-        executable, base_prefix,
-    )
+    # Log once per process: every stdio reconnect cycle would otherwise
+    # re-emit this warning forever on bundles that can never be fixed here
+    # (e.g. PyInstaller-style layouts where base_prefix lives inside the app).
+    global _warned_bundled_watchdog_fallback
+    if not _warned_bundled_watchdog_fallback:
+        _warned_bundled_watchdog_fallback = True
+        logger.warning(
+            "MCP watchdog: .app-bundled interpreter %s has no usable sibling "
+            "in %s/bin; spawning with it anyway (may fail to boot).",
+            executable, base_prefix,
+        )
     return executable
 
 

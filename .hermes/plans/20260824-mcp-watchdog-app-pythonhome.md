@@ -78,10 +78,24 @@ that locates its own stdlib without env help. Falls back to the current
 behavior when no such sibling exists. Non-macOS / non-bundled case untouched,
 so this is invisible everywhere except broken-bundle installs.
 
-Regression test added: `tests/test_mcp_watchdog_app_bundle.py` covers bundled
-rewriting, non-bundled passthrough, missing-sibling fallback, and the
-watchdog script actually executing a trivial command under the rewritten
-interpreter.
+Regression tests: `tests/test_mcp_watchdog_app_bundle.py` (13 tests) covers
+bundled rewriting, non-bundled passthrough, true python3-over-python preference,
+non-executable-sibling fallthrough, one-shot warning latch, case-insensitive
+bundle detection, argv shape, and non-POSIX noop. `HERMES_TEST_REAL_BOOT=1`
+adds the real-boot check: boots the watchdog via `<base_prefix>/bin/python3`
+under a fully stripped env and asserts clean exit + output — pinning the exact
+incident failure mode (child interpreter boot), which mocked tests cannot
+catch.
+
+## Review trail
+
+Adversarial review (2026-08-24, opencode-zen/x-preview-f-free advisor):
+REQUEST_CHANGES adopted. Blocking 3 addressed by real-boot test + plan
+correction; blocking 1/2 resolved by closing PR #24 in favor of upstream
+41447a6d70 which already carries the stronger `_expand_candidate_path`
+machinery. Nonblocking items (preference-order pin, case-insensitive match,
+warning rate-limit, boundary doc) folded into this branch. Second independent
+review lane (opencode/big-pickle) ran concurrently; synthesis by Doc.
 
 ## Operator options
 
