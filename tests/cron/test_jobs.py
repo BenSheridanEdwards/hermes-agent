@@ -371,6 +371,26 @@ class TestMarkJobRun:
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
 
+    def test_failed_recurring_job_retries_with_backoff(self, tmp_cron_dir):
+        job = create_job(prompt="USB zip", schedule="0 4 * * *")
+        before = datetime.now(timezone.utc)
+        mark_job_run(job["id"], success=False, error="Script timed out after 3600s")
+        updated = get_job(job["id"])
+        nxt = datetime.fromisoformat(updated["next_run_at"].replace("Z", "+00:00"))
+        delta = (nxt - before).total_seconds()
+        assert updated["consecutive_failures"] == 1
+        assert 60 <= delta <= 180
+        mark_job_run(job["id"], success=False, error="Script timed out after 3600s")
+        updated = get_job(job["id"])
+        nxt = datetime.fromisoformat(updated["next_run_at"].replace("Z", "+00:00"))
+        delta = (nxt - datetime.now(timezone.utc)).total_seconds()
+        assert updated["consecutive_failures"] == 2
+        assert 180 <= delta <= 300
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated["consecutive_failures"] == 0
+        assert updated["last_status"] == "ok"
+
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
         job = create_job(prompt="Report", schedule="every 1h")

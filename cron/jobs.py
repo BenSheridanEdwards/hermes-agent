@@ -769,6 +769,26 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
+CRON_FAIL_BACKOFF_BASE_SECONDS = 120
+CRON_FAIL_BACKOFF_CAP_SECONDS = 3600
+
+
+def next_run_after_failure(job: Dict[str, Any], now_iso: str) -> str:
+    """Retry a failed recurring job with exponential backoff.
+
+    consecutive_failures is already incremented by the caller. Delay is
+    2, 4, 8, ... minutes, capped at one hour, so a 04:00 USB zip timeout
+    retries soon instead of waiting for tomorrow.
+    """
+    failure_count = max(1, int(job.get("consecutive_failures") or 1))
+    delay_seconds = min(
+        CRON_FAIL_BACKOFF_CAP_SECONDS,
+        CRON_FAIL_BACKOFF_BASE_SECONDS * (2 ** (failure_count - 1)),
+    )
+    now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+    return (now + timedelta(seconds=delay_seconds)).isoformat()
+
+
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """
     Compute the next run time for a schedule.
@@ -1754,8 +1774,19 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run. A failed recurring job retries with
+                # exponential backoff instead of waiting for the next calendar
+                # slot (USB zip timeout must not sit red until 04:00 tomorrow).
+                if success:
+                    job["consecutive_failures"] = 0
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
+                else:
+                    job["consecutive_failures"] = int(job.get("consecutive_failures") or 0) + 1
+                    schedule_kind = (job.get("schedule") or {}).get("kind")
+                    if schedule_kind in {"cron", "interval"}:
+                        job["next_run_at"] = next_run_after_failure(job, now)
+                    else:
+                        job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
