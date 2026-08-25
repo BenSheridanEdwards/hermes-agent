@@ -69,3 +69,24 @@ class TestCustomPoolMismatchGuard:
         assert recovered is False
         assert not pool.method_calls
 
+    def test_custom_opencode_go_url_rotates_go_pool(self):
+        agent, pool = _agent(
+            "custom",
+            "https://opencode.ai/zen/go/v1",
+            "opencode-go",
+        )
+        nxt = MagicMock()
+        nxt.id = "personal-go"
+        agent._is_entitlement_failure.return_value = False
+        pool.try_refresh_matching.return_value = None
+        pool.mark_exhausted_and_rotate.return_value = nxt
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=401,
+            has_retried_429=False,
+            classified_reason=FailoverReason.auth,
+        )
+        assert recovered is True
+        pool.mark_exhausted_and_rotate.assert_called_once()
+        agent._swap_credential.assert_called_once_with(nxt)
+

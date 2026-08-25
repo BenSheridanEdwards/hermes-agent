@@ -138,6 +138,7 @@ _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
 
+
 # Lowercase / dotted / hyphenated config keys from config files
 # (application.properties, .env, YAML-ish dumps): ``spring.datasource.password=secret``,
 # ``app.api.key=xyz``, ``password=secret``. The uppercase _ENV_ASSIGN_RE above
@@ -158,9 +159,8 @@ _ENV_ASSIGN_RE = re.compile(
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
-# can never match either pattern, so the (potentially backtrack-heavy) subs
-# are skipped entirely for such text. See the call site in
-# redact_sensitive_text().
+# can never match either pattern, so the subs are skipped entirely. See the
+# call site in redact_sensitive_text().
 _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 
 # Programmatic env lookups (``os.getenv(...)``, ``os.environ[...]``,
@@ -170,30 +170,15 @@ _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 _ENV_LOOKUP_VALUE_RE = re.compile(
     r"^(?:os\.(?:getenv|environ)|process\.env|\$ENV\{)"
 )
-# Longest key segment either side of the secret word that we are willing to
-# scan. A namespaced config key is short; nothing legitimate approaches this.
-# The bound is what keeps the runs below LINEAR — see the NOTE(perf) block.
-_CFG_KEY_SEGMENT_MAX = 64
-# Namespaced (dotted) key: the secret word may sit anywhere in a dotted path.
-# NOTE(perf): the ``*`` runs bordering {_SECRET_CFG_NAMES} must stay
-# backtrackable (secret words are matchable by the class, e.g.
-# ``app.api.key=…``), so they cannot be made possessive like the dotted-path
-# runs around them. Unbounded, that costs O(n^2): ``[A-Za-z0-9_.\-]*`` swallows
-# the whole run, fails to find a secret word, gives back one character, retries
-# — from every start offset in the subject. Base64 lies entirely inside that
-# character class, so a multi-megabyte base64 tool result (a Gmail attachment)
-# froze a whole agent gateway for hours; ``sre`` never releases the GIL, so the
-# event loop, the platform poller, and the liveness watchdog all starved with
-# it. Capping the runs at _CFG_KEY_SEGMENT_MAX makes the per-offset work
-# constant and the whole scan linear, without narrowing what is redacted: no
-# real config key has a 64-character run on either side of its secret word.
-_CFG_KEY_RUN = rf"[A-Za-z0-9_.\-]{{0,{_CFG_KEY_SEGMENT_MAX}}}"
-_CFG_KEY_RUN_POSSESSIVE = rf"[A-Za-z0-9_.\-]{{0,{_CFG_KEY_SEGMENT_MAX}}}+"
-_CFG_SEGMENT_POSSESSIVE = rf"[A-Za-z0-9_\-]{{1,{_CFG_KEY_SEGMENT_MAX}}}+"
+# Namespaced (dotted) assignment candidate. Keyword validation happens in the
+# replacement callback so this regex never needs ambiguous wildcards around a
+# secret-word alternation. The left boundary makes the engine enter the long
+# key scan only once per key-like run; the possessive key/value scans cannot
+# retry from every character in an opaque base64/hex payload.
 _CFG_DOTTED_RE = re.compile(
-    rf"({_CFG_SEGMENT_POSSESSIVE}\.{_CFG_KEY_RUN}{_SECRET_CFG_NAMES}{_CFG_KEY_RUN_POSSESSIVE}"
-    rf"|{_CFG_KEY_RUN}{_SECRET_CFG_NAMES}{_CFG_KEY_RUN}\.{_CFG_KEY_RUN_POSSESSIVE})"
-    rf"={_CFG_VALUE}",
+    r"(?<![A-Za-z0-9_.\-])"
+    r"((?=[A-Za-z0-9_.\-]*\.)[A-Za-z0-9_\-][A-Za-z0-9_.\-]*+)"
+    r"=([^\s&]++)",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
@@ -671,26 +656,6 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
-# A _CFG_DOTTED_RE match can never span a newline: every character class in
-# the key excludes whitespace, and so does the value (``[^\s&]+?``). Applying
-# the pattern line by line is therefore exactly equivalent to applying it to
-# the whole text — which lets us skip lines that cannot hold a config
-# assignment at all. One multi-megabyte line of base64 (a Gmail attachment
-# returned through a tool) is not a ``key=value`` pair, and scanning it froze
-# an agent gateway for hours.
-_CFG_MAX_SCANNABLE_LINE = 8192
-
-
-def _sub_on_short_lines(pattern, repl, text: str) -> str:
-    """Apply ``pattern`` per line, leaving implausibly long lines untouched."""
-    if len(text) <= _CFG_MAX_SCANNABLE_LINE:
-        return pattern.sub(repl, text)
-    return "\n".join(
-        line if len(line) > _CFG_MAX_SCANNABLE_LINE else pattern.sub(repl, line)
-        for line in text.split("\n")
-    )
-
-
 def redact_sensitive_text(
     text: str,
     *,
@@ -774,23 +739,36 @@ def redact_sensitive_text(
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
             # connection-string passwords.
             #
-            # Extra gate: every _CFG_*_RE match requires a secret keyword in
-            # the key, so a text without any secret keyword cannot match —
-            # skipping is exact.
-            #
-            # The keyword gate is an OPTIMISATION, NOT a safety bound. It is
-            # probabilistic on machine-generated payloads: ``auth`` matched
-            # case-insensitively turns up by chance in any base64 blob past
-            # about a megabyte, so the gate opens on exactly the inputs that
-            # are most expensive to scan. The real bounds are the capped runs
-            # inside _CFG_DOTTED_RE and the long-line skip below.
+            # Extra gate: every _CFG_*_RE replacement requires a secret
+            # keyword in the key, so a text without one can be skipped exactly.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _sub_on_short_lines(_CFG_DOTTED_RE, _redact_env, text)
+                def _redact_dotted_config(m):
+                    name, raw_value = m.group(1), m.group(2)
+                    # A dotted path must have a non-empty final segment. The
+                    # regex keeps candidate discovery linear and delegates the
+                    # semantic checks to this callback.
+                    if name.endswith(".") or not _key_has_secret_keyword(name):
+                        return m.group(0)
+                    quote = ""
+                    value = raw_value
+                    if (
+                        len(raw_value) >= 2
+                        and raw_value[0] in "'\""
+                        and raw_value[-1] == raw_value[0]
+                    ):
+                        quote = raw_value[0]
+                        value = raw_value[1:-1]
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    return f"{name}={quote}{_mask_token(value)}{quote}"
+
+                text = _CFG_DOTTED_RE.sub(_redact_dotted_config, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
