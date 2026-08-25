@@ -17,7 +17,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.agent_runtime_helpers import recover_with_credential_pool
+from agent.agent_runtime_helpers import (
+    _is_official_opencode_go_url,
+    recover_with_credential_pool,
+)
 from agent.error_classifier import FailoverReason
 
 
@@ -90,3 +93,46 @@ class TestCustomPoolMismatchGuard:
         pool.mark_exhausted_and_rotate.assert_called_once()
         agent._swap_credential.assert_called_once_with(nxt)
 
+
+
+class TestOfficialOpenCodeGoUrlDetection:
+    """Which base URLs count as the official OpenCode Go host.
+
+    A delegation child reporting ``provider=custom`` on the Go host must
+    still rotate the Go credential pool. Too loose and an unrelated custom
+    endpoint mutates CodeWalnut credentials; too strict and the original
+    model-hop bug returns.
+    """
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://opencode.ai/zen/go",
+            "https://opencode.ai/zen/go/v1",
+            "https://OpenCode.ai/Zen/Go/v1",
+            "  https://opencode.ai/zen/go/v1  ",
+        ],
+    )
+    def test_official_go_urls_are_recognised(self, base_url):
+        assert _is_official_opencode_go_url(base_url) is True
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://opencode.ai/zen/pro",
+            "https://openrouter.ai/api/v1",
+            "https://api.openai.com/v1",
+            "https://opencode.ai/zen",
+        ],
+    )
+    def test_other_endpoints_are_not_the_go_pool(self, base_url):
+        assert _is_official_opencode_go_url(base_url) is False
+
+    @pytest.mark.parametrize("empty", [None, "", "   "])
+    def test_missing_base_url_is_not_the_go_pool(self, empty):
+        """An agent with no base_url must not be rotated into the Go pool."""
+        assert _is_official_opencode_go_url(empty) is False
+
+    def test_non_string_base_url_does_not_raise(self):
+        """base_url comes off a live agent object and is not always a str."""
+        assert _is_official_opencode_go_url(object()) is False
