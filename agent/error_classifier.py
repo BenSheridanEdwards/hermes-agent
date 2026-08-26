@@ -65,6 +65,11 @@ class FailoverReason(enum.Enum):
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    # The model exists, but THIS credential's plan is not entitled to it (e.g.
+    # a free ChatGPT account asked for a Pro-only Codex slug). Provider and
+    # model are both fine - a different credential in the same pool may well
+    # serve it. Rotate the credential in place; do NOT leave the model.
+    model_not_entitled = "model_not_entitled"
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
 
@@ -450,6 +455,20 @@ def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
     except Exception:
         return False
 
+
+# Plan/entitlement rejections that name the MODEL rather than the account
+# balance.  The credential is healthy and its quota is untouched; it simply is
+# not entitled to this slug.  Distinct from _BILLING_PATTERNS (account is out
+# of money -> quarantine the credential) and from _MODEL_NOT_FOUND_PATTERNS
+# (slug is bogus everywhere -> change model).  Here a sibling credential on a
+# higher plan serves the exact same request, so the pool should rotate the
+# credential and KEEP the model.
+_MODEL_NOT_ENTITLED_PATTERNS = [
+    # OpenAI Codex, free/Plus ChatGPT account asking for a Pro-only slug:
+    #   "The 'gpt-5.6-sol' model is not supported when using Codex with a
+    #    ChatGPT account."
+    "is not supported when using codex with a chatgpt account",
+]
 
 # Malformed-message-array 400s.  Deterministic request-shape rejections that
 # describe the *transcript* being invalid, not a parameter.  The canonical
@@ -1788,6 +1807,17 @@ def _classify_400(
             retryable=False,
             should_fallback=False,
         )
+    # Checked ahead of _MODEL_NOT_FOUND_PATTERNS: an entitlement rejection
+    # also says the model is "not supported", but the slug is valid and a
+    # sibling credential can serve it, so rotating beats hopping model.
+    if any(p in error_msg for p in _MODEL_NOT_ENTITLED_PATTERNS):
+        return result_fn(
+            FailoverReason.model_not_entitled,
+            retryable=False,
+            should_rotate_credential=True,
+            # Only once every credential in the pool has been ruled out.
+            should_fallback=True,
+        )
     if any(p in error_msg for p in _MODEL_NOT_FOUND_PATTERNS):
         return result_fn(
             FailoverReason.model_not_found,
@@ -2057,6 +2087,17 @@ def _classify_by_message(
         )
 
     # Model not found patterns
+    # Checked ahead of _MODEL_NOT_FOUND_PATTERNS: an entitlement rejection
+    # also says the model is "not supported", but the slug is valid and a
+    # sibling credential can serve it, so rotating beats hopping model.
+    if any(p in error_msg for p in _MODEL_NOT_ENTITLED_PATTERNS):
+        return result_fn(
+            FailoverReason.model_not_entitled,
+            retryable=False,
+            should_rotate_credential=True,
+            # Only once every credential in the pool has been ruled out.
+            should_fallback=True,
+        )
     if any(p in error_msg for p in _MODEL_NOT_FOUND_PATTERNS):
         return result_fn(
             FailoverReason.model_not_found,

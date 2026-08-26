@@ -1232,6 +1232,40 @@ def recover_with_credential_pool(
             )
         return False, has_retried_429
 
+    if effective_reason == FailoverReason.model_not_entitled:
+        # This credential's PLAN cannot serve this model, but its quota is
+        # untouched and a sibling credential on a higher plan may serve the
+        # identical request.  Rotate within the pool and keep the model -
+        # leaving for the provider fallback chain here would silently demote
+        # the agent onto a different model, which is exactly what the pool
+        # exists to prevent.
+        _model = (getattr(agent, "model", "") or "").strip()
+        if not _model or not _credential_id:
+            # Without both identities we cannot record a precise block, and a
+            # blind rotate would just re-burn the same rejection next turn.
+            return False, has_retried_429
+        pool.set_active_model(_model)
+        pool.block_for_model(_credential_id, _model)
+        # select() now skips the blocked entry; no exhaustion, no cooldown.
+        next_entry = pool.select()
+        if next_entry is not None and getattr(next_entry, "id", None) != _credential_id:
+            _ra().logger.info(
+                "Credential not entitled to %s - rotated to pool entry %s "
+                "(model preserved)",
+                _model,
+                getattr(next_entry, "id", "?"),
+            )
+            agent._swap_credential(next_entry)
+            return True, has_retried_429
+        # Every credential in the pool has now been ruled out for this model.
+        # Let the caller's fallback chain take over.
+        _ra().logger.warning(
+            "No credential in the %s pool is entitled to %s - deferring to "
+            "the fallback chain",
+            pool.provider, _model,
+        )
+        return False, has_retried_429
+
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402
         # Runtime credentials can be resolved by a separate pool instance,
