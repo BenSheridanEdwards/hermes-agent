@@ -163,6 +163,168 @@ class TestEstimateMessagesTokensRough:
         assert estimate_messages_tokens_rough([msg]) < 5_000
 
 
+class TestReasoningReplayAccounting:
+    """The preflight estimate must charge reasoning at what the wire bills.
+
+    Two persisted shapes inflated it. ``reasoning`` is never sent by any
+    request builder, and Responses-mode ``encrypted_content`` is base64
+    ciphertext roughly an order of magnitude larger than the plaintext it
+    seals, while the provider bills the original token count.
+    """
+
+    def test_reasoning_field_is_not_charged(self):
+        """``reasoning`` is a persisted source field, never a wire field.
+
+        ``apply_reasoning_content_policy()`` reads it only to derive
+        ``reasoning_content``; ``api_msg["reasoning"]`` is never assigned.
+        """
+        trace = "step by step deliberation " * 500
+        wire_shape = {"role": "assistant", "content": "answer"}
+        persisted_shape = {"role": "assistant", "content": "answer", "reasoning": trace}
+
+        assert estimate_messages_tokens_rough([persisted_shape]) == \
+            estimate_messages_tokens_rough([wire_shape])
+
+    def test_reasoning_content_is_still_charged(self):
+        """Echo-back providers (DeepSeek/Kimi/MiMo) do send this one.
+
+        Dropping it would undercount those requests, which is the dangerous
+        direction — compaction would fire too late and the turn would die on
+        a hard context error.
+        """
+        trace = "step by step deliberation " * 500
+        baseline = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": "answer"}]
+        )
+        with_echo = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": "answer", "reasoning_content": trace}]
+        )
+
+        assert with_echo >= baseline + (len(trace) // 4) * 0.9
+
+    def test_duplicate_reasoning_pair_is_counted_once(self):
+        """Both fields hold identical text whenever both are set.
+
+        Charging both doubled the cost of every assistant turn in a long
+        reasoning session.
+        """
+        trace = "step by step deliberation " * 500
+        echo_only = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": "answer", "reasoning_content": trace}]
+        )
+        both_fields = estimate_messages_tokens_rough(
+            [{
+                "role": "assistant",
+                "content": "answer",
+                "reasoning": trace,
+                "reasoning_content": trace,
+            }]
+        )
+
+        assert both_fields == echo_only
+
+    @pytest.mark.parametrize(
+        "field", ["codex_reasoning_items", "codex_message_items"]
+    )
+    def test_encrypted_reasoning_is_discounted_not_raw(self, field):
+        """Charged at its billed rate, not its base64 length."""
+        import base64
+        import os
+
+        blob = base64.b64encode(os.urandom(120_000)).decode()  # ~160K chars
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            field: [{"type": "reasoning", "encrypted_content": blob}],
+        }
+
+        result = estimate_messages_tokens_rough([msg])
+
+        raw_rate = len(blob) // 4          # ~40K tokens, the old behaviour
+        assert result < raw_rate // 2
+        # Still charged something: the provider does bill replayed reasoning,
+        # so counting it as free would undercount.
+        assert result > len(blob) // 64
+
+    @pytest.mark.parametrize(
+        "field", ["codex_reasoning_items", "codex_message_items"]
+    )
+    def test_unencrypted_item_structure_is_still_charged(self, field):
+        """Only the ciphertext is discounted; the rest of the item is sent verbatim."""
+        summary = "a plaintext reasoning summary " * 300
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            field: [{"type": "reasoning", "summary": summary}],
+        }
+
+        result = estimate_messages_tokens_rough([msg])
+
+        assert result >= (len(summary) // 4) * 0.9
+
+    def test_malformed_replay_shapes_do_not_crash_or_vanish(self):
+        """An unexpected payload is counted, never silently dropped.
+
+        Dropping it would undercount the wire.
+        """
+        body = "some real content " * 400
+        baseline = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": body}]
+        )
+
+        for bad_items in (None, "not-a-list", 42, [], [None], ["not-a-dict"],
+                          [{"encrypted_content": None}], [{"no_blob": "here"}]):
+            msg = {
+                "role": "assistant",
+                "content": body,
+                "codex_reasoning_items": bad_items,
+            }
+            assert estimate_messages_tokens_rough([msg]) >= baseline, bad_items
+
+    def test_memoized_and_uncomputed_paths_agree(self):
+        """The per-message memo must not skip the encrypted-reasoning charge.
+
+        The memo is keyed on a fingerprint of the raw message; an unhashable
+        message bypasses it and computes directly. Both paths must return the
+        same number or the estimate would drift with cache state.
+        """
+        from agent.model_metadata import _estimate_message_tokens_cached
+
+        import base64
+        import os
+
+        blob = base64.b64encode(os.urandom(40_000)).decode()
+        items = [{"type": "reasoning", "encrypted_content": blob}]
+        hashable = {"role": "assistant", "content": "answer",
+                    "codex_reasoning_items": items}
+        # A set value is unfingerprintable, forcing the uncached branch.
+        unhashable = dict(hashable, extra={"unfingerprintable"})
+
+        cached_result = _estimate_message_tokens_cached(hashable, 1500)
+        direct_result = _estimate_message_tokens_cached(unhashable, 1500)
+
+        # The set adds a few chars; the encrypted charge must match exactly.
+        assert abs(cached_result - direct_result) < 20
+
+    def test_repeated_calls_are_stable(self):
+        """Second call hits the memo; the number must not move."""
+        import base64
+        import os
+
+        blob = base64.b64encode(os.urandom(40_000)).decode()
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": blob}
+            ],
+        }
+
+        first = estimate_messages_tokens_rough([msg])
+        second = estimate_messages_tokens_rough([msg])
+
+        assert first == second
+
 
 class TestEstimateRequestTokensRough:
     def test_caches_tools_estimate(self):

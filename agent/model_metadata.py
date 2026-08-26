@@ -3400,6 +3400,7 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
         return (
             _estimate_message_tokens_without_images(msg)
             + _count_image_tokens(msg, image_cost)
+            + _count_encrypted_reasoning_tokens(msg)
         )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
@@ -3407,6 +3408,7 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
     tokens = (
         _estimate_message_tokens_without_images(msg)
         + _count_image_tokens(msg, image_cost)
+        + _count_encrypted_reasoning_tokens(msg)
     )
     _MSG_TOKENS_CACHE[key] = (pins, tokens)
     while len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX:
@@ -3443,6 +3445,78 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+# Replayed reasoning is carried as base64 ciphertext (Responses-mode
+# ``encrypted_content``). Providers bill it at the reasoning's ORIGINAL token
+# count, but the blob is roughly an order of magnitude larger than the
+# plaintext it seals, so charging it at the usual ~4 chars/token rate reads a
+# long session as ~1.45x its real prompt size and compacts at barely half the
+# context window. 16 chars/token is deliberately conservative — measured
+# aggregate blowup on real Codex sessions is ~11.6x (i.e. ~46 chars per billed
+# token), so this still over-counts, keeping compaction on the safe side of the
+# provider's hard limit.
+_ENCRYPTED_REASONING_CHARS_PER_TOKEN = 16
+
+# Message fields holding provider reasoning items replayed on the wire.
+_REASONING_REPLAY_FIELDS = ("codex_reasoning_items", "codex_message_items")
+
+# Persisted fields no request builder puts on the wire.
+_SHADOW_EXCLUDED_FIELDS = frozenset({
+    "_anthropic_content_blocks",
+    "reasoning_details",
+    "reasoning",
+})
+
+_ENCRYPTED_REASONING_PLACEHOLDER = "[encrypted]"
+
+
+def _strip_encrypted_reasoning(items: Any) -> Any:
+    """Replace ``encrypted_content`` blobs with a short placeholder.
+
+    Leaves any other shape untouched so an unexpected payload is still counted
+    rather than silently dropped.
+    """
+    if not isinstance(items, list):
+        return items
+    stripped = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("encrypted_content"), str):
+            slim = dict(item)
+            slim["encrypted_content"] = _ENCRYPTED_REASONING_PLACEHOLDER
+            stripped.append(slim)
+        else:
+            stripped.append(item)
+    return stripped
+
+
+def _iter_encrypted_reasoning_blobs(msg: Dict[str, Any]):
+    """Yield every ``encrypted_content`` blob a message replays."""
+    for field in _REASONING_REPLAY_FIELDS:
+        items = msg.get(field)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            blob = item.get("encrypted_content")
+            if isinstance(blob, str) and blob:
+                yield blob
+
+
+def _count_encrypted_reasoning_tokens(msg: Dict[str, Any]) -> int:
+    """Token cost of replayed encrypted reasoning at its billed rate.
+
+    Mirrors the flat per-image rule: the shadow strips the blob so its raw
+    chars are never counted, and the real cost is added back here.
+    """
+    total_chars = 0
+    for blob in _iter_encrypted_reasoning_blobs(msg):
+        total_chars += len(blob)
+    if not total_chars:
+        return 0
+    chars_per_token = _ENCRYPTED_REASONING_CHARS_PER_TOKEN
+    return (total_chars + chars_per_token - 1) // chars_per_token
+
+
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
@@ -3463,6 +3537,16 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     * Base64 image payloads are replaced with a placeholder; they are charged
       separately at a flat rate by ``_count_image_tokens``, and counting their
       raw chars here would massively overestimate usage.
+    * ``reasoning`` is dropped. It is a persisted source field that no request
+      builder ever sends: ``apply_reasoning_content_policy()`` reads it only to
+      derive ``reasoning_content``, and only for the providers that require
+      thinking echo-back. ``reasoning_content`` itself is kept, so echo-back
+      providers are still counted at full size — and since the two fields hold
+      identical text whenever both are set, keeping only one removes an exact
+      double-count without ever undercounting the wire.
+    * Replayed reasoning items keep their structure but lose their
+      ``encrypted_content`` ciphertext, which
+      ``_count_encrypted_reasoning_tokens`` charges at its billed rate.
     """
     sidecar = msg.get("api_content")
     sidecar_wins = (
@@ -3472,7 +3556,14 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     )
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        if k in _SHADOW_EXCLUDED_FIELDS or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+            continue
+        if k in _REASONING_REPLAY_FIELDS:
+            # Replayed on the wire, but the encrypted blob is charged at its
+            # billed rate by ``_count_encrypted_reasoning_tokens`` instead of
+            # its base64 length. Keep the surrounding item structure, which is
+            # small and genuinely sent.
+            shadow[k] = _strip_encrypted_reasoning(v)
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
