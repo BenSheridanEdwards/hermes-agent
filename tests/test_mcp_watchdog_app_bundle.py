@@ -26,8 +26,16 @@ BUNDLED = "/Tools/tcc-identity/apps/Doc.app/Contents/MacOS/Doc"
 
 
 def _bundled_env(base_prefix, isfile, access=True):
-    """Patch context bundle: sys.executable inside a .app + fake base_prefix."""
+    """Patch context bundle: sys.executable inside a .app + fake base_prefix.
+
+    ``sys.platform`` is pinned to darwin because ``_watchdog_interpreter``
+    returns ``sys.executable`` unchanged on every other platform. Without the
+    pin these tests assert macOS-only behaviour while running on the Linux CI
+    slices, where they take the early return and fail. Everything else here is
+    already faked, so the host OS must be faked too.
+    """
     return (
+        mock.patch.object(sys, "platform", "darwin"),
         mock.patch.object(sys, "executable", BUNDLED),
         mock.patch.object(sys, "base_prefix", base_prefix),
         mock.patch("os.path.isfile", side_effect=isfile),
@@ -38,13 +46,15 @@ def _bundled_env(base_prefix, isfile, access=True):
 class WatchdogInterpreterTests(unittest.TestCase):
     def test_plain_executable_passthrough(self):
         """A normal (non-bundled) executable is returned unchanged."""
-        with mock.patch.object(sys, "executable", "/usr/bin/python3"):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(sys, "executable", "/usr/bin/python3"):
             self.assertEqual(_watchdog_interpreter(), "/usr/bin/python3")
 
     def test_venv_executable_passthrough(self):
         """A venv python (has pyvenv.cfg beside it) is returned unchanged."""
         venv_python = "/Users/x/.venvs/hermes/bin/python"
-        with mock.patch.object(sys, "executable", venv_python):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(sys, "executable", venv_python):
             self.assertEqual(_watchdog_interpreter(), venv_python)
 
     def test_bundled_executable_rehomed_to_sibling(self):
@@ -87,6 +97,7 @@ class WatchdogInterpreterTests(unittest.TestCase):
         fake_base = "/fake/base"
         with context_stack(
             (
+                mock.patch.object(sys, "platform", "darwin"),
                 mock.patch.object(sys, "executable", bundled),
                 mock.patch.object(sys, "base_prefix", fake_base),
                 mock.patch("os.path.isfile", return_value=True),
@@ -145,7 +156,8 @@ class WatchdogInterpreterTests(unittest.TestCase):
         """Advisor nonblocking 2: .App/Contents/macos/ also matches."""
         odd = "/Tools/tcc-identity/apps/Sky.App/Contents/macos/Sky"
         fake_base = "/fake/base"
-        with mock.patch.object(sys, "executable", odd), \
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(sys, "executable", odd), \
              mock.patch.object(sys, "base_prefix", fake_base), \
              mock.patch("os.path.isfile", return_value=True), \
              mock.patch("os.access", return_value=True):
@@ -156,7 +168,8 @@ class WatchdogInterpreterTests(unittest.TestCase):
 
     def test_bundled_empty_base_prefix_falls_back(self):
         bundled = BUNDLED
-        with mock.patch.object(sys, "executable", bundled), \
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(sys, "executable", bundled), \
              mock.patch.object(sys, "base_prefix", ""), \
              mock.patch.object(sys, "prefix", ""):
             self.assertEqual(_watchdog_interpreter(), bundled)
@@ -167,6 +180,7 @@ class WatchdogInterpreterTests(unittest.TestCase):
         real_command = "/usr/local/bin/some-mcp-server"
         real_args = ["--flag"]
         posix_case = (
+            mock.patch.object(sys, "platform", "darwin"),
             mock.patch.object(sys, "executable", BUNDLED),
             mock.patch.object(sys, "base_prefix", "/fake/base"),
             mock.patch.object(os, "name", "posix"),
