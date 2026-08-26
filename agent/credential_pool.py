@@ -675,6 +675,53 @@ class CredentialPool:
         # loop runs unbounded and non-interruptible.  Reset whenever a real
         # entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        # Per-credential model entitlement blocks: credential id -> the set of
+        # model slugs that credential's PLAN cannot serve (discovered from a
+        # provider entitlement rejection, e.g. a free ChatGPT account asked for
+        # a Pro-only Codex slug).  Deliberately NOT persisted and NOT a
+        # cooldown/exhaustion: the credential stays fully available for every
+        # other model, and the block evaporates on restart so a plan upgrade is
+        # picked up without anyone having to clear state by hand.
+        self._model_blocks: Dict[str, Set[str]] = {}
+        # The model the agent is currently dispatching, so selection knows
+        # which blocks apply.  None means "no blocks apply".
+        self._active_model: Optional[str] = None
+
+    def set_active_model(self, model: Optional[str]) -> None:
+        """Tell the pool which model is being dispatched.
+
+        Entitlement blocks are per (credential, model), so selection can only
+        apply them when it knows the model in play.  Callers set this before
+        selecting; an unset/empty model disables block filtering entirely
+        rather than guessing.
+        """
+        with self._lock:
+            self._active_model = (model or "").strip() or None
+
+    def block_for_model(self, credential_id: str, model: str) -> None:
+        """Record that *credential_id*'s plan cannot serve *model*.
+
+        Used instead of marking the credential exhausted: its quota is intact
+        and it must stay selectable for the models it IS entitled to.
+        """
+        model = (model or "").strip()
+        if not credential_id or not model:
+            return
+        with self._lock:
+            self._model_blocks.setdefault(credential_id, set()).add(model)
+            logger.info(
+                "credential pool: %s not entitled to %s - skipping it for that "
+                "model only (still available for others)",
+                credential_id[:8], model,
+            )
+
+    def is_blocked_for_model(self, credential_id: str, model: str) -> bool:
+        """Whether *credential_id* is known to be unable to serve *model*."""
+        model = (model or "").strip()
+        if not credential_id or not model:
+            return False
+        with self._lock:
+            return model in self._model_blocks.get(credential_id, set())
 
     def has_credentials(self) -> bool:
         with self._lock:
@@ -1946,11 +1993,17 @@ class CredentialPool:
         sole_credential = sum(
             1 for e in self._entries if e.last_status != STATUS_DEAD
         ) <= 1
+        active_model = self._active_model
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
             # can remain unhydrated; never lease or select it as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                continue
+            # This credential's plan cannot serve the model being dispatched.
+            # Skip it for this request only - it is neither exhausted nor in
+            # cooldown, and remains selectable for other models.
+            if active_model and active_model in self._model_blocks.get(entry.id, ()):
                 continue
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed

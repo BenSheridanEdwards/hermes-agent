@@ -59,7 +59,7 @@ class TestFailoverReason:
             "local_resource",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
-            "model_not_found", "format_error",
+            "model_not_found", "model_not_entitled", "format_error",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
