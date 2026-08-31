@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import FrozenSet, Mapping, Optional
+from typing import Any, FrozenSet, Mapping, Optional, Sequence
 
 from agent.credential_pool import CredentialPool, PooledCredential, load_pool
 from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL, runtime_owns_oauth_refresh
@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 _POOL_PROVIDER = "xai-oauth"
 
 _COMPOSER_MODEL = "grok-composer-2.5"
+_COMPOSER_PORT = 8646
 _COMPOSER_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 _COMPOSER_ALLOWED_PATHS: FrozenSet[str] = frozenset({"/responses"})
+_COMPOSER_ATTESTATION_PATH = "/attest/model"
+_COMPOSER_ATTESTATION_SENTINEL = "HERMES_XAI_COMPOSER_READY"
+_COMPOSER_INVALID_MODEL = "grok-composer-2.5-hermes-invalid-control"
 _COMPOSER_IDENTITY_HEADERS = {
     "User-Agent": "Grok/0.2.117",
     "x-grok-client-version": "0.2.117",
@@ -29,19 +33,25 @@ _COMPOSER_IDENTITY_HEADERS = {
     "X-XAI-Token-Auth": "xai-grok-cli",
     "x-grok-model-override": _COMPOSER_MODEL,
 }
+_COMPOSER_CALLER_IDENTITY_HEADERS = frozenset({
+    "user-agent",
+    "x-grok-client-version",
+    "x-grok-client-identifier",
+    "x-grok-client-mode",
+    "x-xai-token-auth",
+    "x-grok-model-override",
+})
 
 # xAI's public API is OpenAI-compatible for the endpoints Hermes commonly
 # uses. The Responses endpoint is included because Hermes' native xAI runtime
 # uses codex_responses mode.
-_ALLOWED_PATHS: FrozenSet[str] = frozenset(
-    {
-        "/responses",
-        "/chat/completions",
-        "/completions",
-        "/embeddings",
-        "/models",
-    }
-)
+_ALLOWED_PATHS: FrozenSet[str] = frozenset({
+    "/responses",
+    "/chat/completions",
+    "/completions",
+    "/embeddings",
+    "/models",
+})
 
 
 class XAIGrokAdapter(UpstreamAdapter):
@@ -174,6 +184,10 @@ class XAIGrokComposerAdapter(XAIGrokAdapter):
         return _COMPOSER_ALLOWED_PATHS
 
     @property
+    def default_port(self) -> int:
+        return _COMPOSER_PORT
+
+    @property
     def loopback_only(self) -> bool:
         return True
 
@@ -185,7 +199,10 @@ class XAIGrokComposerAdapter(XAIGrokAdapter):
         return method.upper() == "POST"
 
     def is_authenticated(self) -> bool:
-        return not runtime_owns_oauth_refresh(_POOL_PROVIDER) and super().is_authenticated()
+        return (
+            not runtime_owns_oauth_refresh(_POOL_PROVIDER)
+            and super().is_authenticated()
+        )
 
     def get_credential(self) -> UpstreamCredential:
         if runtime_owns_oauth_refresh(_POOL_PROVIDER):
@@ -241,18 +258,138 @@ class XAIGrokComposerAdapter(XAIGrokAdapter):
                 code="model_not_allowed",
             )
 
+        return body, self._locked_headers(headers, _COMPOSER_MODEL)
+
+    @staticmethod
+    def _locked_headers(
+        headers: Mapping[str, str], model_override: str
+    ) -> dict[str, str]:
         prepared = dict(headers)
         # Header names are case-insensitive. Remove all client-supplied identity
         # variants before attaching the locked profile so duplicate casing can
         # never smuggle a conflicting model/client identity upstream.
-        locked_names = {name.lower() for name in _COMPOSER_IDENTITY_HEADERS}
         prepared = {
             name: value
             for name, value in prepared.items()
-            if name.lower() not in locked_names
+            if name.lower() not in _COMPOSER_CALLER_IDENTITY_HEADERS
         }
         prepared.update(_COMPOSER_IDENTITY_HEADERS)
-        return body, prepared
+        prepared["x-grok-model-override"] = model_override
+        return prepared
+
+    def health_attestation(self) -> dict[str, Any]:
+        return {
+            "schema": 1,
+            "status": "ready" if self.is_authenticated() else "unavailable",
+            "provider": self.name,
+            "mode": self.name,
+            "model": _COMPOSER_MODEL,
+            "response_path": "/v1/responses",
+            "attestation_path": _COMPOSER_ATTESTATION_PATH,
+            "identity_owner": "broker",
+            "refresh_owner": "external",
+        }
+
+    @property
+    def model_attestation_path(self) -> str:
+        return _COMPOSER_ATTESTATION_PATH
+
+    def model_attestation_requests(self) -> Sequence[tuple[bytes, dict[str, str]]]:
+        positive = json.dumps(
+            {
+                "model": _COMPOSER_MODEL,
+                "input": (
+                    f"Reply with exactly {_COMPOSER_ATTESTATION_SENTINEL} "
+                    "and no other text."
+                ),
+                "store": False,
+                "stream": False,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        negative = json.dumps(
+            {
+                "model": _COMPOSER_INVALID_MODEL,
+                "input": "fixed invalid model control",
+                "store": False,
+                "stream": False,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return (
+            (
+                positive,
+                self._locked_headers(
+                    {"Content-Type": "application/json"}, _COMPOSER_MODEL
+                ),
+            ),
+            (
+                negative,
+                self._locked_headers(
+                    {"Content-Type": "application/json"}, _COMPOSER_INVALID_MODEL
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _response_text(payload: Mapping[str, Any]) -> Optional[str]:
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+        output = payload.get("output")
+        if not isinstance(output, list):
+            return None
+        texts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or not isinstance(item.get("content"), list):
+                continue
+            for part in item["content"]:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "output_text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    texts.append(part["text"])
+        text = "\n".join(texts).strip()
+        return text or None
+
+    def validate_model_attestation(
+        self, responses: Sequence[tuple[int, bytes]]
+    ) -> dict[str, Any]:
+        if len(responses) != 2:
+            raise ProxyRequestError("model attestation controls were incomplete")
+        try:
+            positive = json.loads(responses[0][1])
+            negative = json.loads(responses[1][1])
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProxyRequestError("model attestation returned invalid JSON") from exc
+        alias = positive.get("model") if isinstance(positive, dict) else None
+        if (
+            responses[0][0] < 200
+            or responses[0][0] >= 300
+            or not isinstance(alias, str)
+            or not alias.strip()
+            or self._response_text(positive) != _COMPOSER_ATTESTATION_SENTINEL
+        ):
+            raise ProxyRequestError("exact Composer control did not succeed")
+        error = negative.get("error") if isinstance(negative, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if (
+            responses[1][0] != 400
+            or str(code).lower().replace("-", "_") != "model_not_found"
+        ):
+            raise ProxyRequestError("fixed impossible model control was not rejected")
+        return {
+            "schema": 1,
+            "status": "ready",
+            "provider": self.name,
+            "mode": self.name,
+            "model": _COMPOSER_MODEL,
+            "positive_control": "accepted",
+            "negative_control": "rejected",
+            "observed_model_alias": alias.strip(),
+            "identity_owner": "broker",
+        }
 
 
 __all__ = ["XAIGrokAdapter", "XAIGrokComposerAdapter"]

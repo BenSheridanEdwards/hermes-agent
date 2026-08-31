@@ -30,7 +30,11 @@ def _add_compat_platform_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def build_gateway_parser(
-    subparsers, *, cmd_gateway: Callable, cmd_proxy: Callable, cmd_gateway_enroll: Callable
+    subparsers,
+    *,
+    cmd_gateway: Callable,
+    cmd_proxy: Callable,
+    cmd_gateway_enroll: Callable,
 ) -> None:
     """Attach the ``gateway`` and ``proxy`` subcommands to ``subparsers``."""
     # =========================================================================
@@ -218,7 +222,9 @@ def build_gateway_parser(
     )
 
     # gateway list
-    gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
+    gateway_subparsers.add_parser(
+        "list", help="List all profiles and their gateway status"
+    )
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -345,12 +351,10 @@ def build_gateway_parser(
         "--port",
         type=int,
         default=None,
-        help="Bind port (default: 8645)",
+        help="Bind port (default: 8645; xai-composer: 8646)",
     )
 
-    proxy_subparsers.add_parser(
-        "status", help="Show which proxy upstreams are ready"
-    )
+    proxy_subparsers.add_parser("status", help="Show which proxy upstreams are ready")
     proxy_subparsers.add_parser(
         "providers", help="List available proxy upstream providers"
     )

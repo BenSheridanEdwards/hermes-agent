@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Mapping, Optional
+from typing import Any, FrozenSet, Mapping, Optional, Sequence
 
 
 class ProxyRequestError(ValueError):
@@ -109,6 +109,11 @@ class UpstreamAdapter(ABC):
         return False
 
     @property
+    def default_port(self) -> Optional[int]:
+        """Return a provider-specific listener port, when one is required."""
+        return None
+
+    @property
     def safe_error_messages(self) -> bool:
         """Whether upstream/credential failures must be returned without details."""
         return False
@@ -126,6 +131,26 @@ class UpstreamAdapter(ABC):
     ) -> tuple[bytes, dict[str, str]]:
         """Validate and transform a request before credential injection."""
         return body, dict(headers)
+
+    def health_attestation(self) -> Optional[dict[str, Any]]:
+        """Return fixed non-secret readiness metadata for a locked adapter."""
+        return None
+
+    @property
+    def model_attestation_path(self) -> Optional[str]:
+        """Return the fixed local model-attestation path, when supported."""
+        return None
+
+    def model_attestation_requests(self) -> Sequence[tuple[bytes, dict[str, str]]]:
+        """Build fixed broker-owned upstream controls for model attestation."""
+        raise NotImplementedError
+
+    def validate_model_attestation(
+        self, responses: Sequence[tuple[int, bytes]]
+    ) -> dict[str, Any]:
+        """Validate fixed control responses and return bounded metadata."""
+        _ = responses
+        raise NotImplementedError
 
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""

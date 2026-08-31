@@ -14,11 +14,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from typing import Optional
+from typing import Mapping, Optional
 
 try:
     import aiohttp
     from aiohttp import web
+
     AIOHTTP_AVAILABLE = True
 except ImportError:
     aiohttp = None  # type: ignore[assignment]
@@ -36,21 +37,19 @@ logger = logging.getLogger(__name__)
 # Headers we strip when forwarding to the upstream. ``host``/``content-length``
 # are recomputed by aiohttp; ``authorization`` is replaced with our bearer.
 # Everything else (content-type, accept, user-agent, x-* headers) passes through.
-_HOP_BY_HOP_HEADERS = frozenset(
-    {
-        "host",
-        "content-length",
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "authorization",  # we replace this one
-    }
-)
+_HOP_BY_HOP_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "authorization",  # we replace this one
+})
 
 DEFAULT_PORT = 8645
 DEFAULT_HOST = "127.0.0.1"
@@ -58,6 +57,7 @@ DEFAULT_HOST = "127.0.0.1"
 # conversations can be large; mirror api_server's MAX_REQUEST_BYTES (10 MB).
 # client_max_size bounds every read path, including chunked bodies.
 MAX_REQUEST_BYTES = 10_000_000
+MAX_ATTESTATION_RESPONSE_BYTES = 1_000_000
 
 
 def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Response":
@@ -66,7 +66,7 @@ def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Re
     return web.json_response(body, status=status)
 
 
-def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
+def _filter_request_headers(headers: Mapping[str, str]) -> dict:
     """Strip hop-by-hop + auth headers from the inbound request."""
     out = {}
     for key, value in headers.items():
@@ -103,13 +103,94 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     app[_adapter_key] = adapter
 
     async def handle_health(request: "web.Request") -> "web.Response":
-        return web.json_response(
-            {
-                "status": "ok",
-                "upstream": adapter.display_name,
-                "authenticated": adapter.is_authenticated(),
-            }
-        )
+        attestation = adapter.health_attestation()
+        if attestation is not None:
+            status = 200 if attestation.get("status") == "ready" else 503
+            return web.json_response(attestation, status=status)
+        return web.json_response({
+            "status": "ok",
+            "upstream": adapter.display_name,
+            "authenticated": adapter.is_authenticated(),
+        })
+
+    async def handle_model_attestation(request: "web.Request") -> "web.Response":
+        if await request.read():
+            return _json_error(
+                400,
+                "model attestation does not accept caller controls",
+                code="attestation_input_not_allowed",
+            )
+        try:
+            credential = adapter.get_credential()
+        except Exception:
+            logger.warning("proxy: model attestation credential resolution failed")
+            return _json_error(
+                401,
+                "upstream credential unavailable",
+                code="upstream_auth_failed",
+            )
+
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=30)
+        controls = adapter.model_attestation_requests()
+        results: list[tuple[int, bytes]] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for body, headers in controls:
+                    upstream_headers = dict(headers)
+                    upstream_headers["Authorization"] = (
+                        f"{credential.token_type} {credential.bearer}"
+                    )
+                    async with session.post(
+                        f"{credential.base_url.rstrip('/')}/responses",
+                        data=body,
+                        headers=upstream_headers,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status == 429:
+                            retry_after = response.headers.get("Retry-After")
+                            response_headers = (
+                                {"Retry-After": retry_after} if retry_after else None
+                            )
+                            return web.json_response(
+                                {
+                                    "error": {
+                                        "message": "model attestation was rate limited",
+                                        "type": "rate_limited",
+                                        "code": "rate_limited",
+                                    }
+                                },
+                                status=429,
+                                headers=response_headers,
+                            )
+                        response_body = await response.read()
+                        if len(response_body) > MAX_ATTESTATION_RESPONSE_BYTES:
+                            raise ProxyRequestError(
+                                "model attestation response exceeded the size limit"
+                            )
+                        results.append((response.status, response_body))
+        except ProxyRequestError:
+            logger.warning("proxy: model attestation response was invalid")
+            return _json_error(
+                502,
+                "model attestation response was invalid",
+                code="attestation_failed",
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.warning("proxy: model attestation upstream unavailable")
+            return _json_error(
+                502,
+                "model attestation upstream unavailable",
+                code="upstream_unreachable",
+            )
+        try:
+            return web.json_response(adapter.validate_model_attestation(results))
+        except ProxyRequestError:
+            logger.warning("proxy: model attestation controls failed")
+            return _json_error(
+                502,
+                "model attestation controls failed",
+                code="attestation_failed",
+            )
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
         # Extract the path *after* /v1
@@ -160,14 +241,19 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
             fwd_headers = dict(prepared_headers)
-            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            fwd_headers["Authorization"] = (
+                f"{active_cred.token_type} {active_cred.bearer}"
+            )
 
             if adapter.safe_error_messages:
                 logger.debug("proxy: forwarding %s %s", request.method, rel_path)
             else:
                 logger.debug(
                     "proxy: forwarding %s %s -> %s (body=%d bytes)",
-                    request.method, rel_path, upstream_url, len(body),
+                    request.method,
+                    rel_path,
+                    upstream_url,
+                    len(body),
                 )
 
             try:
@@ -274,6 +360,8 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
     # /health doesn't go through the upstream
     app.router.add_get("/health", handle_health)
+    if adapter.model_attestation_path is not None:
+        app.router.add_post(adapter.model_attestation_path, handle_model_attestation)
     # Catch-all under /v1 — forwards if the path is allowed.
     app.router.add_route("*", "/v1/{tail:.*}", handle_proxy)
 
@@ -306,7 +394,9 @@ async def run_server(
 
     logger.info(
         "proxy: listening on http://%s:%d/v1 -> %s",
-        host, port, adapter.display_name,
+        host,
+        port,
+        adapter.display_name,
     )
 
     stop_event = shutdown_event or asyncio.Event()
