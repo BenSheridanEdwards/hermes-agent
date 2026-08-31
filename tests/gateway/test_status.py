@@ -435,7 +435,11 @@ class TestGatewayRuntimeStatus:
 
         payload = status.read_runtime_status()
         assert payload["pid"] == os.getpid()
-        assert payload["platforms"] == {}
+        # The stale receipt (volatile per-incarnation auth evidence) is gone;
+        # durable platform state survives with per-entry writer provenance,
+        # and clear_profile_platforms owns pruning per-profile entries.
+        assert "runtime" not in payload["platforms"]["telegram"]
+        assert payload["platforms"]["telegram"]["state"] == "connected"
 
     def test_multiplexed_status_never_persists_ambiguous_runtime_receipt(
         self, tmp_path, monkeypatch

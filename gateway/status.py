@@ -1217,13 +1217,23 @@ def write_runtime_status(
         if payload is not None
         else _build_runtime_status_record()
     )
-    if payload is None or (
+    if payload is None:
+        payload = _build_runtime_status_record()
+    elif (
         payload.get("pid") != current_record["pid"]
         or payload.get("start_time") != current_record["start_time"]
     ):
         # Volatile authentication/readiness evidence belongs to one exact
-        # process incarnation. Never rebind an old receipt to a new PID/start.
-        payload = _build_runtime_status_record()
+        # process incarnation. Never rebind an old receipt to a new PID/start:
+        # strip per-platform ``runtime`` receipts, but keep the rest of the
+        # record — durable platform state carries its own writer_pid/
+        # writer_start_time provenance, and ``clear_profile_platforms`` owns
+        # pruning per-profile entries on a fresh boot.
+        platforms = payload.get("platforms")
+        if isinstance(platforms, dict):
+            for entry in platforms.values():
+                if isinstance(entry, dict):
+                    entry.pop("runtime", None)
     payload.setdefault("platforms", {})
     if clear_profile_platforms:
         # Secondary-profile adapter health is stored in the process-level
