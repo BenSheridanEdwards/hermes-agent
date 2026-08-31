@@ -57,6 +57,105 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
+@pytest.mark.parametrize(
+    ("estimated_tokens", "is_openai_codex", "expected_seconds"),
+    [
+        (0, True, 60.0),
+        (7_723, True, 60.0),
+        (10_000, True, 60.0),
+        (0, False, 12.0),
+        (10_000, False, 12.0),
+        (50_000, False, 60.0),
+        (50_001, True, 120.0),
+        (100_000, True, 120.0),
+        (100_001, True, 180.0),
+    ],
+)
+def test_codex_event_idle_default_tolerates_normal_reasoning_gaps(
+    estimated_tokens,
+    is_openai_codex,
+    expected_seconds,
+):
+    """A first SSE frame followed by ordinary model reasoning must not be
+    classified as a dead stream after only 12 seconds.
+
+    Production evidence showed two independent ~7.5k-token Codex calls emit a
+    first frame and then get killed at the old 12-second default on all five
+    retries.  The default policy must leave at least a minute for progress at
+    that request size while preserving longer bounds for larger contexts.
+    """
+    from agent import chat_completion_helpers as h
+
+    assert (
+        h.codex_event_idle_timeout_default(
+            estimated_tokens,
+            is_openai_codex=is_openai_codex,
+        )
+        == expected_seconds
+    )
+
+
+def test_default_openai_codex_idle_allows_15_second_event_gap(tmp_path, monkeypatch):
+    """Exercise the production default end to end with virtual time.
+
+    A first SSE event followed by 15 seconds of model reasoning was killed by
+    the old 12-second default. The worker must remain live and complete without
+    invoking the stream-idle abort path when the environment override is unset.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    sentinel = SimpleNamespace(ok=True)
+    clock = {"now": 100.0}
+
+    monkeypatch.setattr(h.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(agent, "_run_codex_stream", lambda *a, **k: sentinel)
+
+    class ReasoningGapThread:
+        def __init__(self, *, target, daemon):
+            self._target = target
+            self._polls = 0
+
+        def start(self):
+            agent._codex_stream_last_event_ts = clock["now"]
+
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            self._polls += 1
+            if self._polls <= 3:
+                clock["now"] += 5.0
+                return True
+            self._target()
+            return False
+
+    monkeypatch.setattr(h.threading, "Thread", ReasoningGapThread)
+
+    response = h.interruptible_api_call(
+        agent,
+        {"model": "gpt-5.6-sol", "input": "hi"},
+    )
+
+    assert response is sentinel
+    assert "codex_stream_idle_kill" not in closes
+
+
 
 
 
@@ -146,6 +245,50 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
+
+
+def test_event_idle_override_still_kills_a_proven_stall(tmp_path, monkeypatch):
+    """The safer production default must not disable the operator-tunable
+    stream-idle watchdog: an explicit short threshold still reclaims silence."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.4")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"flag": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert "after first byte" in str(excinfo.value)
+        assert "codex_stream_idle_kill" in closes
+        assert "codex_ttfb_kill" not in closes
+    finally:
+        stop["flag"] = True
 
 
 

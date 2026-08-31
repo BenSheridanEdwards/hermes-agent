@@ -537,6 +537,30 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+def codex_event_idle_timeout_default(
+    est_tokens: int,
+    *,
+    is_openai_codex: bool,
+) -> float:
+    """Return the default maximum gap between Codex SSE events.
+
+    An opening ``response.created`` frame only proves that the stream is
+    connected; OpenAI Codex may then reason without emitting another SSE
+    event. Production traces showed healthy small Codex requests repeatedly
+    killed at the old 12-second default, manufacturing ``Broken pipe`` retries
+    and provider fallback. Keep a one-minute floor for OpenAI Codex while
+    retaining the existing 12-second default for other Responses routes, the
+    larger-context scaling, and the operator override.
+    """
+    if not is_openai_codex and est_tokens <= 10_000:
+        return 12.0
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 120.0
+    return 60.0
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -1534,14 +1558,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
-    if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
-    elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
-    else:
-        _codex_idle_timeout_default = 12.0
+    _codex_idle_timeout_default = codex_event_idle_timeout_default(
+        _est_tokens_for_codex_watchdog,
+        is_openai_codex=_openai_codex_backend,
+    )
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
