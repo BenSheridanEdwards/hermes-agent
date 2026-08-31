@@ -331,7 +331,10 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
+        help=(
+            "Upstream provider: nous, xai, or xai-composer (default: nous). "
+            "See `hermes proxy providers`."
+        ),
     )
     proxy_start.add_argument(
         "--host",

@@ -14,7 +14,7 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
-from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+from hermes_cli.proxy.adapters.xai import XAIGrokAdapter, XAIGrokComposerAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +140,13 @@ def _write_xai_pool_entry(
         },
     }))
     return auth_path
+
+
+def _configure_external_oauth_owner(hermes_home: Path) -> None:
+    (hermes_home / "config.yaml").write_text(
+        "oauth:\n  refresh_owner: external\n",
+        encoding="utf-8",
+    )
 
 
 def test_xai_adapter_not_authenticated_when_no_pool_entry(tmp_path, monkeypatch):
@@ -297,6 +304,8 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "method": request.method,
             "path": request.path,
             "auth": request.headers.get("Authorization"),
+            "headers": {key.lower(): value for key, value in request.headers.items()},
+            "path_qs": request.path_qs,
             "body": body.decode("utf-8") if body else "",
         })
         return web.json_response({"echoed": True, "path": request.path})
@@ -313,6 +322,7 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
 
     app = web.Application()
     app.router.add_route("*", "/v1/chat/completions", echo)
+    app.router.add_route("*", "/v1/responses", echo)
     app.router.add_route("*", "/v1/embeddings", echo)
     app.router.add_route("*", "/v1/sse", sse)
     return app
@@ -363,6 +373,187 @@ def test_server_strips_client_auth_header():
             await upstream_runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_xai_composer_forwards_only_locked_responses_route(
+    tmp_path, monkeypatch, caplog
+):
+    async def run():
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _configure_external_oauth_owner(tmp_path)
+        _write_xai_pool_entry(tmp_path, access_token="fleet-token-v1")
+
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        monkeypatch.setattr(
+            "hermes_cli.proxy.adapters.xai._COMPOSER_BASE_URL",
+            f"{upstream_base}/v1",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(XAIGrokComposerAdapter()))
+        body = json.dumps(
+            {"model": "grok-composer-2.5", "input": "BODY-SECRET-MARKER"}
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses?trace=test",
+                    data=body,
+                    headers={
+                        "Authorization": "Bearer client-dummy",
+                        "Content-Type": "application/json",
+                        "User-Agent": "conflicting-client",
+                        "X-Grok-Client-Version": "999.0.0",
+                        "X-Grok-Client-Identifier": "conflicting-client",
+                        "X-XAI-Token-Auth": "conflicting-auth-mode",
+                        "X-Grok-Model-Override": "conflicting-model",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+        assert len(captured["requests"]) == 1
+        request = captured["requests"][0]
+        assert request["path"] == "/v1/responses"
+        assert request["path_qs"] == "/v1/responses?trace=test"
+        assert request["body"] == body
+        assert request["auth"] == "Bearer fleet-token-v1"
+        headers = request["headers"]
+        assert headers["user-agent"] == "Grok/0.2.117"
+        assert headers["x-grok-client-version"] == "0.2.117"
+        assert headers["x-grok-client-identifier"] == "grok-shell"
+        assert headers["x-xai-token-auth"] == "xai-grok-cli"
+        assert headers["x-grok-model-override"] == "grok-composer-2.5"
+        assert "client-dummy" not in headers.values()
+        assert "conflicting-model" not in headers.values()
+
+    with caplog.at_level("DEBUG"):
+        asyncio.run(run())
+    assert "BODY-SECRET-MARKER" not in caplog.text
+    assert "fleet-token-v1" not in caplog.text
+    assert "cli-chat-proxy.grok.com" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "expected_status"),
+    [
+        ("POST", "/v1/chat/completions", {"model": "grok-composer-2.5"}, 404),
+        ("GET", "/v1/responses", {"model": "grok-composer-2.5"}, 404),
+        ("POST", "/v1/responses", {"model": "grok-4"}, 400),
+        ("POST", "/v1/responses", {}, 400),
+    ],
+)
+def test_xai_composer_rejects_unlocked_routes_and_models(
+    tmp_path, monkeypatch, method, path, body, expected_status
+):
+    async def run():
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _configure_external_oauth_owner(tmp_path)
+        _write_xai_pool_entry(tmp_path)
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        monkeypatch.setattr(
+            "hermes_cli.proxy.adapters.xai._COMPOSER_BASE_URL",
+            f"{upstream_base}/v1",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(XAIGrokComposerAdapter()))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method,
+                    f"{proxy_base}{path}",
+                    json=body,
+                ) as resp:
+                    assert resp.status == expected_status
+                    payload = await resp.json()
+                    assert payload["error"]["code"] in {
+                        "path_not_allowed",
+                        "model_not_allowed",
+                    }
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+        assert captured["requests"] == []
+
+    asyncio.run(run())
+
+
+def test_xai_composer_adopts_rotated_disk_token_without_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _configure_external_oauth_owner(tmp_path)
+    _write_xai_pool_entry(tmp_path, access_token="fleet-token-v1")
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_xai_oauth_pure",
+        lambda *args, **kwargs: pytest.fail("subscription proxy must never refresh"),
+    )
+
+    adapter = XAIGrokComposerAdapter()
+    first = adapter.get_credential()
+    _write_xai_pool_entry(tmp_path, access_token="fleet-token-v2")
+    second = adapter.get_credential()
+
+    assert first.base_url == "https://cli-chat-proxy.grok.com/v1"
+    assert first.bearer == "fleet-token-v1"
+    assert second.bearer == "fleet-token-v2"
+
+
+def test_xai_composer_requires_external_refresh_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_xai_pool_entry(tmp_path)
+    adapter = XAIGrokComposerAdapter()
+    assert not adapter.is_authenticated()
+    with pytest.raises(RuntimeError, match="refresh_owner=external"):
+        adapter.get_credential()
+
+
+def test_xai_composer_safe_errors_do_not_log_or_return_raw_details(
+    tmp_path, monkeypatch, caplog
+):
+    async def run():
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _configure_external_oauth_owner(tmp_path)
+        _write_xai_pool_entry(tmp_path)
+        adapter = XAIGrokComposerAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "get_credential",
+            lambda: (_ for _ in ()).throw(RuntimeError("RAW-ERROR token-secret-marker")),
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "grok-composer-2.5", "input": "hello"},
+                ) as resp:
+                    assert resp.status == 401
+                    response_text = await resp.text()
+        finally:
+            await proxy_runner.cleanup()
+        assert "RAW-ERROR" not in response_text
+        assert "token-secret-marker" not in response_text
+
+    with caplog.at_level("DEBUG"):
+        asyncio.run(run())
+    assert "RAW-ERROR" not in caplog.text
+    assert "token-secret-marker" not in caplog.text
+    assert "cli-chat-proxy.grok.com" not in caplog.text
+
+
+def test_xai_composer_run_server_refuses_non_loopback_bind():
+    from hermes_cli.proxy.server import run_server
+
+    with pytest.raises(ValueError, match="only bind to loopback"):
+        asyncio.run(
+            run_server(
+                XAIGrokComposerAdapter(),
+                host="0.0.0.0",
+                port=0,
+                shutdown_event=asyncio.Event(),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

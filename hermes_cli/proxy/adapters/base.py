@@ -15,7 +15,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Mapping, Optional
+
+
+class ProxyRequestError(ValueError):
+    """A client request rejected before any upstream connection is opened."""
+
+    def __init__(self, message: str, *, code: str = "invalid_request") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,30 @@ class UpstreamAdapter(ABC):
         _ = failed_credential, status_code
         return None
 
+    @property
+    def loopback_only(self) -> bool:
+        """Whether this adapter refuses non-loopback listener addresses."""
+        return False
+
+    @property
+    def safe_error_messages(self) -> bool:
+        """Whether upstream/credential failures must be returned without details."""
+        return False
+
+    def request_method_allowed(self, method: str) -> bool:
+        """Return whether ``method`` may be forwarded for an allowed path."""
+        _ = method
+        return True
+
+    def prepare_request(
+        self,
+        *,
+        body: bytes,
+        headers: Mapping[str, str],
+    ) -> tuple[bytes, dict[str, str]]:
+        """Validate and transform a request before credential injection."""
+        return body, dict(headers)
+
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
         try:
@@ -105,4 +137,4 @@ class UpstreamAdapter(ABC):
         return f"{self.display_name}: {cred.base_url}{ttl}"
 
 
-__all__ = ["UpstreamAdapter", "UpstreamCredential"]
+__all__ = ["ProxyRequestError", "UpstreamAdapter", "UpstreamCredential"]

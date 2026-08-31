@@ -25,7 +25,11 @@ except ImportError:
     web = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
 
-from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.base import (
+    ProxyRequestError,
+    UpstreamAdapter,
+    UpstreamCredential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +116,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         rel_path = request.match_info.get("tail", "")
         rel_path = "/" + rel_path.lstrip("/")
 
-        if rel_path not in adapter.allowed_paths:
+        if rel_path not in adapter.allowed_paths or not adapter.request_method_allowed(
+            request.method
+        ):
             allowed = ", ".join(sorted(adapter.allowed_paths))
             return _json_error(
                 404,
@@ -124,14 +130,26 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         try:
             cred = adapter.get_credential()
         except Exception as exc:
-            logger.warning("proxy: credential resolution failed: %s", exc)
-            return _json_error(401, str(exc), code="upstream_auth_failed")
+            if adapter.safe_error_messages:
+                logger.warning("proxy: credential resolution failed")
+                message = "upstream credential unavailable"
+            else:
+                logger.warning("proxy: credential resolution failed: %s", exc)
+                message = str(exc)
+            return _json_error(401, message, code="upstream_auth_failed")
 
         # Forward body verbatim. Read into memory once — request bodies for
         # chat/completions/embeddings are small (<1MB typically). If we ever
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+        try:
+            body, prepared_headers = adapter.prepare_request(
+                body=body,
+                headers=_filter_request_headers(request.headers),
+            )
+        except ProxyRequestError as exc:
+            return _json_error(400, str(exc), code=exc.code)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -141,13 +159,16 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             if request.query_string:
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
-            fwd_headers = _filter_request_headers(request.headers)
+            fwd_headers = dict(prepared_headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
 
-            logger.debug(
-                "proxy: forwarding %s %s -> %s (body=%d bytes)",
-                request.method, rel_path, upstream_url, len(body),
-            )
+            if adapter.safe_error_messages:
+                logger.debug("proxy: forwarding %s %s", request.method, rel_path)
+            else:
+                logger.debug(
+                    "proxy: forwarding %s %s -> %s (body=%d bytes)",
+                    request.method, rel_path, upstream_url, len(body),
+                )
 
             try:
                 session = aiohttp.ClientSession(timeout=timeout)
@@ -171,13 +192,23 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             try:
                 return await _send_upstream(active_cred)
             except RuntimeError as exc:
-                return _json_error(500, str(exc)), None
+                if adapter.safe_error_messages:
+                    logger.warning("proxy: upstream session initialization failed")
+                    message = "upstream session initialization failed"
+                else:
+                    message = str(exc)
+                return _json_error(500, message), None
             except aiohttp.ClientError as exc:
-                logger.warning("proxy: upstream connection failed: %s", exc)
+                if adapter.safe_error_messages:
+                    logger.warning("proxy: upstream connection failed")
+                    message = "upstream connection failed"
+                else:
+                    logger.warning("proxy: upstream connection failed: %s", exc)
+                    message = f"upstream connection failed: {exc}"
                 return (
                     _json_error(
                         502,
-                        f"upstream connection failed: {exc}",
+                        message,
                         code="upstream_unreachable",
                     ),
                     None,
@@ -204,7 +235,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     status_code=upstream_resp.status,
                 )
             except Exception as exc:
-                logger.warning("proxy: retry credential resolution failed: %s", exc)
+                if adapter.safe_error_messages:
+                    logger.warning("proxy: retry credential resolution failed")
+                else:
+                    logger.warning("proxy: retry credential resolution failed: %s", exc)
                 retry_cred = None
 
             if retry_cred is not None:
@@ -227,7 +261,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 if chunk:
                     await resp.write(chunk)
         except (aiohttp.ClientError, asyncio.CancelledError) as exc:
-            logger.warning("proxy: streaming interrupted: %s", exc)
+            if adapter.safe_error_messages:
+                logger.warning("proxy: streaming interrupted")
+            else:
+                logger.warning("proxy: streaming interrupted: %s", exc)
         finally:
             upstream_resp.release()
             await session.close()
@@ -257,6 +294,9 @@ async def run_server(
         raise RuntimeError(
             "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
         )
+
+    if adapter.loopback_only and host not in {"127.0.0.1", "::1"}:
+        raise ValueError(f"{adapter.display_name} can only bind to loopback")
 
     app = create_app(adapter)
     runner = web.AppRunner(app, access_log=None)

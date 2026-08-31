@@ -52,6 +52,13 @@ def cmd_proxy_start(args: Any) -> int:
 
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
+    if adapter.loopback_only and host not in {"127.0.0.1", "::1"}:
+        print(
+            f"{adapter.display_name} is locked to a loopback listener; "
+            "use --host 127.0.0.1.",
+            file=sys.stderr,
+        )
+        return 2
 
     print(
         f"Starting Hermes proxy for {adapter.display_name}\n"
@@ -121,7 +128,7 @@ def cmd_proxy(args: Any) -> int:
         "OAuth-authenticated provider credentials to outbound requests.\n"
         "\n"
         "Subcommands:\n"
-        "  hermes proxy start [--provider nous|xai] [--host 127.0.0.1] [--port 8645]\n"
+        "  hermes proxy start [--provider nous|xai|xai-composer] [--host 127.0.0.1] [--port 8645]\n"
         "      Run the proxy in the foreground.\n"
         "  hermes proxy status\n"
         "      Show which upstream adapters are ready.\n"
