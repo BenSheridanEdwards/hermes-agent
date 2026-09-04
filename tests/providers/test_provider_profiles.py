@@ -180,6 +180,8 @@ class TestRegistry:
         credential_shapes = (
             "sk-proj-syntheticcredential123",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0In0.synthetic-signature",
+            "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl",
+            "eyJhbGciOiJub25lIn0.e30.",
             "session_secret",
         )
         for name in valid_headers:
