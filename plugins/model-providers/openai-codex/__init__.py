@@ -5,39 +5,26 @@ from collections.abc import Callable
 
 from providers import register_provider
 from providers.base import ProviderProfile
+from providers.privacy import is_safe_metadata_value
 
 
-_SENSITIVE_VALUE = re.compile(
-    r"(?:authorization|bearer|cookie|token|secret|password|api[-_ ]?key)",
-    re.IGNORECASE,
-)
 _IDENTIFIER_VALUE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _INTEGER_VALUE = re.compile(r"(?:0|[1-9][0-9]{0,18})")
 _DECIMAL_VALUE = re.compile(r"(?:0|[1-9][0-9]{0,18})(?:\.[0-9]{1,6})?")
+_BOOLEAN_VALUE = re.compile(r"(?:true|false)")
 _LIMIT_NAME_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:/ -]{0,127}")
 
 
-def _contains_sensitive_value(value: str) -> bool:
-    return bool(
-        "@" in value
-        or value.startswith(("{", "["))
-        or _SENSITIVE_VALUE.search(value)
-    )
-
-
 def _identifier_value(value: str) -> bool:
-    return bool(
-        _IDENTIFIER_VALUE.fullmatch(value)
-        and not _contains_sensitive_value(value)
-    )
+    return is_safe_metadata_value(value, syntax=_IDENTIFIER_VALUE, max_length=64)
 
 
 def _integer_value(value: str) -> bool:
-    return bool(_INTEGER_VALUE.fullmatch(value))
+    return is_safe_metadata_value(value, syntax=_INTEGER_VALUE, max_length=19)
 
 
 def _decimal_value(value: str) -> bool:
-    return bool(_DECIMAL_VALUE.fullmatch(value))
+    return is_safe_metadata_value(value, syntax=_DECIMAL_VALUE, max_length=26)
 
 
 def _percentage_value(value: str) -> bool:
@@ -45,14 +32,11 @@ def _percentage_value(value: str) -> bool:
 
 
 def _boolean_value(value: str) -> bool:
-    return value in {"true", "false"}
+    return is_safe_metadata_value(value, syntax=_BOOLEAN_VALUE, max_length=5)
 
 
 def _limit_name_value(value: str) -> bool:
-    return bool(
-        _LIMIT_NAME_VALUE.fullmatch(value)
-        and not _contains_sensitive_value(value)
-    )
+    return is_safe_metadata_value(value, syntax=_LIMIT_NAME_VALUE, max_length=128)
 
 
 def _tier_validators(prefix: str) -> dict[str, Callable[[str], bool]]:

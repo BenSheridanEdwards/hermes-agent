@@ -1290,9 +1290,23 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
-def test_codex_response_metadata_reaches_post_api_request(monkeypatch):
+@pytest.mark.parametrize(
+    ("credential_id", "expected_credential_id"),
+    (
+        ("manual:personal-codex", "manual:personal-codex"),
+        ("manual:sk-proj-syntheticcredential123", None),
+        (
+            "manual:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0In0.synthetic-signature",
+            None,
+        ),
+        ("manual:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-", None),
+    ),
+)
+def test_codex_response_credential_id_is_filtered_at_post_api_hook(
+    monkeypatch, credential_id, expected_credential_id
+):
     agent = _build_agent(monkeypatch)
-    agent._credential_pool_entry_id = "credential-entry-A"
+    agent._credential_pool_entry_id = credential_id
     stream = _FakeCreateStream(
         [
             SimpleNamespace(
@@ -1343,7 +1357,7 @@ def test_codex_response_metadata_reaches_post_api_request(monkeypatch):
         "x-codex-primary-used-percent": "42",
     }
     assert isinstance(payload["provider_response_observed_at"], float)
-    assert payload["provider_response_credential_id"] == "credential-entry-A"
+    assert payload["provider_response_credential_id"] == expected_credential_id
     serialized = str(payload).lower()
     for forbidden in ("authorization", "set-cookie", "x-account-email", "raw_response"):
         assert forbidden not in serialized

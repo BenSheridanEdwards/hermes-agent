@@ -105,6 +105,7 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from providers.privacy import safe_metadata_credential_id
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
@@ -7020,8 +7021,10 @@ def run_conversation(
                         provider_response_observed_at=getattr(
                             agent, "_provider_response_observed_at", None
                         ),
-                        provider_response_credential_id=getattr(
-                            agent, "_provider_response_credential_id", None
+                        provider_response_credential_id=safe_metadata_credential_id(
+                            getattr(
+                                agent, "_provider_response_credential_id", None
+                            )
                         ),
                         finish_reason=finish_reason,
                         message_count=len(api_messages),

@@ -131,6 +131,68 @@ class TestRegistry:
         for name, value in hostile_values:
             assert p.filter_observed_response_headers({name: value}) == {}
 
+    def test_codex_response_headers_reject_credential_shapes_for_every_field(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        valid_headers = {
+            "Retry-After": "120",
+            "X-Codex-Active-Limit": "codex_bengalfox",
+            "X-Codex-Credits-Balance": "12.5",
+            "X-Codex-Credits-Has-Credits": "true",
+            "X-Codex-Credits-Unlimited": "false",
+            "X-Codex-Plan-Type": "plus",
+            "X-Codex-Primary-Allowed": "true",
+            "X-Codex-Primary-Limit-Reached": "false",
+            "X-Codex-Primary-Used-Percent": "42.5",
+            "X-Codex-Primary-Window-Minutes": "300",
+            "X-Codex-Primary-Reset-After-Seconds": "60",
+            "X-Codex-Primary-Reset-At": "1780000000",
+            "X-Codex-Primary-Over-Secondary-Limit-Percent": "5",
+            "X-Codex-Secondary-Allowed": "true",
+            "X-Codex-Secondary-Limit-Reached": "false",
+            "X-Codex-Secondary-Used-Percent": "35",
+            "X-Codex-Secondary-Window-Minutes": "10080",
+            "X-Codex-Secondary-Reset-After-Seconds": "120",
+            "X-Codex-Secondary-Reset-At": "1780003600",
+            "X-Codex-Bengalfox-Limit-Name": "GPT-5.3-Codex-Spark",
+            "X-Codex-Bengalfox-Primary-Allowed": "true",
+            "X-Codex-Bengalfox-Primary-Limit-Reached": "false",
+            "X-Codex-Bengalfox-Primary-Used-Percent": "21.5",
+            "X-Codex-Bengalfox-Primary-Window-Minutes": "300",
+            "X-Codex-Bengalfox-Primary-Reset-After-Seconds": "60",
+            "X-Codex-Bengalfox-Primary-Reset-At": "1780000000",
+            "X-Codex-Bengalfox-Primary-Over-Secondary-Limit-Percent": "5",
+            "X-Codex-Bengalfox-Secondary-Allowed": "true",
+            "X-Codex-Bengalfox-Secondary-Limit-Reached": "false",
+            "X-Codex-Bengalfox-Secondary-Used-Percent": "35",
+            "X-Codex-Bengalfox-Secondary-Window-Minutes": "10080",
+            "X-Codex-Bengalfox-Secondary-Reset-After-Seconds": "120",
+            "X-Codex-Bengalfox-Secondary-Reset-At": "1780003600",
+            "X-Codex-Bengalfox-Secondary-Over-Secondary-Limit-Percent": "7",
+        }
+        expected = {name.lower(): value for name, value in valid_headers.items()}
+        assert {
+            name.lower() for name in p.observed_response_header_names
+        } <= expected.keys()
+        assert p.filter_observed_response_headers(valid_headers) == expected
+
+        credential_shapes = (
+            "sk-proj-syntheticcredential123",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0In0.synthetic-signature",
+            "session_secret",
+        )
+        for name in valid_headers:
+            for credential_shape in credential_shapes:
+                headers = {"X-Codex-Active-Limit": "codex_bengalfox"}
+                headers[name] = credential_shape
+                projected = p.filter_observed_response_headers(headers)
+                assert name.lower() not in projected, (
+                    name,
+                    credential_shape,
+                    projected,
+                )
+
     def test_provider_response_header_projection_rejects_conflicting_duplicates(self):
         class DuplicateHeaders:
             @staticmethod
