@@ -80,6 +80,26 @@ class TestHooksList:
 
 
 class TestHooksTest:
+    def test_post_api_request_synthetic_payload_exposes_safe_provider_metadata_shape(
+        self, tmp_path
+    ):
+        capture = tmp_path / "captured.json"
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"post_api_request": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            _run(SimpleNamespace(
+                hooks_action="test", event="post_api_request",
+                for_tool=None, payload_file=None,
+            ))
+
+        extra = json.loads(capture.read_text())["extra"]
+        assert extra["provider_response_headers"] == {}
+        assert extra["provider_response_observed_at"] is None
+        assert extra["provider_response_credential_id"] is None
+
     def test_synthetic_payload_matches_production_shape(self, tmp_path):
         """`hermes hooks test` must feed the script stdin in the same
         shape invoke_hook() would at runtime.  Prior to this fix,

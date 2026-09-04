@@ -1,5 +1,7 @@
 """Tests for the provider module registry and profiles."""
 
+import httpx
+
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
@@ -10,8 +12,151 @@ class TestRegistry:
         assert p is not None
         assert p.name == "nvidia"
 
+    def test_provider_response_header_projection_is_exact_and_private(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
 
+        projected = p.filter_observed_response_headers(
+            {
+                "X-Codex-Primary-Used-Percent": "42",
+                "X-Codex-Email-Used-Percent": "must-not-survive",
+                "Authorization": "Bearer must-not-survive",
+                "Proxy-Authorization": "must-not-survive",
+                "Cookie": "must-not-survive",
+                "Set-Cookie": "must-not-survive",
+                "X-Account-Email": "must-not-survive",
+                "X-Unrelated": "must-not-survive",
+            }
+        )
 
+        assert projected == {"x-codex-primary-used-percent": "42"}
+
+    def test_codex_profile_accepts_only_anchored_named_limit_headers(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        projected = p.filter_observed_response_headers(
+            {
+                "X-Codex-Active-Limit": "codex_bengalfox",
+                "X-Codex-Bengalfox-Limit-Name": "GPT-5.3-Codex-Spark",
+                "X-Codex-Bengalfox-Secondary-Used-Percent": "35",
+                "X-Codex-Email-Used-Percent": "must-not-survive",
+                "X-Codex-Bengalfox-Account-Email": "must-not-survive",
+            }
+        )
+
+        assert projected == {
+            "x-codex-active-limit": "codex_bengalfox",
+            "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+            "x-codex-bengalfox-secondary-used-percent": "35",
+        }
+
+    def test_codex_active_limit_does_not_authorize_double_codex_namespace(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        projected = p.filter_observed_response_headers(
+            {
+                "X-Codex-Active-Limit": "codex_bengalfox",
+                "X-Codex-Bengalfox-Primary-Used-Percent": "35",
+                "X-Codex-Codex-Bengalfox-Primary-Used-Percent": "99",
+            }
+        )
+
+        assert projected == {
+            "x-codex-active-limit": "codex_bengalfox",
+            "x-codex-bengalfox-primary-used-percent": "35",
+        }
+
+    def test_codex_response_header_values_use_closed_field_validators(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        valid = p.filter_observed_response_headers(
+            {
+                "Retry-After": "120",
+                "X-Codex-Active-Limit": "codex_bengalfox",
+                "X-Codex-Credits-Balance": "12.5",
+                "X-Codex-Credits-Has-Credits": "true",
+                "X-Codex-Credits-Unlimited": "false",
+                "X-Codex-Plan-Type": "plus",
+                "X-Codex-Primary-Used-Percent": "42.5",
+                "X-Codex-Primary-Window-Minutes": "300",
+                "X-Codex-Primary-Reset-After-Seconds": "60",
+                "X-Codex-Primary-Reset-At": "1780000000",
+                "X-Codex-Bengalfox-Limit-Name": "GPT-5.3-Codex-Spark",
+                "X-Codex-Bengalfox-Secondary-Limit-Reached": "false",
+            }
+        )
+        assert set(valid) == {
+            "retry-after",
+            "x-codex-active-limit",
+            "x-codex-credits-balance",
+            "x-codex-credits-has-credits",
+            "x-codex-credits-unlimited",
+            "x-codex-plan-type",
+            "x-codex-primary-used-percent",
+            "x-codex-primary-window-minutes",
+            "x-codex-primary-reset-after-seconds",
+            "x-codex-primary-reset-at",
+            "x-codex-bengalfox-limit-name",
+            "x-codex-bengalfox-secondary-limit-reached",
+        }
+
+        exhaustion = p.filter_observed_response_headers(
+            {
+                "X-Codex-Primary-Allowed": "true",
+                "X-Codex-Primary-Limit-Reached": "false",
+                "X-Codex-Secondary-Allowed": "false",
+                "X-Codex-Secondary-Limit-Reached": "true",
+            }
+        )
+        assert exhaustion == {
+            "x-codex-primary-allowed": "true",
+            "x-codex-primary-limit-reached": "false",
+            "x-codex-secondary-allowed": "false",
+            "x-codex-secondary-limit-reached": "true",
+        }
+
+        hostile_values = (
+            ("X-Codex-Primary-Used-Percent", 42),
+            ("X-Codex-Primary-Used-Percent", "101"),
+            ("X-Codex-Primary-Used-Percent", '{"token":"secret"}'),
+            ("X-Codex-Plan-Type", "Bearer secret-token"),
+            ("X-Codex-Plan-Type", "session_cookie"),
+            ("X-Codex-Active-Limit", "person@example.com"),
+            ("X-Codex-Credits-Balance", "token=secret"),
+            ("Retry-After", "tomorrow"),
+        )
+        for name, value in hostile_values:
+            assert p.filter_observed_response_headers({name: value}) == {}
+
+    def test_provider_response_header_projection_rejects_conflicting_duplicates(self):
+        class DuplicateHeaders:
+            @staticmethod
+            def items():
+                return [
+                    ("X-Codex-Primary-Used-Percent", "51"),
+                    ("x-codex-primary-used-percent", "conflict"),
+                ]
+
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        assert p.filter_observed_response_headers(DuplicateHeaders()) == {}
+
+    def test_provider_response_header_projection_rejects_all_physical_duplicates(self):
+        p = get_provider_profile("openai-codex")
+        assert p is not None
+
+        for values in (("51", "51"), ("51", "52")):
+            headers = httpx.Headers(
+                [
+                    ("X-Codex-Primary-Used-Percent", values[0]),
+                    ("X-Codex-Primary-Used-Percent", values[1]),
+                ]
+            )
+            assert p.filter_observed_response_headers(headers) == {}
 
 
 class TestNvidiaProfile:

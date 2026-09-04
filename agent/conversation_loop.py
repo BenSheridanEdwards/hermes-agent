@@ -3059,6 +3059,13 @@ def run_conversation(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                # Provider response metadata belongs to one physical attempt.
+                # Clear it before every transport call so retries and failover
+                # cannot inherit quota evidence from an earlier response.
+                agent._provider_response_headers = {}
+                agent._provider_response_observed_at = None
+                agent._provider_response_credential_id = None
+                agent._provider_response_attempt_fence = None
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -7007,6 +7014,15 @@ def run_conversation(
                         api_duration=api_duration,
                         started_at=api_start_time,
                         ended_at=_api_ended_at,
+                        provider_response_headers=dict(
+                            getattr(agent, "_provider_response_headers", {}) or {}
+                        ),
+                        provider_response_observed_at=getattr(
+                            agent, "_provider_response_observed_at", None
+                        ),
+                        provider_response_credential_id=getattr(
+                            agent, "_provider_response_credential_id", None
+                        ),
                         finish_reason=finish_reason,
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),

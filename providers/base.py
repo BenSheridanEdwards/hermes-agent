@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,13 @@ class ProviderProfile:
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
 
+    # Only these exact provider-declared response headers may cross the
+    # lifecycle hook boundary.
+    observed_response_header_names: tuple[str, ...] = ()
+    observed_response_header_validators: dict[
+        str, Callable[[str], bool]
+    ] = field(default_factory=dict)
+
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
     fixed_temperature: Any = None
@@ -100,6 +107,63 @@ class ProviderProfile:
     # empty = use main model
 
     # ── Hooks (override in subclass for complex providers) ───
+
+    def filter_observed_response_headers(self, headers: Any) -> dict[str, str]:
+        """Return a bounded, provider-declared response-header projection."""
+        if not hasattr(headers, "items"):
+            return {}
+        exact = {name.lower() for name in self.observed_response_header_names}
+        validators = {
+            name.lower(): validator
+            for name, validator in self.observed_response_header_validators.items()
+            if callable(validator)
+        }
+        projected: dict[str, str] = {}
+        seen_names: set[str] = set()
+        item_source = getattr(headers, "multi_items", None)
+        items: Any = item_source() if callable(item_source) else headers.items()
+        for raw_name, raw_value in items:
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name.strip().lower()
+            if (
+                not name
+                or len(name) > 200
+                or any(
+                    not (char.isascii() and (char.isalnum() or char == "-"))
+                    for char in name
+                )
+            ):
+                continue
+            if name not in exact:
+                continue
+            if name in seen_names:
+                return {}
+            seen_names.add(name)
+            if not isinstance(raw_value, str):
+                continue
+            value = raw_value.strip()
+            if (
+                not value
+                or len(value) > 512
+                or any(
+                    ord(char) < 0x20 or ord(char) == 0x7F
+                    for char in value
+                )
+            ):
+                continue
+            validator = validators.get(name)
+            if validator is None:
+                continue
+            try:
+                if not validator(value):
+                    continue
+            except Exception:
+                continue
+            projected[name] = value
+            if len(projected) > 64:
+                return {}
+        return dict(sorted(projected.items()))
 
     def resolve_aux_model(self, *, vision: bool = False) -> str:
         """Return a LIVE cheap-model id for auxiliary tasks, or "".

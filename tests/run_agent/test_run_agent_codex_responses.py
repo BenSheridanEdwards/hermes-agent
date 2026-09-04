@@ -251,11 +251,18 @@ class _FakeCreateStream:
     tests use this to drive it through the same code paths the wire does.
     """
 
-    def __init__(self, events):
+    def __init__(
+        self, events, *, headers=None, response_attribute="response", on_iter=None
+    ):
         self._events = list(events)
         self.closed = False
+        self._on_iter = on_iter
+        raw_response = SimpleNamespace(headers=headers or {})
+        setattr(self, response_attribute, raw_response)
 
     def __iter__(self):
+        if self._on_iter is not None:
+            self._on_iter()
         return iter(self._events)
 
     def close(self):
@@ -270,6 +277,245 @@ def _codex_request_kwargs():
         "tools": None,
         "store": False,
     }
+
+
+def test_codex_stream_captures_only_allowlisted_metadata_and_snapshots_credential(
+    monkeypatch,
+):
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "credential-entry-A"
+
+    stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("quota captured"),
+            )
+        ],
+        headers={
+            "X-Codex-Primary-Used-Percent": "42",
+            "Authorization": "Bearer must-not-survive",
+            "Set-Cookie": "must-not-survive",
+            "X-Account-Email": "must-not-survive",
+        },
+        response_attribute="_response",
+    )
+
+    def _create(**_kwargs):
+        # The physical request was opened with credential A. A pool rotation
+        # during create must not relabel its response as credential B.
+        agent._credential_pool_entry_id = "credential-entry-B"
+        return stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=_create),
+    )
+
+    agent._run_codex_stream(_codex_request_kwargs())
+
+    assert agent._provider_response_headers == {
+        "x-codex-primary-used-percent": "42",
+    }
+    assert isinstance(getattr(agent, "_provider_response_observed_at", None), float)
+    assert getattr(agent, "_provider_response_credential_id", None) == "credential-entry-A"
+
+
+def test_codex_stream_rejects_email_shaped_credential_identity(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "person@example.com"
+    stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("quota captured"),
+            )
+        ],
+        headers={"X-Codex-Primary-Used-Percent": "42"},
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+    )
+
+    agent._run_codex_stream(_codex_request_kwargs())
+
+    assert getattr(agent, "_provider_response_credential_id", None) is None
+
+
+def test_codex_stream_preserves_colon_bearing_pool_entry_identity(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "manual:personal-codex"
+    stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("quota captured"),
+            )
+        ],
+        headers={"X-Codex-Primary-Used-Percent": "42"},
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+    )
+
+    agent._run_codex_stream(_codex_request_kwargs())
+
+    assert agent._provider_response_credential_id == "manual:personal-codex"
+
+
+def test_codex_stream_clears_failed_attempt_metadata_before_physical_retry(monkeypatch):
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "credential-entry-A"
+
+    class FailingStream:
+        response = SimpleNamespace(
+            headers={"X-Codex-Primary-Used-Percent": "99"}
+        )
+
+        def __iter__(self):
+            raise httpx.RemoteProtocolError("stream interrupted")
+
+        def close(self):
+            pass
+
+    streams = [
+        FailingStream(),
+        _FakeCreateStream(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_codex_message_response("retry succeeded"),
+                )
+            ]
+        ),
+    ]
+    calls = []
+
+    def _create(**kwargs):
+        calls.append(kwargs)
+        return streams.pop(0)
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+
+    final = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert len(calls) == 2
+    assert final.status == "completed"
+    assert getattr(agent, "_provider_response_headers", None) == {}
+    assert getattr(agent, "_provider_response_observed_at", None) is None
+    assert getattr(agent, "_provider_response_credential_id", None) is None
+
+
+def test_codex_stream_fences_late_abandoned_attempt_metadata(monkeypatch):
+    import httpx
+    from agent import relay_llm
+
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "credential-entry-A"
+    abandoned_callback = None
+    attempts = 0
+
+    old_stream = SimpleNamespace(
+        response=SimpleNamespace(
+            headers={"X-Codex-Primary-Used-Percent": "99"}
+        )
+    )
+    new_stream = SimpleNamespace(
+        response=SimpleNamespace(
+            headers={"X-Codex-Primary-Used-Percent": "22"}
+        )
+    )
+
+    def _relay_stream(request, stream_factory, **kwargs):
+        nonlocal abandoned_callback, attempts
+        attempts += 1
+        callback = kwargs["on_stream_created"]
+        raw_stream = stream_factory(request)
+        if attempts == 1:
+            abandoned_callback = callback
+            raise httpx.RemoteProtocolError("first attempt abandoned")
+
+        callback(raw_stream)
+        assert abandoned_callback is not None
+        abandoned_callback(old_stream)
+        return iter(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_codex_message_response("retry succeeded"),
+                )
+            ]
+        )
+
+    streams = [old_stream, new_stream]
+
+    def _create(**_kwargs):
+        stream = streams.pop(0)
+        agent._credential_pool_entry_id = "credential-entry-B"
+        return stream
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(relay_llm, "stream", _relay_stream)
+
+    final = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert attempts == 2
+    assert final.status == "completed"
+    assert agent._provider_response_headers == {
+        "x-codex-primary-used-percent": "22",
+    }
+    assert agent._provider_response_credential_id == "credential-entry-B"
+
+
+def test_codex_stream_fences_each_physical_request_inside_relay(monkeypatch):
+    from agent import relay_llm
+
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "credential-entry-A"
+    old_stream = SimpleNamespace(
+        response=SimpleNamespace(
+            headers={"X-Codex-Primary-Used-Percent": "99"}
+        )
+    )
+    new_stream = SimpleNamespace(
+        response=SimpleNamespace(
+            headers={"X-Codex-Primary-Used-Percent": "22"}
+        )
+    )
+    streams = [old_stream, new_stream]
+
+    def _create(**_kwargs):
+        stream = streams.pop(0)
+        if stream is old_stream:
+            agent._credential_pool_entry_id = "credential-entry-B"
+        return stream
+
+    def _relay_stream(request, stream_factory, **kwargs):
+        callback = kwargs["on_stream_created"]
+        abandoned_stream = stream_factory(request)
+        current_stream = stream_factory(request)
+        callback(current_stream)
+        callback(abandoned_stream)
+        return iter(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_codex_message_response("relay retry succeeded"),
+                )
+            ]
+        )
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(relay_llm, "stream", _relay_stream)
+
+    final = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert final.status == "completed"
+    assert agent._provider_response_headers == {
+        "x-codex-primary-used-percent": "22",
+    }
+    assert agent._provider_response_credential_id == "credential-entry-B"
 
 
 def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
@@ -1042,6 +1288,65 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["final_response"] == "OK"
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["content"] == "OK"
+
+
+def test_codex_response_metadata_reaches_post_api_request(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent._credential_pool_entry_id = "credential-entry-A"
+    stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("OK"),
+            )
+        ],
+        headers={
+            "X-Codex-Primary-Used-Percent": "42",
+            "Authorization": "Bearer must-not-survive",
+            "Set-Cookie": "must-not-survive",
+            "X-Account-Email": "must-not-survive",
+        },
+    )
+    fake_client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        close=lambda: None,
+    )
+    agent.client = fake_client
+    def _run_stream_and_return_valid_response(api_kwargs):
+        agent._run_codex_stream(api_kwargs, client=fake_client)
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        _run_stream_and_return_valid_response,
+    )
+    hook_calls = []
+
+    def _record_hook(name, **kwargs):
+        hook_calls.append((name, kwargs))
+        return []
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.has_hook",
+        lambda name: name == "post_api_request",
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _record_hook)
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["final_response"] == "OK"
+    payloads = [payload for name, payload in hook_calls if name == "post_api_request"]
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["provider_response_headers"] == {
+        "x-codex-primary-used-percent": "42",
+    }
+    assert isinstance(payload["provider_response_observed_at"], float)
+    assert payload["provider_response_credential_id"] == "credential-entry-A"
+    serialized = str(payload).lower()
+    for forbidden in ("authorization", "set-cookie", "x-account-email", "raw_response"):
+        assert forbidden not in serialized
 
 
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):

@@ -146,9 +146,18 @@ API hooks describe provider attempts inside the agent loop:
 - `api_duration`, `started_at`, `ended_at`
 - `finish_reason`, `message_count`, `response_model`
 - `usage`
+- provider response metadata: `provider_response_headers`,
+  `provider_response_observed_at`, `provider_response_credential_id`
 - `assistant_content_chars`, `assistant_tool_call_count`
 - sanitized response payload: `response`
 - compatibility object: `assistant_message`
+
+Provider response metadata is request-attempt scoped and fail-closed. Headers are
+lowercased and limited to exact names declared by the active provider profile;
+providers without a declaration emit an empty mapping. The credential field is
+an opaque pool-entry identifier, not an account label or email. Raw response
+objects, arbitrary headers, authorization values, cookies, tokens, and account
+identity never cross this hook boundary.
 
 `api_request_error` includes the same identity/runtime fields plus:
 

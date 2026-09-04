@@ -1621,29 +1621,103 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    def _credential_id_for_request() -> str | None:
+        credential_id = getattr(agent, "_credential_pool_entry_id", None)
+        if (
+            not isinstance(credential_id, str)
+            or not 0 < len(credential_id) <= 256
+            or not any(char.isalnum() for char in credential_id)
+            or any(
+                not (
+                    char.isascii()
+                    and (char.isalnum() or char in {"-", "_", ".", ":"})
+                )
+                for char in credential_id
+            )
+        ):
+            return None
+        return credential_id
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
+        # Response metadata is request-attempt scoped. Clearing before every
+        # physical attempt prevents a failed retry from inheriting old quota.
+        attempt_fence = object()
+        agent._provider_response_attempt_fence = attempt_fence
+        agent._provider_response_headers = {}
+        agent._provider_response_observed_at = None
+        agent._provider_response_credential_id = None
         intercepted_events = []
-        writer_token = {"value": None}
+        writer_token: dict[str, int | None] = {"value": None}
+        physical_attempts: dict[int, tuple[Any, object, str | None]] = {}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            physical_fence = object()
+            agent._provider_response_attempt_fence = physical_fence
+            agent._provider_response_headers = {}
+            agent._provider_response_observed_at = None
+            agent._provider_response_credential_id = None
+            physical_credential_id = _credential_id_for_request()
             stream_kwargs = _sanitize_consumer_codex_request(
                 agent,
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            raw_stream = active_client.responses.create(**stream_kwargs)
+            physical_attempts[id(raw_stream)] = (
+                raw_stream,
+                physical_fence,
+                physical_credential_id,
+            )
+            return raw_stream
 
         def _codex_stream_created(_raw_stream: Any) -> None:
-            # Claim the delta sink for THIS physical attempt. A newer attempt
-            # supersedes this token and fences late deltas out of the turn.
-            writer_token["value"] = claim_stream_writer(agent)
+            physical_attempt = physical_attempts.pop(id(_raw_stream), None)
+            if physical_attempt is None or physical_attempt[0] is not _raw_stream:
+                return
+            _, physical_fence, physical_credential_id = physical_attempt
+            if (
+                getattr(agent, "_provider_response_attempt_fence", None)
+                is not physical_fence
+            ):
+                return
+            try:
+                from providers import get_provider_profile
 
-        def _accept_codex_chunk(_chunk: Any) -> bool:
-            token = writer_token["value"]
+                profile = get_provider_profile(getattr(agent, "provider", ""))
+                response = getattr(_raw_stream, "response", None) or getattr(
+                    _raw_stream, "_response", None
+                )
+                headers = getattr(response, "headers", None)
+                projected = (
+                    profile.filter_observed_response_headers(headers)
+                    if profile is not None
+                    else {}
+                )
+            except Exception:
+                projected = {}
+            if (
+                getattr(agent, "_provider_response_attempt_fence", None)
+                is not physical_fence
+            ):
+                return
+            # Claim the delta sink only after the attempt fence is rechecked;
+            # an abandoned callback must not supersede the active writer.
+            writer_token["value"] = claim_stream_writer(agent)
+            if not projected:
+                return
+            agent._provider_response_headers = projected
+            agent._provider_response_observed_at = time.time()
+            agent._provider_response_credential_id = physical_credential_id
+
+        def _accept_codex_chunk(
+            _chunk: Any,
+            _writer_token: dict[str, int | None] = writer_token,
+        ) -> bool:
+            token = _writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
                 return True
             logger.warning(
@@ -1654,9 +1728,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             return False
 
-        def _finalize_codex_stream() -> Any:
+        def _finalize_codex_stream(
+            _intercepted_events: list[Any] = intercepted_events,
+        ) -> Any:
             return _consume_codex_event_stream(
-                list(intercepted_events),
+                list(_intercepted_events),
                 model=api_kwargs.get("model"),
             )
 

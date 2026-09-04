@@ -3324,6 +3324,63 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
+    def test_post_api_hook_projects_provider_response_metadata_without_stale_carryover(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        responses = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done searching", finish_reason="stop"),
+        ]
+        request_count = 0
+
+        def _create(**_kwargs):
+            nonlocal request_count
+            response = responses[request_count]
+            if request_count == 0:
+                agent._provider_response_headers = {
+                    "x-codex-primary-used-percent": "51",
+                }
+                agent._provider_response_observed_at = 1234.5
+                agent._provider_response_credential_id = "credential-entry-123"
+            request_count += 1
+            return response
+
+        agent.client.chat.completions.create.side_effect = _create
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        post_calls = [
+            kwargs for name, kwargs in hook_calls if name == "post_api_request"
+        ]
+        assert len(post_calls) == 2
+        assert post_calls[0]["provider_response_headers"] == {
+            "x-codex-primary-used-percent": "51",
+        }
+        assert post_calls[0]["provider_response_observed_at"] == 1234.5
+        assert post_calls[0]["provider_response_credential_id"] == "credential-entry-123"
+        assert post_calls[1]["provider_response_headers"] == {}
+        assert post_calls[1]["provider_response_observed_at"] is None
+        assert post_calls[1]["provider_response_credential_id"] is None
+
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 
