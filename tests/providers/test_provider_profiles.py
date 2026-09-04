@@ -182,6 +182,7 @@ class TestRegistry:
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0In0.synthetic-signature",
             "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl",
             "eyJhbGciOiJub25lIn0.e30.",
+            "GPT-5.3-Codex-Spark+eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
             "session_secret",
         )
         for name in valid_headers:

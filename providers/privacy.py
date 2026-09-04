@@ -11,9 +11,7 @@ _SENSITIVE_MARKER = re.compile(
     re.IGNORECASE,
 )
 _JWT_LIKE = re.compile(
-    r"(?:^|[:= /])"
     r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"
-    r"(?:$|[:= /])"
 )
 _PREFIXED_CREDENTIAL = re.compile(
     r"(?:^|[:= /])"

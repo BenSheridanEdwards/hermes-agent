@@ -1301,6 +1301,7 @@ def test_run_conversation_codex_plain_text(monkeypatch):
         ),
         ("manual:eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl", None),
         ("manual:eyJhbGciOiJub25lIn0.e30.", None),
+        ("manual.eyJhbGciOiJIUzI1NiJ9.e30.c2ln", None),
         ("manual:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-", None),
     ),
 )
