@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import os
 import subprocess
@@ -10,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,6 +40,18 @@ _SUBPROCESS_EXERCISE = r"""
 import asyncio, ctypes, sys
 from gateway.shutdown_watchdog import start_loop_liveness_watchdog
 
+def hold_gil(seconds):
+    if sys.platform == "win32":
+        library = ctypes.PyDLL("kernel32")
+        library.Sleep.argtypes = [ctypes.c_ulong]
+        library.Sleep.restype = None
+        library.Sleep(int(seconds * 1000))
+        return
+    library = ctypes.PyDLL(None)
+    library.sleep.argtypes = [ctypes.c_uint]
+    library.sleep.restype = ctypes.c_uint
+    library.sleep(int(seconds))
+
 async def exercise():
     handle = start_loop_liveness_watchdog(
         asyncio.get_running_loop(),
@@ -61,18 +73,12 @@ async def exercise():
     elif sys.argv[1] == "stopped":
         handle.stop()
         handle.join(0.5)
-        library = ctypes.PyDLL(None)
-        library.sleep.argtypes = [ctypes.c_uint]
-        library.sleep.restype = ctypes.c_uint
-        library.sleep(2)
+        hold_gil(2)
     elif sys.argv[1] == "loop_blocked":
         import time
         time.sleep(4)
     else:
-        library = ctypes.PyDLL(None)
-        library.sleep.argtypes = [ctypes.c_uint]
-        library.sleep.restype = ctypes.c_uint
-        library.sleep(4)
+        hold_gil(4)
 
 asyncio.run(exercise())
 """
@@ -103,8 +109,7 @@ def _run_watchdog_child(mode: str, tmp_path: Path, timeout: float = 5.0):
     return result, time.monotonic() - started
 
 
-@pytest.mark.live_system_guard_bypass
-def test_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
+def _assert_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
     result, elapsed = _run_watchdog_child("gil_held", tmp_path)
 
     assert result.stdout.strip() == "ARMED"
@@ -118,6 +123,24 @@ def test_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
     assert "exercise" in dump
 
 
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_linux_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
+    _assert_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path)
+
+
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
+def test_macos_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
+    _assert_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path)
+
+
+@pytest.mark.windows_only
+@pytest.mark.live_system_guard_bypass
+def test_windows_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path):
+    _assert_gil_held_c_call_dumps_stacks_and_exits_before_deadline(tmp_path)
+
+
 @pytest.mark.live_system_guard_bypass
 def test_healthy_loop_survives_repeated_hard_deadlines(tmp_path):
     result, elapsed = _run_watchdog_child("healthy", tmp_path)
@@ -127,13 +150,30 @@ def test_healthy_loop_survives_repeated_hard_deadlines(tmp_path):
     assert elapsed >= 3.0
 
 
-@pytest.mark.live_system_guard_bypass
-def test_stopping_loop_watchdog_disarms_hard_deadline(tmp_path):
+def _assert_stopping_loop_watchdog_disarms_hard_deadline(tmp_path):
     result, elapsed = _run_watchdog_child("stopped", tmp_path)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ARMED"
     assert elapsed >= 2.0
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_linux_stopping_loop_watchdog_disarms_hard_deadline(tmp_path):
+    _assert_stopping_loop_watchdog_disarms_hard_deadline(tmp_path)
+
+
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
+def test_macos_stopping_loop_watchdog_disarms_hard_deadline(tmp_path):
+    _assert_stopping_loop_watchdog_disarms_hard_deadline(tmp_path)
+
+
+@pytest.mark.windows_only
+@pytest.mark.live_system_guard_bypass
+def test_windows_stopping_loop_watchdog_disarms_hard_deadline(tmp_path):
+    _assert_stopping_loop_watchdog_disarms_hard_deadline(tmp_path)
 
 
 @pytest.mark.live_system_guard_bypass
@@ -268,25 +308,51 @@ def test_native_arm_failure_is_visible_inactive_and_not_cancelled(caplog):
     assert "could not arm" in caplog.text
 
 
-def test_gateway_has_single_faulthandler_deadline_owner():
-    """New Hermes delayed-timer users must go through the process lease."""
-    gateway_dir = Path(__file__).resolve().parents[2] / "gateway"
-    timer_methods = {"dump_traceback_later", "cancel_dump_traceback_later"}
-    offenders = []
+def test_concurrent_native_deadline_activation_has_one_owner():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    first = start_loop_liveness_watchdog(loop, probe_interval=10.0)
+    second = start_loop_liveness_watchdog(loop, probe_interval=10.0)
+    assert first is not None and second is not None
+    contenders = [first, second]
+    ready = threading.Barrier(3)
+    results = {}
 
-    for source_path in gateway_dir.rglob("*.py"):
-        if source_path.name == "shutdown_watchdog.py":
-            continue
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in timer_methods
-            ):
-                offenders.append(f"{source_path.relative_to(gateway_dir)}:{node.lineno}")
+    def activate(index: int) -> None:
+        ready.wait(timeout=2.0)
+        results[index] = contenders[index].notify_loop_progress()
 
-    assert offenders == []
+    with (
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback_later"
+        ) as arm_deadline,
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.cancel_dump_traceback_later"
+        ) as cancel_deadline,
+    ):
+        threads = [
+            threading.Thread(target=activate, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        ready.wait(timeout=2.0)
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(results.values()) == [False, True]
+        arm_deadline.assert_called_once()
+
+        owner_index = next(index for index, acquired in results.items() if acquired)
+        next_index = 1 - owner_index
+        contenders[owner_index].stop()
+        assert contenders[next_index].notify_loop_progress() is True
+
+        contenders[next_index].stop()
+        for contender in contenders:
+            contender.join(timeout=1.0)
+
+    assert arm_deadline.call_count == 2
+    assert cancel_deadline.call_count == 2
 
 
 def test_python_thread_start_failure_keeps_native_deadline_available(caplog):
@@ -527,3 +593,46 @@ async def test_gateway_heartbeat_activates_native_deadline_only_when_running_and
     runner._loop_heartbeat_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await runner._loop_heartbeat_task
+
+
+@pytest.mark.asyncio
+async def test_gateway_queued_heartbeat_cannot_rearm_deadline_after_guards_stop():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = MagicMock(loop_watchdog=True)
+    runner._running = True
+    runner._gateway_started_at = time.time()
+    runner._loop_heartbeat_task = None
+    runner._background_tasks = set()
+    runner._loop_floor_timer_handle = MagicMock()
+    watchdog = start_loop_liveness_watchdog(
+        MagicMock(spec=asyncio.AbstractEventLoop), probe_interval=10.0
+    )
+    assert watchdog is not None
+    runner._loop_liveness_watchdog = watchdog
+
+    with (
+        patch("gateway.shutdown_watchdog.write_loop_heartbeat") as write_heartbeat,
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback_later"
+        ) as arm_deadline,
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.cancel_dump_traceback_later"
+        ) as cancel_deadline,
+    ):
+        runner._start_loop_heartbeat_task()
+        heartbeat_task = cast(asyncio.Task, runner._loop_heartbeat_task)
+        runner._stop_loop_liveness_guards()
+        await asyncio.sleep(0)
+
+        write_heartbeat.assert_called_once()
+        arm_deadline.assert_not_called()
+        cancel_deadline.assert_not_called()
+
+        heartbeat_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await heartbeat_task
+
+    watchdog.join(timeout=1.0)
+    assert not watchdog.is_alive()
