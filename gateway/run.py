@@ -12302,6 +12302,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
+            if watchdog is not None:
+                # A failed probe thread may still own an armed native deadline.
+                # Release that lease before replacing the handle so the new
+                # heartbeat callback can acquire ownership safely.
+                try:
+                    watchdog.stop()
+                except Exception:
+                    logger.debug(
+                        "Failed to stop stale gateway loop liveness watchdog",
+                        exc_info=True,
+                    )
             try:
                 self._loop_liveness_watchdog = start_loop_liveness_watchdog(loop)
             except Exception:
@@ -12368,10 +12379,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _existing_hb = getattr(self, "_loop_heartbeat_task", None)
             if _existing_hb is not None and not _existing_hb.done():
                 return
+            _watchdog = getattr(self, "_loop_liveness_watchdog", None)
+            _config = getattr(self, "config", None)
+            _on_progress = None
+            if (
+                bool(getattr(self, "_running", False))
+                and (_config is None or getattr(_config, "loop_watchdog", True))
+                and _watchdog is not None
+            ):
+                _on_progress = _watchdog.notify_loop_progress
             self._loop_heartbeat_task = asyncio.create_task(
                 loop_heartbeat_forever(
                     interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
                     start_time=getattr(self, "_gateway_started_at", 0.0),
+                    on_progress=_on_progress,
                 )
             )
             # PERMANENT for the process lifetime, same as a

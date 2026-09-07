@@ -22,8 +22,10 @@ from gateway.shutdown_watchdog import (
     get_shutdown_watchdog_dump_path,
     loop_heartbeat_forever,
     resolve_shutdown_watchdog_delay,
+    start_loop_liveness_watchdog,
     write_loop_heartbeat,
 )
+
 
 def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(180) == 180 + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
@@ -66,3 +68,88 @@ def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):
     assert get_shutdown_watchdog_dump_path(tmp_path).name == "gateway-shutdown-watchdog.log"
 
 
+def test_liveness_timer_is_cancelled_before_shutdown_watchdog_arms(tmp_path):
+    loop = asyncio.new_event_loop()
+    shutdown_fired = threading.Event()
+
+    with (
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback_later"),
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.cancel_dump_traceback_later"
+        ) as cancel_deadline,
+        patch(
+            "gateway.shutdown_watchdog.os._exit",
+            side_effect=lambda _code: shutdown_fired.set(),
+        ),
+    ):
+        liveness = start_loop_liveness_watchdog(loop, probe_interval=10.0)
+        assert liveness is not None
+        assert liveness.notify_loop_progress() is True
+        liveness.stop()
+        liveness.join(timeout=1.0)
+        cancel_deadline.assert_called_once_with()
+        try:
+            arm_shutdown_watchdog(0.01, dump_path=tmp_path / "shutdown.log")
+            assert shutdown_fired.wait(timeout=2.0)
+            cancel_deadline.assert_called_once_with()
+        finally:
+            liveness.stop()
+            loop.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_heartbeat_reports_progress_before_file_write():
+    events = []
+
+    async def no_wait(_delay):
+        return None
+
+    keep_running = iter((True, False))
+    with (
+        patch("gateway.shutdown_watchdog.asyncio.sleep", side_effect=no_wait),
+        patch(
+            "gateway.shutdown_watchdog.write_loop_heartbeat",
+            side_effect=lambda **_kwargs: events.append("write"),
+        ),
+    ):
+        await loop_heartbeat_forever(
+            on_progress=lambda: events.append("progress"),
+            should_continue=lambda: next(keep_running),
+        )
+
+    assert events == ["progress", "write"]
+
+
+@pytest.mark.asyncio
+async def test_disarm_blocks_heartbeat_rearm_after_shutdown_begins(tmp_path):
+    """A heartbeat crossing stop() cannot resurrect the native deadline."""
+    loop = asyncio.get_running_loop()
+    keep_running = iter((True, True, False))
+
+    with (
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback_later"
+        ) as arm_deadline,
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.cancel_dump_traceback_later"
+        ) as cancel_deadline,
+        patch("gateway.shutdown_watchdog.write_loop_heartbeat"),
+    ):
+        liveness = start_loop_liveness_watchdog(loop, probe_interval=10.0)
+        assert liveness is not None
+
+        async def begin_shutdown(_delay):
+            liveness.stop()
+
+        with patch(
+            "gateway.shutdown_watchdog.asyncio.sleep", side_effect=begin_shutdown
+        ):
+            await loop_heartbeat_forever(
+                on_progress=liveness.notify_loop_progress,
+                should_continue=lambda: next(keep_running),
+                home=tmp_path,
+            )
+        liveness.join(timeout=1.0)
+
+    arm_deadline.assert_called_once()
+    cancel_deadline.assert_called_once_with()

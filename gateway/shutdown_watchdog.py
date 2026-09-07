@@ -33,7 +33,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TextIO
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from hermes_constants import get_hermes_home
@@ -51,6 +51,114 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+_LOOP_WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-loop-liveness-watchdog.log")
+
+
+def _process_hermes_home() -> Path:
+    """HERMES_HOME for process-level identity files (ignore profile overrides)."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    return get_hermes_home()
+
+
+# CPython exposes one process-global delayed faulthandler timer and no owner
+# query. Hermes therefore treats this API as exclusive process state and routes
+# every use through this lease. This prevents collisions between Hermes handles,
+# but cannot detect or restore a timer installed directly by third-party code.
+_FAULTHANDLER_TIMER_LOCK = threading.Lock()
+_faulthandler_timer_owner: Optional[int] = None
+_faulthandler_timer_next_token = 0
+
+
+class _NativeLivenessDeadline:
+    """Inactive-until-heartbeat lease for CPython's C-level watchdog timer."""
+
+    def __init__(self, delay_s: float, dump_path: Optional[Path] = None):
+        self._delay_s = delay_s
+        self._dump_path = dump_path
+        self._token: Optional[int] = None
+        self._file: Optional[TextIO] = None
+        self._stopped = False
+        self._failed = False
+
+    def notify_loop_progress(self) -> bool:
+        """Activate/rearm from the event loop after confirmed progress."""
+        global _faulthandler_timer_next_token, _faulthandler_timer_owner
+        with _FAULTHANDLER_TIMER_LOCK:
+            if self._stopped or self._failed:
+                return False
+            if self._token is None:
+                if _faulthandler_timer_owner is not None:
+                    return False
+                try:
+                    path = self._dump_path or _process_hermes_home().joinpath(
+                        *_LOOP_WATCHDOG_DUMP_RELATIVE
+                    )
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self._file = open(path, "a", encoding="utf-8")
+                except Exception:
+                    self._failed = True
+                    logger.warning(
+                        "GIL-independent gateway liveness watchdog could not open its dump file",
+                        exc_info=True,
+                    )
+                    return False
+                _faulthandler_timer_next_token += 1
+                self._token = _faulthandler_timer_next_token
+                _faulthandler_timer_owner = self._token
+            if _faulthandler_timer_owner != self._token:
+                return False
+            dump_file = self._file
+            if dump_file is None:
+                return False
+            try:
+                faulthandler.dump_traceback_later(
+                    self._delay_s,
+                    repeat=False,
+                    file=dump_file,
+                    exit=True,
+                )
+            except Exception:
+                # CPython cancels the previous global timer before attempting
+                # to start its replacement. Relinquish without a second,
+                # ownership-unsafe cancel and never retry this failed lease.
+                _faulthandler_timer_owner = None
+                self._token = None
+                self._failed = True
+                self._close_file()
+                logger.warning(
+                    "GIL-independent gateway liveness watchdog could not arm",
+                    exc_info=True,
+                )
+                return False
+            return True
+
+    def stop(self) -> None:
+        """Gate future heartbeats, cancel the owned timer, then close its file."""
+        global _faulthandler_timer_owner
+        with _FAULTHANDLER_TIMER_LOCK:
+            self._stopped = True
+            if self._token is not None and _faulthandler_timer_owner == self._token:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception:
+                    logger.warning(
+                        "GIL-independent gateway liveness watchdog could not disarm",
+                        exc_info=True,
+                    )
+                finally:
+                    _faulthandler_timer_owner = None
+            self._token = None
+            self._close_file()
+
+    def _close_file(self) -> None:
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
 
 
 class _LoopFloorTimerHandle:
@@ -77,20 +185,36 @@ class _LoopFloorTimerHandle:
 
 
 class _LoopLivenessWatchdogHandle:
-    """Small lifecycle handle for the daemon liveness thread."""
+    """Lifecycle owner for Python loop probes and the native deadline lease."""
 
-    def __init__(self, stop_event: threading.Event, thread: threading.Thread):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        thread: threading.Thread,
+        native_deadline: _NativeLivenessDeadline,
+        *,
+        thread_started: bool,
+    ):
         self._stop_event = stop_event
         self._thread = thread
+        self._native_deadline = native_deadline
+        self._thread_started = thread_started
+
+    def notify_loop_progress(self) -> bool:
+        return self._native_deadline.notify_loop_progress()
 
     def stop(self) -> None:
+        # Inactivate/cancel the native timer before allowing any later heartbeat
+        # callback or shutdown work to run.
+        self._native_deadline.stop()
         self._stop_event.set()
 
     def join(self, timeout: Optional[float] = None) -> None:
-        self._thread.join(timeout=timeout)
+        if self._thread_started:
+            self._thread.join(timeout=timeout)
 
     def is_alive(self) -> bool:
-        return self._thread.is_alive()
+        return self._thread_started and self._thread.is_alive()
 
 
 def _arm_loop_floor_timer(
@@ -126,6 +250,23 @@ def start_loop_liveness_watchdog(
     timeout = probe_timeout
     strikes_limit = max_strikes
     stop_event = threading.Event()
+    try:
+        # Keep the C timer behind the Python watchdog's final-strike path so
+        # ordinary loop freezes retain their exit code, ledger entry, and log.
+        # One extra probe interval (with a 0.5s floor for accelerated tests)
+        # gives that diagnostic path time to run under scheduler/load variance;
+        # a GIL-holding C call still cannot prevent the native timer expiring.
+        hard_deadline = max(
+            (float(interval) + float(timeout)) * max(int(strikes_limit), 1)
+            + max(float(interval), float(timeout), 0.5),
+            0.1,
+        )
+    except (TypeError, ValueError, OverflowError):
+        hard_deadline = (
+            DEFAULT_LOOP_WATCHDOG_INTERVAL_S + DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
+        ) * DEFAULT_LOOP_WATCHDOG_MAX_STRIKES + DEFAULT_LOOP_WATCHDOG_INTERVAL_S
+
+    native_deadline = _NativeLivenessDeadline(hard_deadline)
 
     def _wait_for_probe(probe_event: threading.Event) -> Optional[bool]:
         deadline = time.monotonic() + timeout
@@ -138,7 +279,7 @@ def start_loop_liveness_watchdog(
             if probe_event.wait(timeout=min(remaining, 0.05)):
                 return True
 
-    def _watchdog() -> None:
+    def _watchdog_body() -> None:
         strikes = 0
         while not stop_event.wait(timeout=interval):
             probe_event = threading.Event()
@@ -196,25 +337,31 @@ def start_loop_liveness_watchdog(
             os._exit(exit_code)
             return
 
+    def _watchdog() -> None:
+        try:
+            _watchdog_body()
+        finally:
+            native_deadline.stop()
+
     thread = threading.Thread(
         target=_watchdog,
         daemon=True,
         name="gateway-loop-liveness-watchdog",
     )
+    thread_started = False
     try:
         thread.start()
+        thread_started = True
     except Exception:
-        logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
-        return None
-    return _LoopLivenessWatchdogHandle(stop_event, thread)
-
-
-def _process_hermes_home() -> Path:
-    """HERMES_HOME for process-level identity files (ignore profile overrides)."""
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return get_hermes_home()
+        # The heartbeat-activated native lease remains available even if the
+        # Python probe thread could not start.
+        logger.warning("Failed to start gateway loop liveness watchdog", exc_info=True)
+    return _LoopLivenessWatchdogHandle(
+        stop_event,
+        thread,
+        native_deadline,
+        thread_started=thread_started,
+    )
 
 
 def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
@@ -227,6 +374,12 @@ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
     """Return the faulthandler / metadata dump path for a fired watchdog."""
     base = home if home is not None else _process_hermes_home()
     return base.joinpath(*_WATCHDOG_DUMP_RELATIVE)
+
+
+def get_loop_liveness_watchdog_dump_path(home: Optional[Path] = None) -> Path:
+    """Return the owned native liveness-watchdog traceback path."""
+    base = home if home is not None else _process_hermes_home()
+    return base.joinpath(*_LOOP_WATCHDOG_DUMP_RELATIVE)
 
 
 def write_loop_heartbeat(
@@ -434,6 +587,7 @@ async def loop_heartbeat_forever(
     start_time: Optional[float] = None,
     home: Optional[Path] = None,
     should_continue: Optional[Callable[[], bool]] = None,
+    on_progress: Optional[Callable[[], Any]] = None,
 ) -> None:
     """Rewrite the loop heartbeat file on a cadence until cancelled / gated off.
 
@@ -445,8 +599,16 @@ async def loop_heartbeat_forever(
     except (TypeError, ValueError):
         interval = DEFAULT_HEARTBEAT_INTERVAL_S
 
-    # Immediate first write so monitors see a fresh file as soon as the
-    # gateway is running, not after the first interval.
+    def _report_progress() -> None:
+        if on_progress is not None:
+            try:
+                on_progress()
+            except Exception:
+                logger.warning("Gateway loop progress callback failed", exc_info=True)
+
+    # Arm/rearm before heartbeat file I/O: reaching this callback is the proof
+    # of event-loop progress, while persistence may itself be slow or fail.
+    _report_progress()
     write_loop_heartbeat(start_time=start_time, home=home)
     while True:
         if should_continue is not None and not should_continue():
@@ -454,4 +616,5 @@ async def loop_heartbeat_forever(
         await asyncio.sleep(interval)
         if should_continue is not None and not should_continue():
             return
+        _report_progress()
         write_loop_heartbeat(start_time=start_time, home=home)
