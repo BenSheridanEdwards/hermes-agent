@@ -1526,6 +1526,19 @@ def _deliver_standalone(
 _UNDELIVERED_OUTPUT_LOG_LIMIT = 4000
 
 
+def _scrub_surrogates(text: str) -> str:
+    """Replace lone surrogates so the text can be encoded by the log file handlers.
+
+    Job output is decoded with ``surrogateescape`` (``tools/environments/base_output.py``,
+    ``tools/file_operations.py``), so any non-UTF-8 byte a script writes arrives here as a lone
+    surrogate. The rotating file handlers open with ``encoding="utf-8"`` and no ``errors=``
+    (``hermes_logging.py``), unlike the console stream which is wrapped with ``errors="replace"``,
+    so emitting one raises ``UnicodeEncodeError`` inside ``logging``: the record is dropped
+    entirely and a ``--- Logging error ---`` traceback goes to stderr. Before this module logged
+    job output, arbitrary bytes never reached those handlers."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def _log_undelivered_output(
     job: dict, content: str, errors: list, *, level: int = logging.WARNING,
 ) -> None:
@@ -1548,6 +1561,7 @@ def _log_undelivered_output(
     text = (content or "").strip()
     if not text:
         return
+    text = _scrub_surrogates(text)
     suffix = ""
     if len(text) > _UNDELIVERED_OUTPUT_LOG_LIMIT:
         suffix = f" (truncated, {len(text)} chars total; full text in last_output)"
@@ -1556,7 +1570,7 @@ def _log_undelivered_output(
         level,
         "Job '%s': output not delivered to any target (%s); output follows%s:\n%s",
         job.get("id", "?"),
-        "; ".join(errors) or "no target accepted the send", suffix, text)
+        _scrub_surrogates("; ".join(errors) or "no target accepted the send"), suffix, text)
 
 
 def _prepare_target_delivery(
