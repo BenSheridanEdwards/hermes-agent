@@ -3056,7 +3056,7 @@ class TestAttachmentReadAuthorization:
         adapter._auth_tag = '["auth","owner-attestation"]'
         digest = "ef" * 32
 
-        headers = adapter._attachment_request_headers({"sha256": digest})
+        headers = adapter._attachment_request_headers({"sha256": digest}, "https://test.relay/media/x.pdf")
 
         assert headers["Accept-Encoding"] == "identity"
         assert headers["x-auth-tag"] == '["auth","owner-attestation"]'
@@ -3064,13 +3064,26 @@ class TestAttachmentReadAuthorization:
         assert _tag_map(event)["t"] == "get"
         assert _tag_map(event)["x"] == digest
 
+    def test_request_headers_never_credential_a_third_party_attachment_host(self):
+        """A configured CDN is a trusted origin to download from, never a party to hand relay credentials to."""
+        adapter = _make_adapter({"attachment_hosts": ["cdn.other.example", "test.relay:8443"]})
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+        digest = "ef" * 32
+
+        for foreign in ("https://cdn.other.example/media/x.pdf", "https://test.relay:8443/media/x.pdf"):
+            assert adapter._attachment_request_headers({"sha256": digest}, foreign) == {"Accept-Encoding": "identity"}
+        # Same host, default port spelled out: still the relay, so still credentialed.
+        assert "Authorization" in adapter._attachment_request_headers({"sha256": digest}, "https://test.relay:443/media/x.pdf")
+
     def test_request_headers_stay_unauthenticated_without_a_usable_key(self):
+        url = "https://test.relay/media/x.pdf"
         adapter = _make_adapter()
         adapter._private_key = ""
-        assert adapter._attachment_request_headers({"sha256": "ab" * 32}) == {"Accept-Encoding": "identity"}
+        assert adapter._attachment_request_headers({"sha256": "ab" * 32}, url) == {"Accept-Encoding": "identity"}
 
         adapter._private_key = "nsec1test"  # cannot sign: the read still goes out, just unauthenticated
-        assert "Authorization" not in adapter._attachment_request_headers({"sha256": "ab" * 32})
+        assert "Authorization" not in adapter._attachment_request_headers({"sha256": "ab" * 32}, url)
 
     @pytest.mark.asyncio
     async def test_download_sends_signed_get_authorization_for_the_blob(self, monkeypatch, tmp_path):
@@ -3092,6 +3105,26 @@ class TestAttachmentReadAuthorization:
         assert event["kind"] == 24242
         assert _tag_map(event)["t"] == "get"
         assert _tag_map(event)["x"] == metadata["sha256"]
+
+    @pytest.mark.asyncio
+    async def test_download_from_a_configured_cdn_carries_no_relay_credentials(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% public blob\n"
+        metadata = dict(self._metadata(payload), url="https://cdn.other.example/media/report.pdf")
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        adapter = _make_adapter({"attachment_hosts": ["cdn.other.example"]})
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+
+        cached = await adapter._download_attachment(metadata)
+
+        assert cached is not None  # the download still happens, just without our credentials
+        (request,) = requests
+        assert request.headers["accept-encoding"] == "identity"
+        assert "authorization" not in request.headers
+        assert "x-auth-tag" not in request.headers
 
     @pytest.mark.asyncio
     async def test_download_reports_unauthorized_read(self, monkeypatch, tmp_path):
