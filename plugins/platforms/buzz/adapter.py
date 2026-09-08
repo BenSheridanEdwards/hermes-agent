@@ -633,16 +633,21 @@ _AUDIO_EXTENSION_TTL = 600.0  # seconds a NIP-11 probe result stays trusted
 _VOICE_NOTE_PREFIX = "voice-note-"
 _BLOSSOM_AUTH_TTL = 600  # seconds a kind-24242 authorization stays valid
 _FFMPEG_TIMEOUT = 120.0
-_FFMPEG_FALLBACK = "/opt/homebrew/bin/ffmpeg"  # Homebrew on macOS when the gateway runs with a stripped PATH
+# PATH first; these are the usual install roots, consulted only when the gateway runs with a stripped PATH.
+# ``BUZZ_FFMPEG_PATH`` overrides both, for a build that lives anywhere else.
+_FFMPEG_FALLBACKS = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg", "/opt/local/bin/ffmpeg")
 # Strip every stream but audio plus all container metadata so the relay's validator sees bare frames.
 _FFMPEG_AUDIO_ONLY = ("-vn", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact")
 _FFMPEG_TAGLESS_MP3 = ("-id3v2_version", "0", "-write_id3v1", "0", "-f", "mp3")
 
 
 def _ffmpeg_path() -> Optional[str]:
-    """Absolute path of the ffmpeg binary, or None when it is not installed."""
-    ffmpeg = shutil.which("ffmpeg") or _FFMPEG_FALLBACK
-    return ffmpeg if Path(ffmpeg).is_file() else None
+    """Absolute path of the ffmpeg binary: ``BUZZ_FFMPEG_PATH``, then ``PATH``, then the usual install roots.
+
+    None when none of them holds an ffmpeg build.
+    """
+    candidates = [os.environ.get("BUZZ_FFMPEG_PATH", "").strip(), shutil.which("ffmpeg") or "", *_FFMPEG_FALLBACKS]
+    return next((c for c in candidates if c and Path(c).is_file()), None)
 
 
 def _voice_note_workdir() -> Path:
@@ -651,8 +656,27 @@ def _voice_note_workdir() -> Path:
     return out_dir
 
 
-def _voice_note_stamp() -> str:
-    return str(int(time.time() * 1000))
+def _voice_note_tempfile(suffix: str, prefix: str = _VOICE_NOTE_PREFIX) -> Path:
+    """Create an empty, uniquely named scratch file in the voice workdir and return its path.
+
+    ``mkstemp`` rather than a timestamp: every gateway on this host shares the workdir, and two replies in
+    the same millisecond would otherwise write the same name and upload each other's audio. ffmpeg runs
+    with ``-y`` so it overwrites the placeholder, and ``_run_ffmpeg`` still rejects a zero-byte result.
+    Callers own the file: unlink it once the upload that reads it has finished.
+    """
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=_voice_note_workdir())
+    os.close(fd)
+    return Path(name)
+
+
+def _unlink_quietly(path: Optional[Path]) -> None:
+    """Best-effort delete of a scratch file; a missing or undeletable file is not worth a failed send."""
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _run_ffmpeg(args: List[str], out: Path, what: str) -> bool:
@@ -683,10 +707,13 @@ def _convert_audio_to_clean_mp3(src: Path, *, reencode: bool = False) -> Optiona
     if not src.is_file():
         logger.warning("Buzz audio: voice source %s does not exist", src.name)
         return None
-    out = _voice_note_workdir() / f"{_VOICE_NOTE_PREFIX}{_voice_note_stamp()}.mp3"
+    out = _voice_note_tempfile(".mp3")
     codec = ["-c:a", "copy"] if src.suffix.lower() == ".mp3" and not reencode else ["-c:a", "libmp3lame", "-b:a", "96k"]
     args = ["-i", str(src), *_FFMPEG_AUDIO_ONLY, *codec, *_FFMPEG_TAGLESS_MP3]
-    return out if _run_ffmpeg(args, out, "convert voice audio to mp3") else None
+    if _run_ffmpeg(args, out, "convert voice audio to mp3"):
+        return out
+    _unlink_quietly(out)
+    return None
 
 
 def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
@@ -694,7 +721,7 @@ def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
     if not src.is_file():
         logger.warning("Buzz audio: voice source %s does not exist", src.name)
         return None
-    out = _voice_note_workdir() / f"{_VOICE_NOTE_PREFIX}{_voice_note_stamp()}.mp4"
+    out = _voice_note_tempfile(".mp4")
     args = [
         "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1", "-i", str(src),
         "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
@@ -702,14 +729,16 @@ def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-metadata", "encoder=", "-f", "mp4",
     ]
-    return out if _run_ffmpeg(args, out, "build voice-note envelope") else None
+    if _run_ffmpeg(args, out, "build voice-note envelope"):
+        return out
+    _unlink_quietly(out)
+    return None
 
 
 def _extract_voice_note_audio(data: bytes) -> Optional[bytes]:
     """Demux a Buzz voice-note MP4 envelope into MP3 bytes so the speech can reach STT."""
-    stamp = _voice_note_stamp()
-    src = _voice_note_workdir() / f"inbound-{stamp}.mp4"
-    out = src.with_suffix(".mp3")
+    src = _voice_note_tempfile(".mp4", prefix="inbound-")
+    out = _voice_note_tempfile(".mp3", prefix="inbound-")
     try:
         src.write_bytes(data)
         args = ["-i", str(src), "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "libmp3lame", "-b:a", "96k", *_FFMPEG_TAGLESS_MP3]
@@ -719,10 +748,7 @@ def _extract_voice_note_audio(data: bytes) -> Optional[bytes]:
         return None
     finally:
         for path in (src, out):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            _unlink_quietly(path)
 
 
 def _is_voice_note_envelope(filename: str, mime_type: str) -> bool:
@@ -731,8 +757,12 @@ def _is_voice_note_envelope(filename: str, mime_type: str) -> bool:
 
 
 def _clean_transcript(text: str) -> str:
-    """Single-line-safe transcript for an imeta ``alt`` entry: printable characters, spaces and newlines only."""
-    return "".join(ch for ch in text.strip() if ch in " \n" or (not ch.isspace() and ch.isprintable()))[:4000]
+    """Single-line-safe transcript for an imeta ``alt`` entry: printable characters, spaces and newlines only.
+
+    Tabs become spaces rather than vanishing, so an indented or column-aligned reply keeps its word breaks.
+    """
+    flattened = text.strip().replace("\t", " ")
+    return "".join(ch for ch in flattened if ch in " \n" or (not ch.isspace() and ch.isprintable()))[:4000]
 
 
 def _is_voice_note(filename: str, mime_type: str) -> bool:
@@ -844,10 +874,17 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
-    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+    def _ensure_credentials(self) -> None:
+        """Resolve the signing key and owner tag if ``connect()`` has not already done so.
+
+        Raises ``ValueError`` on a malformed owner-auth configuration, exactly as ``connect()`` does.
+        """
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
             self._auth_tag = _resolve_auth_tag(self._extra)
+
+    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+        self._ensure_credentials()
         return await _exec_buzz(self.cli_path, args, relay_url=self.relay_url, private_key=self._private_key,
                                 auth_tag=self._auth_tag, input_text=input_text)
 
@@ -1235,32 +1272,44 @@ class BuzzAdapter(BasePlatformAdapter):
         around Buzz's MP4 envelope uploaded through the CLI. When ffmpeg is missing or every voice path fails
         the audio goes out as a plain ``--file`` attachment. ``metadata["transcript"]`` becomes the imeta
         ``alt`` text, which Buzz shows as the note's transcript.
+
+        Every transcode lands in a private scratch file that is unlinked before this returns, after the
+        upload (or the plain-file fallback) that reads it has finished.
         """
         src = Path(audio_path).expanduser()
         if _ffmpeg_path() is None or not src.is_file():
             return await self._send_file_attachment(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
-        if await self._relay_supports_audio():
-            result = await self._send_voice_note_mp3(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
-            if result is not None:
-                return result
-        wrapped = await asyncio.to_thread(_wrap_audio_in_voice_note_envelope, src)
-        if wrapped is not None:
-            result = await self._send_voice_note_envelope(chat_id, wrapped, caption=caption, reply_to=reply_to, metadata=metadata)
-            if result is not None:
-                return result
-        return await self._send_file_attachment(chat_id, wrapped or src, caption=caption, reply_to=reply_to, metadata=metadata, probe=False)
+        scratch: List[Path] = []
+        try:
+            if await self._relay_supports_audio():
+                result = await self._send_voice_note_mp3(chat_id, src, scratch=scratch, caption=caption, reply_to=reply_to, metadata=metadata)
+                if result is not None:
+                    return result
+            wrapped = await asyncio.to_thread(_wrap_audio_in_voice_note_envelope, src)
+            if wrapped is not None:
+                scratch.append(wrapped)
+                result = await self._send_voice_note_envelope(chat_id, wrapped, caption=caption, reply_to=reply_to, metadata=metadata)
+                if result is not None:
+                    return result
+            return await self._send_file_attachment(chat_id, wrapped or src, caption=caption, reply_to=reply_to, metadata=metadata, probe=False)
+        finally:
+            for path in scratch:
+                _unlink_quietly(path)
 
     async def _send_voice_note_mp3(
-        self, chat_id: str, src: Path, *, caption: Optional[str], reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+        self, chat_id: str, src: Path, *, scratch: List[Path], caption: Optional[str], reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
     ) -> Optional[SendResult]:
         """Blossom-upload *src* as a clean MP3 and publish it; None when the caller should fall back.
 
         A copied MP3 stream the relay's validator rejects (junk between frames) is worth one re-encode.
+        Each converted file is appended to *scratch* so ``send_voice`` can unlink it once the send is done.
         """
         for reencode in (False, True):
             mp3 = await asyncio.to_thread(_convert_audio_to_clean_mp3, src, reencode=reencode)
             if mp3 is None:
                 return None
+            scratch.append(mp3)
             desc, error = await self._blossom_upload(mp3, "audio/mpeg")
             if desc is not None:
                 result = await self._publish_voice_note(chat_id, desc, mp3.name, "audio/mpeg", caption=caption, reply_to=reply_to, metadata=metadata)
@@ -1293,9 +1342,21 @@ class BuzzAdapter(BasePlatformAdapter):
         return None
 
     async def _play_tts_file(self, event, text_content, tts_path, first, metadata, record_delivery):
-        """Auto-TTS delivery: the spoken text rides along as the voice note's transcript."""
+        """Auto-TTS delivery: the spoken text rides along as the first voice note's transcript.
+
+        Buzz deliberately gets TWO messages for an auto-TTS turn, the voice card and then the normal text
+        reply, unlike Telegram where the text becomes the audio caption and the text send is skipped. The
+        caption alternative was considered and rejected: a voice note is published straight to the relay as
+        a kind-9 event, so a caption would bypass ``send()`` and lose mention resolution (``--mention``
+        p-tags, without which a mentioned agent never wakes) and the base class's length chunking, and on
+        the plain-file fallback there is no transcript at all, so a failed voice path would silently drop
+        the reply text. Returning False keeps the text on its own well-trodden path. A reply long enough to
+        be split into several TTS chunks carries the transcript on the first chunk only, so the full text
+        is not repeated under every card.
+        """
         merged = dict(metadata or {})
-        merged["transcript"] = text_content
+        if first:
+            merged["transcript"] = text_content
         record_delivery(await self.send_voice(chat_id=event.source.chat_id, audio_path=tts_path, metadata=merged))
         return False  # the text reply is still sent as its own message
 
@@ -1308,10 +1369,14 @@ class BuzzAdapter(BasePlatformAdapter):
         supported = False
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+            # Redirects are followed here (and only here): this is an unauthenticated capability probe that
+            # carries no credentials, and an http:// relay URL that 301s to https would otherwise cache
+            # "no audio" for the whole TTL. Blob downloads still refuse to follow redirects.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10), follow_redirects=True) as client:
                 response = await client.get(self._http_relay_url() + "/", headers={"Accept": "application/nostr+json"})
                 if response.status_code == 200:
-                    extensions = response.json().get("supported_extensions") or []
+                    doc = response.json()
+                    extensions = doc.get("supported_extensions") if isinstance(doc, dict) else None
                     supported = isinstance(extensions, list) and _AUDIO_EXTENSION in extensions
         except Exception as exc:  # noqa: BLE001 - an unreachable or odd relay simply means "no audio"
             logger.warning("Buzz audio: NIP-11 probe failed (%s): %s", type(exc).__name__, exc)
@@ -1331,23 +1396,37 @@ class BuzzAdapter(BasePlatformAdapter):
         import base64
         now = int(time.time())
         tags: List[List[str]] = [["t", verb], ["x", sha256_hex], ["expiration", str(now + _BLOSSOM_AUTH_TTL)]]
-        if server := urlsplit(self.relay_url.strip()).netloc:
-            tags.append(["server", server])
+        # Host, never netloc: the relay's normalizer strips scheme, path and default ports but not
+        # userinfo, so a relay URL with credentials in it would sign "user:pw@host" into the header.
+        parsed = urlsplit(self.relay_url.strip())
+        if host := (parsed.hostname or "").lower().rstrip("."):
+            port = parsed.port
+            default_port = {"http": 80, "ws": 80, "https": 443, "wss": 443}.get(parsed.scheme)
+            tags.append(["server", f"{host}:{port}" if port and port != default_port else host])
         content = "Upload file" if verb == "upload" else "Get file"
         event = _nostr_auth.build_signed_event(private_key=self._private_key, kind=24242, tags=tags, content=content, created_at=now)
         token = base64.urlsafe_b64encode(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()).decode().rstrip("=")
         return f"Nostr {token}"
 
     async def _blossom_upload(self, path: Path, mime: str) -> Tuple[Optional[dict], Optional[str]]:
-        """PUT *path* to the relay's Blossom upload endpoint. Returns (descriptor, None) or (None, error)."""
+        """PUT *path* to the relay's Blossom upload endpoint. Returns (descriptor, None) or (None, error).
+
+        Nothing here raises. Key resolution, signing and the file read all sit inside the ``try``, because
+        ``send_voice`` runs from the gateway's auto-TTS hook, which wraps it in ``try/finally`` with no
+        ``except``: an exception escaping this call would take the turn's text reply down with it. An
+        unsigned or unreadable upload is reported as an error so the envelope and plain-file fallbacks run.
+        Credentials are resolved lazily the way ``_run_cli`` does them, for a send that reaches an adapter
+        whose ``connect()`` never populated them.
+        """
         import httpx
-        data = path.read_bytes()
-        sha256_hex = hashlib.sha256(data).hexdigest()
-        headers = {"Authorization": self._blossom_auth_header(sha256_hex), "Content-Type": mime, "X-SHA-256": sha256_hex}
-        if self._auth_tag:
-            headers["x-auth-tag"] = self._auth_tag
-        base = self._http_relay_url()
         try:
+            self._ensure_credentials()
+            data = await asyncio.to_thread(path.read_bytes)
+            sha256_hex = hashlib.sha256(data).hexdigest()
+            headers = {"Authorization": self._blossom_auth_header(sha256_hex), "Content-Type": mime, "X-SHA-256": sha256_hex}
+            if self._auth_tag:
+                headers["x-auth-tag"] = self._auth_tag
+            base = self._http_relay_url()
             async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
                 for endpoint in ("/upload", "/media/upload"):
                     response = await client.put(base + endpoint, content=data, headers=headers)
@@ -1400,6 +1479,10 @@ class BuzzAdapter(BasePlatformAdapter):
                     if reply[0] == "OK" and len(reply) >= 3 and reply[1] == event["id"]:
                         if reply[2] is True:
                             self._mark_seen(str(chat_id), event["id"])
+                            # Parity with send() and _send_file_attachment: without the meta row a thread
+                            # reply to the card alone never counts as "reply to own" in a require_mention
+                            # channel, because the relay echo of our own event is suppressed.
+                            self._remember_event_meta(str(chat_id), event["id"], self._self_pubkey, content)
                             return SendResult(success=True, message_id=event["id"])
                         return SendResult(success=False, error=f"relay rejected voice note: {reply[3] if len(reply) > 3 else ''}")
                     if reply[0] in ("NOTICE", "CLOSED"):

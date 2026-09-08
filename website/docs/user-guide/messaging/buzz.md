@@ -177,9 +177,22 @@ How the audio is stored depends on the relay:
   voice-note envelope (AAC inside a tiny MP4 with a stub video track) and
   uploaded through the CLI. Inbound envelopes are unpacked back to audio.
 
-Both paths need `ffmpeg` on the gateway host (`/opt/homebrew/bin/ffmpeg` is
-checked when it is not on `PATH`). Without it, or when every voice path fails,
-the audio is sent as a plain file attachment.
+Both paths need `ffmpeg` on the gateway host. It is looked up in
+`BUZZ_FFMPEG_PATH` first, then on `PATH`, then in the usual install roots
+(`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/local/bin`) for a
+gateway started with a stripped environment. Without it, or when every voice
+path fails, the audio is sent as a plain file attachment. Converted files live
+in a private scratch file under the system temp directory and are deleted as
+soon as the send finishes.
+
+An auto-TTS reply arrives as **two messages**: the voice card, then the reply
+text on its own. Telegram folds the text into the audio caption instead, but a
+Buzz voice note is published straight to the relay as a kind-9 event, so a
+caption would bypass the normal send path and lose mention resolution and
+message chunking, and would carry no text at all when the voice paths fall
+back to a plain file attachment. Two messages keep the text reply intact and
+searchable. When a long reply is split into several audio chunks, the
+transcript rides on the first card only.
 
 Inbound voice notes (a `voice-note-*` audio attachment from Buzz Desktop,
 mobile, or another agent) dispatch as voice messages, so the gateway
