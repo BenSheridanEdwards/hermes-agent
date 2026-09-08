@@ -267,7 +267,8 @@ A gateway with zero enabled platforms is a supported mode, not a configuration e
 What changes for cron output:
 
 - `deliver: local` and `bot-chat:<profile>` targets work unchanged (neither needs a platform adapter).
-- A platform target (`telegram:123`, `origin`, `all`) has nothing to send through. The job is recorded as `delivery_failed` with the reason, and the output is written to the gateway log (`Job '<id>': output not delivered to any target ...`, bounded to 4000 characters) so the result is still visible. The full text stays in `last_output`.
+- A platform target (`telegram:123`, `origin`, `all`) has nothing to send through. The job is recorded as `delivery_failed` with the reason (`origin` with no captured origin stays a non-failure, as before), and the output is written to the log (`Job '<id>': output not delivered to any target ...`, bounded to 4000 characters) so the result is still visible. The full text stays in `last_output`.
+- That line is emitted by the `cron.scheduler` logger, so `_ComponentFilter` in `hermes_logging.py` keeps it out of `gateway.log`: it lands in `logs/agent.log`, `logs/errors.log` and the gateway's stderr (`gateway.error.log` under launchd, the journal under systemd). Log files run the `RedactingFormatter`, so the body is redacted unless `security.redact_secrets` is off.
 
 The fatal `EX_CONFIG` (78) exit is reserved for real configuration conflicts: a token already polled by another gateway, or an invalid multiplexer config. Disabling every platform never triggers it.
 

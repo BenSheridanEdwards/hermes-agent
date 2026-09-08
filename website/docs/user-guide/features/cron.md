@@ -488,11 +488,19 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
-When no target accepts the output at all (every platform target failed, or
-the gateway is running with no messaging platform enabled), the output is
-also written to the gateway log as a warning (`output not delivered to any
-target`, capped at 4000 characters) so the result stays visible. `local` and
-`bot-chat` targets never need a platform and are unaffected.
+When no target accepts the output at all (every platform target failed, no
+target resolves because the gateway runs with no messaging platform enabled,
+or `deliver: origin` on a job that never captured an origin), the output is
+also written to the log as a warning (`output not delivered to any target`,
+capped at 4000 characters) so the result stays visible. The line comes from
+the `cron` component, so it lands in `logs/agent.log` and `logs/errors.log`
+(and the gateway's stderr), not in `logs/gateway.log`; `hermes logs
+--component cron` shows it. The logged body passes through the same secret
+redactor as every other log line, so recognised keys and tokens are masked;
+setting `security.redact_secrets: false` disables that and writes the output
+verbatim into the log files. `deliver: local` never needs a target and stays
+silent, and a `bot-chat` target that was queued, claimed or left ambiguous by
+a live owner counts as delivered (the output may already have been consumed).
 
 ### Bot Chat delivery (`bot-chat`)
 
