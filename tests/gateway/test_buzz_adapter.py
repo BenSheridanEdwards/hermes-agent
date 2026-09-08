@@ -3490,6 +3490,25 @@ class TestVoiceNoteClassification:
         assert event.message_type is MessageType.DOCUMENT
         assert len(event.media_urls) == 2 and event.media_urls[0] == str(note)
 
+    @pytest.mark.asyncio
+    async def test_no_attachment_is_hashed_when_the_text_carries_no_media(self, monkeypatch, tmp_path):
+        """Nothing to compare against on the common path, so do not read every attachment back off disk."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        adapter, captured = self._localizing_adapter(tmp_path, self.MP3)
+        adapter._run_cli = AsyncMock(side_effect=AssertionError("no URL refs to localize"))
+        monkeypatch.setattr(_buzz_mod, "_content_digest", lambda path: pytest.fail(f"hashed {path}"))
+
+        await adapter._dispatch_message(
+            text="a plain caption", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-only", created_at=1006,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.VOICE and event.media_urls == [str(note)]
+
 
 class TestThreadAnchoring:
     """A reply must JOIN the thread it was triggered from, not nest a new one.
