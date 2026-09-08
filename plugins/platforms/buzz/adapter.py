@@ -1298,14 +1298,18 @@ class BuzzAdapter(BasePlatformAdapter):
         scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
         return urlunsplit((scheme, parsed.netloc, (parsed.path or "").rstrip("/"), "", ""))
 
-    def _blossom_auth_header(self, sha256_hex: str) -> str:
-        """``Authorization`` value for a Blossom upload (BUD-02): a base64 kind-24242 event scoped to one blob and our relay."""
+    def _blossom_auth_header(self, sha256_hex: str, verb: str = "upload") -> str:
+        """``Authorization`` value for a Blossom request (BUD-01): a base64 kind-24242 event scoped to one blob and our relay.
+
+        *verb* is the Blossom action being authorized: ``upload`` for a PUT, ``get`` for a blob read.
+        """
         import base64
         now = int(time.time())
-        tags: List[List[str]] = [["t", "upload"], ["x", sha256_hex], ["expiration", str(now + _BLOSSOM_AUTH_TTL)]]
+        tags: List[List[str]] = [["t", verb], ["x", sha256_hex], ["expiration", str(now + _BLOSSOM_AUTH_TTL)]]
         if server := urlsplit(self.relay_url.strip()).netloc:
             tags.append(["server", server])
-        event = _nostr_auth.build_signed_event(private_key=self._private_key, kind=24242, tags=tags, content="Upload file", created_at=now)
+        content = "Upload file" if verb == "upload" else "Get file"
+        event = _nostr_auth.build_signed_event(private_key=self._private_key, kind=24242, tags=tags, content=content, created_at=now)
         token = base64.urlsafe_b64encode(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()).decode().rstrip("=")
         return f"Nostr {token}"
 
@@ -1829,6 +1833,25 @@ class BuzzAdapter(BasePlatformAdapter):
         """Return a fixed-width diagnostic for malformed or excess metadata."""
         return f"[{rejected if rejected <= 999 else '999+'} Buzz attachment(s) rejected as malformed or over limits.]"
 
+    def _attachment_request_headers(self, metadata: dict) -> Dict[str, str]:
+        """Headers for a Blossom blob GET: identity encoding plus a signed kind-24242 ``get`` authorization.
+
+        Relays that authenticate media reads answer an unauthenticated request with HTTP 401 and check that the
+        signer is a community member, so every imeta attachment is fetched under the agent's own key. The
+        owner-attestation tag rides along the same way it does on the WebSocket AUTH. A key that cannot sign
+        leaves the request unauthenticated, which a relay without read authentication still serves.
+        """
+        headers = {"Accept-Encoding": "identity"}
+        sha256_hex = str(metadata.get("sha256") or "")
+        if self._private_key and _HEX64_RE.fullmatch(sha256_hex):
+            try:
+                headers["Authorization"] = self._blossom_auth_header(sha256_hex, verb="get")
+            except Exception as exc:  # noqa: BLE001 - an unusable key degrades to the unauthenticated read
+                logger.warning("Buzz: could not sign attachment read authorization: %s", exc)
+        if self._auth_tag:
+            headers["x-auth-tag"] = self._auth_tag
+        return headers
+
     async def _download_attachment(self, metadata: dict) -> Optional[CachedMedia]:
         """Download, integrity-check, and cache one authorized Buzz attachment."""
         url = metadata["url"]
@@ -1845,7 +1868,7 @@ class BuzzAdapter(BasePlatformAdapter):
             timeout = httpx.Timeout(_ATTACHMENT_DOWNLOAD_TIMEOUT)
             async with (
                 asyncio.timeout(_ATTACHMENT_DOWNLOAD_TIMEOUT),
-                httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers={"Accept-Encoding": "identity"}) as client,
+                httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers=self._attachment_request_headers(metadata)) as client,
                 client.stream("GET", url) as response,
             ):
                 if response.status_code != 200:

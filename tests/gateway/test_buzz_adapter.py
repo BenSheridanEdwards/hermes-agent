@@ -3021,6 +3021,91 @@ class TestVoiceNoteInbound:
         assert calls == []
 
 
+class TestAttachmentReadAuthorization:
+    """Attachment downloads carry a signed Blossom ``get`` authorization; the relay answers 401 without one."""
+
+    @staticmethod
+    def _metadata(payload: bytes) -> dict:
+        return {
+            "url": "https://test.relay/media/report.pdf",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+        }
+
+    def test_blossom_auth_header_signs_get_event(self):
+        adapter = _make_adapter({"relay_url": "wss://test.relay"})
+        adapter._private_key = TEST_PRIVATE_KEY
+        digest = "cd" * 32
+
+        event = _decode_nostr_token(adapter._blossom_auth_header(digest, verb="get"))
+
+        assert event["kind"] == 24242
+        assert event["content"] == "Get file"
+        assert event["pubkey"] == _nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+        tags = _tag_map(event)
+        assert tags["t"] == "get"
+        assert tags["x"] == digest
+        assert tags["server"] == "test.relay"
+        assert int(tags["expiration"]) > event["created_at"]
+
+    def test_request_headers_carry_get_auth_and_owner_tag(self):
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+        digest = "ef" * 32
+
+        headers = adapter._attachment_request_headers({"sha256": digest})
+
+        assert headers["Accept-Encoding"] == "identity"
+        assert headers["x-auth-tag"] == '["auth","owner-attestation"]'
+        event = _decode_nostr_token(headers["Authorization"])
+        assert _tag_map(event)["t"] == "get"
+        assert _tag_map(event)["x"] == digest
+
+    def test_request_headers_stay_unauthenticated_without_a_usable_key(self):
+        adapter = _make_adapter()
+        adapter._private_key = ""
+        assert adapter._attachment_request_headers({"sha256": "ab" * 32}) == {"Accept-Encoding": "identity"}
+
+        adapter._private_key = "nsec1test"  # cannot sign: the read still goes out, just unauthenticated
+        assert "Authorization" not in adapter._attachment_request_headers({"sha256": "ab" * 32})
+
+    @pytest.mark.asyncio
+    async def test_download_sends_signed_get_authorization_for_the_blob(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% signed read\n"
+        metadata = self._metadata(payload)
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+
+        cached = await adapter._download_attachment(metadata)
+
+        assert cached is not None and cached.kind == "document"
+        (request,) = requests
+        assert request.headers["accept-encoding"] == "identity"
+        event = _decode_nostr_token(request.headers["authorization"])
+        assert event["kind"] == 24242
+        assert _tag_map(event)["t"] == "get"
+        assert _tag_map(event)["x"] == metadata["sha256"]
+
+    @pytest.mark.asyncio
+    async def test_download_reports_unauthorized_read(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% denied\n"
+        _mock_http(monkeypatch, lambda request: httpx.Response(401, json={"error": "unauthorized"}))
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+
+        assert await adapter._download_attachment(self._metadata(payload)) is None
+
+
 class TestThreadAnchoring:
     """A reply must JOIN the thread it was triggered from, not nest a new one.
 
