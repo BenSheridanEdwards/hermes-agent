@@ -576,7 +576,22 @@ from hermes_cli.env_loader import load_hermes_dotenv, mark_acp_hosted
 # ``hermes acp`` runs under an ACP host that owns the agent identity it passed in as env (HERMES_HOME,
 # BUZZ_*). This import-time load runs before cmd_acp dispatches, so the marker has to be set here or the
 # profile's .env would already have replaced the host's values (acp_adapter.entry sets it for hermes-acp).
-if sys.argv[1:2] == ["acp"]:
+def _argv_selects_acp(argv: list[str] | None = None) -> bool:
+    """True when the ``acp`` subcommand is the one argparse will dispatch.
+
+    NOT ``sys.argv[1:2] == ["acp"]``: zero-arg top-level options (``--yolo``, ``--safe-mode``, ``--dev``,
+    ``--tui``) are legal before the subcommand, so ``hermes --yolo acp`` would skip the marker and the
+    profile's ``.env`` would replace the host's managed identity. Uses the same first-non-flag idiom as the
+    logging-mode selection below; ``_first_positional_argv()`` is the exhaustive version but is defined too
+    far down this module to call from import scope. ``--profile``/``-p``, the one top-level value flag
+    that could otherwise swallow the subcommand slot, has already been stripped from ``sys.argv`` by
+    ``_apply_profile_override()`` above.
+    """
+    tokens = sys.argv[1:] if argv is None else argv
+    return next((arg for arg in tokens if not arg.startswith("-")), "") == "acp"
+
+
+if _argv_selects_acp():
     mark_acp_hosted()
 
 # ``update`` must not import optional secret-manager libs before ``uv``
