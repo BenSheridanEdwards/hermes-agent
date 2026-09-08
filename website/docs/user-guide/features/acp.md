@@ -32,8 +32,50 @@ Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. I
 - skills
 - execute_code and delegate_task
 - vision
+- `text_to_speech`, when a TTS provider is configured (see [Voice notes](#voice-notes))
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
+
+To run ACP sessions with a different toolset, set `acp.toolsets` in `config.yaml`
+(the default is `["hermes-acp"]`; MCP server toolsets are added on top):
+
+```yaml
+acp:
+  toolsets: ["hermes-acp"]
+```
+
+## Voice notes
+
+Hosts that carry attachments (Buzz Desktop via `buzz-acp`) can hand a voice note
+to `session/prompt` as a `resource_link` to an audio file, an embedded `resource`
+blob, or an `audio` content block. Hermes treats such a prompt as a voice turn,
+the same way the gateway does on Telegram or Discord:
+
+- **Speech-to-text first.** Each audio attachment (`audio/*` MIME, or an audio
+  extension such as `.ogg`, `.opus`, `.mp3`, `.m4a`, `.wav`, `.webm`, `.flac`,
+  `.aac`) is transcribed with the configured `stt` provider before the model sees
+  the prompt, with the local fallback the gateway uses. The transcript is prepended
+  to any typed text as a quoted line. If STT is disabled, fails, or returns
+  nothing, the model instead sees a short note naming the attached file. Audio is
+  never inlined into the prompt as text.
+- **Voice-first reply.** When the turn carried audio, `voice.auto_tts` is on, and
+  the `text_to_speech` tool is available (a TTS provider such as `tts.provider: xai`
+  is configured), Hermes adds a per-turn instruction asking the model to call
+  `text_to_speech` with a spoken version of its answer, then give the text answer
+  and end it with the tool's `MEDIA:<absolute path>` line. The audio file is written
+  under `<session cwd>/voice/` so the host can publish it alongside the text.
+- Text-only prompts never trigger any of this, so editor hosts that never send
+  audio see no change.
+
+Related config keys (all optional):
+
+```yaml
+voice:
+  auto_tts: true          # gateway default; also gates ACP voice-first replies
+acp:
+  auto_tts: true          # override voice.auto_tts for ACP hosts only
+  voice_dir: voice        # where text_to_speech writes, relative to the session cwd
+```
 
 ## Installation
 
