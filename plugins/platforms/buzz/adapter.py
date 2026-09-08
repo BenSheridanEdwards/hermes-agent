@@ -656,15 +656,22 @@ def _voice_note_workdir() -> Path:
     return out_dir
 
 
-def _voice_note_tempfile(suffix: str, prefix: str = _VOICE_NOTE_PREFIX) -> Path:
+def _voice_note_tempfile(suffix: str, prefix: str = _VOICE_NOTE_PREFIX) -> Optional[Path]:
     """Create an empty, uniquely named scratch file in the voice workdir and return its path.
 
     ``mkstemp`` rather than a timestamp: every gateway on this host shares the workdir, and two replies in
     the same millisecond would otherwise write the same name and upload each other's audio. ffmpeg runs
     with ``-y`` so it overwrites the placeholder, and ``_run_ffmpeg`` still rejects a zero-byte result.
     Callers own the file: unlink it once the upload that reads it has finished.
+
+    None when the workdir or the file cannot be created (a full or read-only ``TMPDIR``), so a scratch
+    failure degrades exactly like a failed transcode instead of raising out of a send or an inbound event.
     """
-    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=_voice_note_workdir())
+    try:
+        fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=_voice_note_workdir())
+    except OSError as exc:
+        logger.warning("Buzz audio: could not create a %s scratch file: %s", suffix, exc)
+        return None
     os.close(fd)
     return Path(name)
 
@@ -698,16 +705,19 @@ def _run_ffmpeg(args: List[str], out: Path, what: str) -> bool:
     return True
 
 
-def _convert_audio_to_clean_mp3(src: Path, *, reencode: bool = False) -> Optional[Path]:
-    """Write *src* as a metadata-free MPEG audio stream, the form a ``buzz-audio`` relay accepts.
+def _convert_audio_to_clean_mp3(src: Path, out: Path, *, reencode: bool = False) -> Optional[Path]:
+    """Write *src* to *out* as a metadata-free MPEG audio stream, the form a ``buzz-audio`` relay accepts.
 
     An MP3 source has its frames copied (tags stripped, no quality loss) unless *reencode* is set; anything
-    else goes through libmp3lame. Returns the new file, or None when the source is missing or ffmpeg fails.
+    else goes through libmp3lame. Returns *out*, or None when the source is missing or ffmpeg fails.
+
+    *out* is allocated by the caller and registered for cleanup before this runs: this is the body of an
+    ``asyncio.to_thread`` call, and a turn cancelled mid-transcode leaves the thread to finish and write
+    the file, so a path invented in here would never reach the caller's unlink list.
     """
     if not src.is_file():
         logger.warning("Buzz audio: voice source %s does not exist", src.name)
         return None
-    out = _voice_note_tempfile(".mp3")
     codec = ["-c:a", "copy"] if src.suffix.lower() == ".mp3" and not reencode else ["-c:a", "libmp3lame", "-b:a", "96k"]
     args = ["-i", str(src), *_FFMPEG_AUDIO_ONLY, *codec, *_FFMPEG_TAGLESS_MP3]
     if _run_ffmpeg(args, out, "convert voice audio to mp3"):
@@ -716,12 +726,14 @@ def _convert_audio_to_clean_mp3(src: Path, *, reencode: bool = False) -> Optiona
     return None
 
 
-def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
-    """Transcode *src* into Buzz's voice-note envelope: AAC under a 16x16 black H.264 track, fast-start, no metadata."""
+def _wrap_audio_in_voice_note_envelope(src: Path, out: Path) -> Optional[Path]:
+    """Transcode *src* into *out* as Buzz's voice-note envelope: AAC under a 16x16 black H.264 track, fast-start, no metadata.
+
+    *out* is caller-allocated for the same reason as ``_convert_audio_to_clean_mp3``.
+    """
     if not src.is_file():
         logger.warning("Buzz audio: voice source %s does not exist", src.name)
         return None
-    out = _voice_note_tempfile(".mp4")
     args = [
         "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1", "-i", str(src),
         "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
@@ -736,10 +748,18 @@ def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
 
 
 def _extract_voice_note_audio(data: bytes) -> Optional[bytes]:
-    """Demux a Buzz voice-note MP4 envelope into MP3 bytes so the speech can reach STT."""
-    src = _voice_note_tempfile(".mp4", prefix="inbound-")
-    out = _voice_note_tempfile(".mp3", prefix="inbound-")
+    """Demux a Buzz voice-note MP4 envelope into MP3 bytes so the speech can reach STT.
+
+    Both scratch files are allocated inside the ``try`` so that a second allocation failing cannot escape
+    into ``_download_attachment`` and drop the whole inbound event, and cannot leak the first file either.
+    """
+    src: Optional[Path] = None
+    out: Optional[Path] = None
     try:
+        src = _voice_note_tempfile(".mp4", prefix="inbound-")
+        out = _voice_note_tempfile(".mp3", prefix="inbound-")
+        if src is None or out is None:
+            return None
         src.write_bytes(data)
         args = ["-i", str(src), "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "libmp3lame", "-b:a", "96k", *_FFMPEG_TAGLESS_MP3]
         return out.read_bytes() if _run_ffmpeg(args, out, "extract voice-note audio") else None
@@ -1275,23 +1295,39 @@ class BuzzAdapter(BasePlatformAdapter):
 
         Every transcode lands in a private scratch file that is unlinked before this returns, after the
         upload (or the plain-file fallback) that reads it has finished.
+
+        Nothing raises out of here. Auto-TTS calls this from ``_play_tts_file``, whose caller in the base
+        gateway treats an exception as a failed turn and never sends the text reply, so a full ``TMPDIR``
+        or an odd relay would cost the turn its answer. Every failure returns a ``SendResult`` instead.
         """
-        src = Path(audio_path).expanduser()
-        if _ffmpeg_path() is None or not src.is_file():
-            return await self._send_file_attachment(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
         scratch: List[Path] = []
         try:
-            if await self._relay_supports_audio():
+            src = Path(audio_path).expanduser()
+            ffmpeg, exists = _ffmpeg_path(), src.is_file()
+            if ffmpeg is None or not exists:
+                logger.debug("Buzz audio: send_voice %s as a plain file (exists=%s, ffmpeg=%s)", src.name, exists, ffmpeg)
+                return await self._send_file_attachment(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
+            relay_audio = await self._relay_supports_audio()
+            logger.debug("Buzz audio: send_voice %s (ffmpeg=%s, relay_audio=%s)", src.name, ffmpeg, relay_audio)
+            if relay_audio:
                 result = await self._send_voice_note_mp3(chat_id, src, scratch=scratch, caption=caption, reply_to=reply_to, metadata=metadata)
                 if result is not None:
                     return result
-            wrapped = await asyncio.to_thread(_wrap_audio_in_voice_note_envelope, src)
+            # Allocated here, not in the worker: a turn cancelled mid-transcode still lets the thread
+            # finish and write the file, and only a path already in *scratch* gets unlinked.
+            envelope = _voice_note_tempfile(".mp4")
+            wrapped = None
+            if envelope is not None:
+                scratch.append(envelope)
+                wrapped = await asyncio.to_thread(_wrap_audio_in_voice_note_envelope, src, envelope)
             if wrapped is not None:
-                scratch.append(wrapped)
                 result = await self._send_voice_note_envelope(chat_id, wrapped, caption=caption, reply_to=reply_to, metadata=metadata)
                 if result is not None:
                     return result
             return await self._send_file_attachment(chat_id, wrapped or src, caption=caption, reply_to=reply_to, metadata=metadata, probe=False)
+        except Exception as exc:  # noqa: BLE001 - a failed voice send must not cost the turn its text reply
+            logger.warning("Buzz audio: voice send failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=f"voice send failed: {exc}")
         finally:
             for path in scratch:
                 _unlink_quietly(path)
@@ -1303,13 +1339,17 @@ class BuzzAdapter(BasePlatformAdapter):
         """Blossom-upload *src* as a clean MP3 and publish it; None when the caller should fall back.
 
         A copied MP3 stream the relay's validator rejects (junk between frames) is worth one re-encode.
-        Each converted file is appended to *scratch* so ``send_voice`` can unlink it once the send is done.
+        Each scratch path is appended to *scratch* before the transcode starts, so ``send_voice`` unlinks
+        it once the send is done and a cancellation mid-transcode cannot orphan it.
         """
         for reencode in (False, True):
-            mp3 = await asyncio.to_thread(_convert_audio_to_clean_mp3, src, reencode=reencode)
+            out = _voice_note_tempfile(".mp3")
+            if out is None:
+                return None
+            scratch.append(out)
+            mp3 = await asyncio.to_thread(_convert_audio_to_clean_mp3, src, out, reencode=reencode)
             if mp3 is None:
                 return None
-            scratch.append(mp3)
             desc, error = await self._blossom_upload(mp3, "audio/mpeg")
             if desc is not None:
                 result = await self._publish_voice_note(chat_id, desc, mp3.name, "audio/mpeg", caption=caption, reply_to=reply_to, metadata=metadata)
