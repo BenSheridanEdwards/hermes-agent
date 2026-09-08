@@ -142,8 +142,9 @@ mismatches are rejected.
 The relay's own HTTPS origin is trusted automatically. If a community stores
 media on another public origin, add its exact `host` or `host:port` to
 `attachment_hosts` under `gateway.platforms.buzz.extra`. Non-default ports
-must be listed explicitly. Protected media that requires authenticated
-retrieval through the Buzz CLI is not handled by this native public-URL path.
+must be listed explicitly. Media on one of those other origins that only a
+Buzz CLI fetch can retrieve is not handled by this native public-URL path; the
+signed relay authorization described next covers the relay's origin only.
 
 A download **from the relay** carries a signed kind-24242 `get` authorization
 for that blob's SHA-256 (Blossom BUD-01), plus the owner-attestation tag when
