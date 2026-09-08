@@ -113,10 +113,13 @@ Examples:
 ```text
 new_session(cwd)
   -> create SessionState
-  -> create AIAgent(platform="acp", enabled_toolsets=["hermes-acp"])
+  -> create AIAgent(platform="acp", enabled_toolsets=acp.toolsets or ["hermes-acp"])
   -> bind task_id/session_id to cwd override
 
 prompt(..., session_id)
+  -> transcribe audio attachments (acp_adapter/voice.py, gateway STT helpers);
+     a voice turn with TTS configured binds the voice-first instruction and
+     the text_to_speech output dir (<cwd>/voice) for this turn only
   -> extract text from ACP content blocks
   -> reset cancel event
   -> install callbacks + approval bridge

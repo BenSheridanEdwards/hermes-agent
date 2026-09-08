@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import tempfile
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Dict, Any, List, Optional
 
@@ -118,10 +119,26 @@ def _get_default_output_dir() -> str:
 
 DEFAULT_OUTPUT_DIR = _DEFAULT_OUTPUT_DIR_AT_IMPORT = _get_default_output_dir()
 
+# Task-local default output directory. ACP turns bind it to a host-visible workspace folder so
+# a ``text_to_speech`` call without ``output_path`` lands where the host can publish it; it
+# propagates into tool worker threads with the other session ContextVars. ``None`` = not bound.
+_OUTPUT_DIR_OVERRIDE: ContextVar[Optional[str]] = ContextVar("HERMES_TTS_OUTPUT_DIR", default=None)
+
+
+def set_tts_output_dir(path: Optional[str]):
+    """Bind the default ``text_to_speech`` output directory for the current context; returns the
+    reset token for :func:`reset_tts_output_dir`. An explicit ``output_path`` argument still wins."""
+    return _OUTPUT_DIR_OVERRIDE.set(str(path) if path else None)
+
+
+def reset_tts_output_dir(token) -> None:
+    _OUTPUT_DIR_OVERRIDE.reset(token)
+
 
 def _default_output_dir() -> str:
     """The active profile's audio output dir at call time (long-lived runtimes switch profiles
-    after import); a monkeypatched ``DEFAULT_OUTPUT_DIR`` wins.
+    after import); a task-local :func:`set_tts_output_dir` binding wins, then a monkeypatched
+    ``DEFAULT_OUTPUT_DIR``.
 
     Same bug class as skills_tool (f8723c478) and skills_sync (#65828): long-lived multi-profile runtimes
     (dashboard console, TUI/Desktop backend, cron, kanban workers) import this module once under the launch
@@ -131,6 +148,9 @@ def _default_output_dir() -> str:
     ``DEFAULT_OUTPUT_DIR`` module attribute for tests and external patchers; when it has not been patched,
     re-resolve from the live profile-scoped HERMES_HOME on every call.
     """
+    override = _OUTPUT_DIR_OVERRIDE.get()
+    if override:
+        return override
     if DEFAULT_OUTPUT_DIR != _DEFAULT_OUTPUT_DIR_AT_IMPORT:
         return DEFAULT_OUTPUT_DIR
     return _get_default_output_dir()

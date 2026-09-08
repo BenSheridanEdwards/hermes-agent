@@ -179,11 +179,14 @@ TOOLSETS = {
 
     # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
     # there is deliberately no agent-callable send_message tool. hermes-acp is the
-    # coding posture minus the interactive clarify UI.
+    # coding posture minus the interactive clarify UI, plus text_to_speech so hosts
+    # that carry attachments (Buzz) can receive voice-note replies; the tool's own
+    # check_fn drops it when no TTS provider is configured, so editor hosts without
+    # a voice setup see the same list as before.
     "hermes-acp": _ts(
         "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
-        "messaging, audio, or clarify UI",
-        [t for t in _CODING_TOOLS if t != "clarify"],
+        "messaging or clarify UI; text_to_speech when a TTS provider is configured",
+        [t for t in _CODING_TOOLS if t != "clarify"] + ["text_to_speech"],
     ),
     "hermes-api-server": _ts(
         "OpenAI-compatible API server — full agent tools accessible via HTTP (no "

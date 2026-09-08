@@ -33,7 +33,8 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets, default_acp_toolsets
+from acp_adapter.voice import VoiceTurn, bind_voice_turn, cleanup_voice_turn, prepare_voice_turn
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -421,7 +422,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             agent = state.agent
             agent.enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(agent, "enabled_toolsets", None) or ["hermes-acp"],
+                getattr(agent, "enabled_toolsets", None) or default_acp_toolsets(),
                 mcp_server_names=[s.name for s in mcp_servers],
             )
             agent.tools = get_tool_definitions(
@@ -712,6 +713,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
         loop: asyncio.AbstractEventLoop, approval_cb: Any, edit_approval_requester: Any,
+        voice_turn: VoiceTurn | None = None,
     ) -> dict:
         """Executor-thread body of one turn, run inside ``contextvars.copy_context()`` so
         ContextVar writes are isolated from concurrent sessions.
@@ -753,6 +755,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 _bind_guarded(stack, "approval callback", _approval)
             if edit_approval_requester:
                 _bind_guarded(stack, "edit approval requester", _edit_approval)
+            if voice_turn is not None:
+                # Voice-first instruction (ephemeral, API-time only) and the text_to_speech
+                # output directory; the ContextVar lives in this copied context only.
+                _bind_guarded(stack, "voice turn", lambda: bind_voice_turn(agent, voice_turn))
             stack.callback(reset_hermes_interactive_context, set_hermes_interactive_context(True))
             # Tools tag side-effects with the ACP session (``kanban_create``); save/restore it.
             stack.callback(_restore_env, "HERMES_SESSION_ID", os.environ.get("HERMES_SESSION_ID"))
@@ -780,10 +786,22 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
 
+        # Audio attachments are transcribed before the model sees the prompt (gateway STT
+        # helpers); a turn that started with voice also asks for a voice-note reply.
+        voice_turn: VoiceTurn | None = None
+        try:
+            voice_turn = await prepare_voice_turn(prompt, cwd=state.cwd, agent=state.agent)
+        except Exception:
+            logger.warning("Session %s: voice preprocessing failed; prompt continues as text", session_id, exc_info=True)
+
         user_text = _extract_text(prompt).strip()
-        user_content = _content_blocks_to_openai_user_content(prompt)
+        user_content = _content_blocks_to_openai_user_content(
+            prompt, audio_notes=voice_turn.audio_notes if voice_turn else None)
+        if voice_turn is not None:
+            user_text = voice_turn.prompt_text(user_text)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         if not user_text and not (isinstance(user_content, list) and user_content):
+            cleanup_voice_turn(voice_turn)
             return PromptResponse(stop_reason="end_turn")
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
@@ -799,6 +817,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
         if absorbed is not None:
+            cleanup_voice_turn(voice_turn)
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
             return PromptResponse(stop_reason="end_turn")
@@ -813,6 +832,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return self._run_agent_turn(
                 state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
                 loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
+                voice_turn=voice_turn,
             )
 
         try:
@@ -828,6 +848,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
+        finally:
+            cleanup_voice_turn(voice_turn)
 
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 

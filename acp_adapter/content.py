@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -67,6 +68,120 @@ _IMAGE_SUFFIX_MIME = {
     ".bmp": "image/bmp",
     ".svg": "image/svg+xml",
 }
+
+
+def _is_audio_resource(mime_type: str | None) -> bool:
+    return _mime_main(mime_type).startswith("audio/")
+
+
+# Voice-note and audio attachment extensions a host may link without a MIME type. ``.webm``
+# is listed because voice recorders emit Opus-in-WebM; a WebM video linked as ``video/webm``
+# is not matched (the MIME wins when present).
+_AUDIO_SUFFIX_MIME = {
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+}
+_AUDIO_MIME_SUFFIX = {
+    "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/wav": ".wav",
+    "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/webm": ".webm", "audio/flac": ".flac",
+}
+
+
+@dataclass
+class AudioAttachment:
+    """One audio prompt block. ``path`` is the local file for a ``resource_link``; ``data`` carries
+    embedded bytes (embedded ``resource`` blob or ``audio`` block) until a caller materializes them."""
+
+    index: int
+    uri: str
+    display: str
+    mime: str
+    path: Path | None = None
+    data: bytes | None = None
+
+    @property
+    def suffix(self) -> str:
+        if self.path is not None and self.path.suffix:
+            return self.path.suffix.lower()
+        return _AUDIO_MIME_SUFFIX.get(_mime_main(self.mime), ".bin")
+
+
+def _audio_mime_for(mime_type: str | None, path: Path | None) -> str | None:
+    """Effective audio MIME for a block, or ``None`` when it is not audio. An explicit non-audio
+    MIME wins over the extension (a ``text/plain`` file named ``notes.wav`` stays text)."""
+    if mime_type:
+        return mime_type if _is_audio_resource(mime_type) else None
+    if path is not None:
+        return _AUDIO_SUFFIX_MIME.get(path.suffix.lower())
+    return None
+
+
+def _decode_blob(blob: str) -> bytes:
+    try:
+        return base64.b64decode(blob, validate=True)
+    except Exception:
+        return blob.encode("utf-8", errors="replace")
+
+
+def audio_attachment_from_block(index: int, block: Any) -> AudioAttachment | None:
+    """Classify one prompt block as audio: a ``resource_link``/embedded ``resource`` whose MIME is
+    ``audio/*`` (or, without a MIME, whose file extension is a known audio type), or an ``audio``
+    content block. Returns ``None`` for everything else. Never reads or decodes file contents."""
+    if isinstance(block, AudioContentBlock):
+        data = _attr(block, "data") or ""
+        if data.startswith("data:") and "," in data:
+            data = data.split(",", 1)[1]
+        mime = _attr(block, "mime_type") or "audio/mpeg"
+        return AudioAttachment(index=index, uri="", display="voice message", mime=mime, data=_decode_blob(data))
+
+    if isinstance(block, ResourceContentBlock):
+        uri = _attr(block, "uri")
+        if not uri:
+            return None
+        path = _path_from_file_uri(uri)
+        mime = _audio_mime_for(_attr(block, "mime_type"), path)
+        if mime is None:
+            return None
+        display = _resource_display_name(uri, name=_attr(block, "name"), title=_attr(block, "title"))
+        return AudioAttachment(index=index, uri=uri, display=display, mime=mime, path=path)
+
+    if isinstance(block, EmbeddedResourceContentBlock):
+        resource = getattr(block, "resource", None)
+        if not isinstance(resource, BlobResourceContents):
+            return None
+        uri = _attr(resource, "uri") or ""
+        mime = _audio_mime_for(_attr(resource, "mime_type"), _path_from_file_uri(uri) if uri else None)
+        if mime is None:
+            return None
+        return AudioAttachment(
+            index=index, uri=uri, display=_resource_display_name(uri) if uri else "voice message", mime=mime,
+            data=_decode_blob(resource.blob or ""),
+        )
+    return None
+
+
+def audio_attachments(prompt: list[PromptBlock]) -> list[AudioAttachment]:
+    """Every audio attachment in ``prompt`` (prompt order)."""
+    found = [audio_attachment_from_block(index, block) for index, block in enumerate(prompt)]
+    return [att for att in found if att is not None]
+
+
+def _audio_fallback_note(att: AudioAttachment) -> str:
+    """Prompt text for an audio block that went through no voice preprocessing: name the file when
+    there is one so the agent knows a clip was attached; never inline or decode the bytes."""
+    if att.path is not None:
+        from gateway.run_inbound import voice_message_attached_note
+        return voice_message_attached_note(str(att.path))
+    size = len(att.data or b"")
+    return f"[The user sent an audio attachment ({att.display}, {att.mime}, {size} bytes) that is not available as a file]"
 
 
 def _path_from_file_uri(uri: str) -> Path | None:
@@ -246,13 +361,23 @@ def _append_parts(parts: list, text_parts: list[str], new_parts: list[dict[str, 
             text_parts.append(part["text"])
 
 
-def _content_blocks_to_openai_user_content(prompt: list[PromptBlock]) -> str | list[dict[str, Any]]:
-    """Convert ACP prompt blocks into a Hermes/OpenAI-compatible user content payload."""
+def _content_blocks_to_openai_user_content(
+    prompt: list[PromptBlock], audio_notes: dict[int, str] | None = None,
+) -> str | list[dict[str, Any]]:
+    """Convert ACP prompt blocks into a Hermes/OpenAI-compatible user content payload.
+
+    Audio blocks never reach the binary/text inlining path: each becomes the note in
+    ``audio_notes`` (block index -> transcript or marker, from ``acp_adapter.voice``) or a
+    fallback marker, and the notes lead the payload the way the gateway prepends transcripts."""
     parts: list[dict[str, Any]] = []
     text_parts: list[str] = []
+    audio_parts: list[str] = []
 
-    for block in prompt:
-        if isinstance(block, TextContentBlock):
+    for index, block in enumerate(prompt):
+        attachment = audio_attachment_from_block(index, block)
+        if attachment is not None:
+            audio_parts.append((audio_notes or {}).get(index) or _audio_fallback_note(attachment))
+        elif isinstance(block, TextContentBlock):
             if block.text:
                 parts.append({"type": "text", "text": block.text})
                 text_parts.append(block.text)
@@ -264,6 +389,10 @@ def _content_blocks_to_openai_user_content(prompt: list[PromptBlock]) -> str | l
             _append_parts(parts, text_parts, _resource_link_to_parts(block))
         elif isinstance(block, EmbeddedResourceContentBlock):
             _append_parts(parts, text_parts, _embedded_resource_to_parts(block))
+
+    if audio_parts:
+        parts = [{"type": "text", "text": note} for note in audio_parts] + parts
+        text_parts = audio_parts + text_parts
 
     if not parts:
         return _extract_text(prompt)

@@ -100,10 +100,53 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
 
+DEFAULT_ACP_TOOLSET = "hermes-acp"
+
+
+def acp_settings(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The ``acp:`` config section (``{}`` when absent); loads the merged config when not given."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            logger.debug("ACP: config unavailable, using defaults", exc_info=True)
+            config = {}
+    section = (config or {}).get("acp")
+    return section if isinstance(section, dict) else {}
+
+
+def acp_voice_reply_enabled(config: Dict[str, Any] | None = None) -> bool:
+    """Whether ACP turns that start with a voice note ask for a spoken reply (the gateway's
+    ``voice.auto_tts`` default), with ``acp.auto_tts: true|false`` overriding it for ACP hosts."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            config = {}
+    override = acp_settings(config).get("auto_tts")
+    if override is not None:
+        return bool(override)
+    voice = (config or {}).get("voice")
+    return bool(voice.get("auto_tts", False)) if isinstance(voice, dict) else False
+
+
+def default_acp_toolsets(config: Dict[str, Any] | None = None) -> List[str]:
+    """Base toolsets for an ACP session: ``acp.toolsets`` when set, else ``["hermes-acp"]``.
+    ``hermes-acp`` carries ``text_to_speech``; the tool's own check_fn drops it when the
+    configured TTS provider cannot run, so hosts without a voice setup see no change."""
+    raw = acp_settings(config).get("toolsets")
+    if isinstance(raw, str):
+        raw = [raw]
+    names = [str(n).strip() for n in (raw or []) if str(n or "").strip()] or [DEFAULT_ACP_TOOLSET]
+    return list(dict.fromkeys(names))
+
+
 def _expand_acp_enabled_toolsets(toolsets: List[str] | None = None,
                                  mcp_server_names: List[str] | None = None) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
-    names = [n for n in (toolsets or ["hermes-acp"]) if n]
+    names = [n for n in (toolsets or default_acp_toolsets()) if n]
     names += [f"mcp-{s}" for s in (mcp_server_names or []) if s]
     return list(dict.fromkeys(names))
 
@@ -390,7 +433,8 @@ class SessionManager:
         ]
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
-            "enabled_toolsets": _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=configured_mcp_servers),
+            "enabled_toolsets": _expand_acp_enabled_toolsets(
+                default_acp_toolsets(config), mcp_server_names=configured_mcp_servers),
             "model": model or default_model,
         }
         try:
