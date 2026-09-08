@@ -2654,13 +2654,22 @@ class TestVoiceNoteDelivery:
         assert [r.url.scheme for r in requests] == ["http", "https"]
 
     @pytest.mark.asyncio
-    async def test_relay_supports_audio_survives_a_non_object_nip11_body(self, monkeypatch):
+    async def test_relay_supports_audio_survives_a_non_object_nip11_body(self, monkeypatch, caplog):
+        """A JSON array is a well-formed "no extensions" answer, not a probe failure.
+
+        The ``isinstance(doc, dict)`` guard is what makes it one: without it the ``.get`` raises an
+        AttributeError that the broad ``except`` turns into a warning about an unusable relay, which is
+        why this asserts on the log as well as the result.
+        """
         import httpx
+        import logging
 
         _mock_http(monkeypatch, lambda request: httpx.Response(200, json=["buzz-audio"]))
         adapter = _make_adapter()
 
-        assert await adapter._relay_supports_audio() is False
+        with caplog.at_level(logging.WARNING, logger=_buzz_mod.logger.name):
+            assert await adapter._relay_supports_audio() is False
+        assert "NIP-11 probe failed" not in caplog.text
 
     def test_blossom_auth_header_is_signed_upload_event(self):
         adapter = _make_adapter({"relay_url": "wss://test.relay:8443/relay"})
