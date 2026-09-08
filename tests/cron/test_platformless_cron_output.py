@@ -336,3 +336,45 @@ def test_surrogates_in_the_error_reason_are_scrubbed_too(gateway_mode_logging):
     assert "not configured/enabled" in written
 
 
+@pytest.mark.parametrize("deliver", ["Local", " local ", "LOCAL"])
+def test_local_lane_is_matched_case_and_whitespace_insensitively(
+    platformless_env, monkeypatch, caplog, deliver
+):
+    """``local`` is a lane keyword, not a platform name, and ``all``/``bot-chat`` are already
+    matched case-insensitively. Before this, ``Local`` resolved to no target, reported a spurious
+    ``no delivery target resolved for deliver=Local`` and (once unresolved lanes started logging)
+    dumped the job body into agent.log and errors.log on every run."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("typo lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-typo", "name": "typo", "deliver": deliver}, adapters={}, loop=None,
+        )
+
+    msgs = _messages(caplog)
+    assert not any("output not delivered" in m for m in msgs)
+    assert not any("no delivery target resolved" in m for m in msgs)
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] is None
+
+
+def test_a_delivered_co_target_suppresses_the_body_for_a_failed_one(
+    platformless_env, monkeypatch, caplog
+):
+    """The log gate is per job, not per target. A bot-chat receipt the live owner may already have
+    consumed counts as delivered, so a platform target failing alongside it does not re-dump the
+    body: something reached a human. The failure is still reported in the returned error."""
+    monkeypatch.setattr(sched_delivery, "_deliver_to_bot_chat", _bot_chat_receipt("ambiguous"))
+    monkeypatch.setattr(sched_delivery, "_record_delivery_verification", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        error = sched_delivery._deliver_result(
+            {"id": "j-cotarget", "name": "co", "deliver": "bot-chat,telegram:123"},
+            "co-target body", adapters={}, loop=None,
+        )
+
+    assert error is not None
+    assert "ambiguous" in error and "telegram" in error
+    assert not any("output not delivered" in m for m in _messages(caplog))
+
+

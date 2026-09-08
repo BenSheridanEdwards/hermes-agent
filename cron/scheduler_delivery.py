@@ -560,14 +560,17 @@ def _home_target(platform_name: str, chat_id: str, resolved_from: Optional[str] 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
     origin = _resolve_origin(job)
-    if deliver_value == "local":
+    # ``local``/``origin`` are lane keywords, not platform names, so match them the way ``all`` and
+    # ``bot-chat`` are already matched: case-insensitively, on the stripped token.
+    lane = (deliver_value or "").strip().lower()
+    if lane == "local":
         return None
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
     bot_chat_profile = parse_bot_chat_deliver_token(deliver_value)
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
 
-    if deliver_value == "origin":
+    if lane == "origin":
         if origin:
             return {
                 "platform": origin["platform"],
@@ -850,7 +853,7 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver == "local":
+    if deliver.strip().lower() == "local":
         return []
 
     parts: List[str] = []
@@ -1690,9 +1693,13 @@ def _unresolved_delivery_outcome(
     belongs in the output file alone. Every other lane asked for a platform that is not there, so
     the caller logs the output under this reason instead of leaving it in ``last_output`` only."""
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver_value == "local":
+    # Lane names are matched case- and whitespace-insensitively: `"Local"` or `" local "` is the
+    # same opt-out a plain `local` is, and treating it as a platform name would resolve to nothing
+    # and (since this change logs unresolved lanes) dump the job body on every run.
+    lane = deliver_value.strip().lower()
+    if lane == "local":
         return None, None
-    if deliver_value == "origin":
+    if lane == "origin":
         logger.info(
             # deliver=origin with no resolvable origin and no configured home channels: treat as local
             # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
@@ -1854,6 +1861,10 @@ def _deliver_result(
             delivered_targets += 1
 
     # Nothing reached anyone (typically a gateway with no live platform): keep the result visible.
+    # The gate is per JOB, not per target: if any co-target took the output (including a bot-chat
+    # receipt that was queued, claimed or left ambiguous) a human may already be reading it, so the
+    # body is not repeated in the log even though another target failed. That failure is still
+    # reported in the returned error and in ``last_delivery_error``; only the body is withheld.
     if delivered_targets == 0:
         _log_undelivered_output(job, content, delivery_errors)
 
