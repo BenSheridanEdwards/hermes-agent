@@ -1521,14 +1521,19 @@ def _deliver_standalone(
     return True
 
 
-# Bounded so a long report cannot flood gateway.log; the full text stays in ``last_output``.
+# Bounded so a long report cannot flood the log files; the full text stays in ``last_output``.
+# Counted in characters, not bytes: a multi-byte report can exceed 4000 bytes on disk.
 _UNDELIVERED_OUTPUT_LOG_LIMIT = 4000
 
 
 def _log_undelivered_output(job: dict, content: str, errors: list) -> None:
-    """Every resolved target refused the send: surface the output in the log. A gateway running with
-    no messaging platform (scheduled work only) still produces results, and without this line they
-    would exist only in ``last_output``, invisible to anyone tailing gateway.log."""
+    """No target took the output (none resolved, or every resolved one refused): surface it in the
+    log. A gateway running with no messaging platform (scheduled work only) still produces results,
+    and without this line they would exist only in ``last_output``.
+
+    This is the ``cron.scheduler`` logger, so the line lands in ``logs/agent.log`` and (being a
+    WARNING) ``logs/errors.log``, plus the gateway's stderr; it is NOT in ``logs/gateway.log``,
+    which the component filter in ``hermes_logging`` restricts to ``gateway.*`` loggers."""
     text = (content or "").strip()
     if not text:
         return
@@ -1647,13 +1652,19 @@ def _prepare_target_delivery(
         opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
 
 
-def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
-    """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
-    origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
-    an error string."""
+def _unresolved_delivery_outcome(
+    job: dict, for_failure: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """``_deliver_result`` outcome when no target resolved, as ``(error, undelivered_reason)``.
+
+    ``error`` is None (not a failure) for ``local`` and for origin-less ``origin`` (CLI jobs never
+    capture an origin, so an error there would fire every run), else an error string.
+    ``undelivered_reason`` is None only for ``local``: that lane asked for no target and its output
+    belongs in the output file alone. Every other lane asked for a platform that is not there, so
+    the caller logs the output under this reason instead of leaving it in ``last_output`` only."""
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver_value == "local":
-        return None
+        return None, None
     if deliver_value == "origin":
         logger.info(
             # deliver=origin with no resolvable origin and no configured home channels: treat as local
@@ -1664,10 +1675,10 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
             "Job '%s': deliver=origin but no origin or home channels — "
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
-        return None
+        return None, "deliver=origin but no origin or home channels"
     msg = f"no delivery target resolved for deliver={deliver_value}"
     logger.warning("Job '%s': %s", job["id"], msg)
-    return msg
+    return msg, msg
 
 
 def _deliver_result(
@@ -1681,7 +1692,13 @@ def _deliver_result(
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
+        outcome, undelivered_reason = _unresolved_delivery_outcome(job, for_failure)
+        # `deliver: all` with no enabled platform, and `deliver: origin` with no captured origin,
+        # resolve to nothing at all: they never reach the per-target loop below, so the output has
+        # to be logged here or it stays invisible. `local` passes reason=None and stays silent.
+        if undelivered_reason:
+            _log_undelivered_output(job, content, [undelivered_reason])
+        return outcome
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
@@ -1770,12 +1787,16 @@ def _deliver_result(
             if bot_chat_error:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
+                status = receipt["status"] if receipt else None
+                if status not in ("queued", "claimed"):
                     delivery_errors.append(bot_chat_error)
-                else:
-                    # Queued/claimed by the live Bot Chat owner: the output reached someone.
+                if status in ("queued", "claimed", "ambiguous"):
+                    # Queued/claimed: admitted by the live Bot Chat owner, so the output reached
+                    # someone. Ambiguous: the owner MAY have consumed it, which is exactly why a
+                    # replay is refused above; claiming "not delivered to any target" and dumping
+                    # the body would overstate what is known, so it counts here too.
                     delivered_targets += 1
-                if receipt and receipt["status"] == "ambiguous":
+                if status == "ambiguous":
                     unverified_targets.append(bot_chat_error)
             else:
                 delivered_targets += 1

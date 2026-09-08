@@ -1,4 +1,4 @@
-"""A gateway with zero enabled messaging platforms is a supported mode (#5196).
+"""A gateway with zero enabled messaging platforms is a supported mode (upstream #5196).
 
 It starts, reports ``running``, and keeps the cron ticker and housekeeping thread alive so a
 profile whose chat face lives elsewhere (a managed harness, a desktop app) still gets its

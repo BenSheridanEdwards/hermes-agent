@@ -2,15 +2,25 @@
 
 A gateway may run with zero enabled platforms (scheduled work only). A job whose ``deliver``
 names a platform then has nothing to send through: the run is recorded as a delivery failure
-as before, and the output is ALSO written to the log so the result is visible to whoever tails
-gateway.log. ``local`` and ``bot-chat`` targets never needed a platform and stay silent.
+as before, and the output is ALSO written to the log so the result stays visible. That covers
+both shapes of "nothing took it": a target that resolved and refused (``telegram:123``), and a
+lane that resolves to no target at all on a platform-less gateway (``all``, and ``origin`` on a
+CLI-created job with no captured origin).
+
+The line comes from the ``cron.scheduler`` logger, so it lands in ``agent.log``/``errors.log``,
+NOT in ``gateway.log`` (pinned by ``test_undelivered_output_lands_in_agent_log_not_gateway_log``).
+``local`` never wanted a target and stays silent; a ``bot-chat`` receipt the live owner may have
+consumed is not treated as undelivered.
 """
 
 import logging
+import os
+from pathlib import Path
 
 import pytest
 
 import cron.scheduler as s
+import hermes_logging
 from cron import scheduler_delivery as sched_delivery
 
 
@@ -89,6 +99,55 @@ def test_platform_bound_output_is_logged_when_no_platform_can_take_it(
     assert "not configured/enabled" in repr((args, kw))
 
 
+def test_deliver_all_output_is_logged_when_no_target_resolves(
+    platformless_env, monkeypatch, caplog
+):
+    """``deliver: all`` on a platform-less gateway resolves to NO target, so it never reaches
+    the per-target loop. The run is still recorded as a delivery failure and the output is
+    logged: this is the gap the change set out to close."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("fleet report: 3 jobs, 0 failures"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        ok = s.run_one_job(
+            {"id": "j-all", "name": "fleet", "deliver": "all"}, adapters={}, loop=None,
+        )
+
+    assert ok is True
+    logged = [m for m in _messages(caplog) if "output not delivered to any target" in m]
+    assert len(logged) == 1
+    assert "j-all" in logged[0]
+    assert "no delivery target resolved for deliver=all" in logged[0]
+    assert "fleet report: 3 jobs, 0 failures" in logged[0]
+    # Bookkeeping unchanged: still a delivery failure with the same reason.
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] == "no delivery target resolved for deliver=all"
+
+
+def test_deliver_origin_without_an_origin_logs_output_without_reporting_an_error(
+    platformless_env, monkeypatch, caplog
+):
+    """``deliver: origin`` on a CLI-created job has no origin to resolve. That stays a
+    non-failure (upstream #43014: no spurious error every run), but the output is no longer
+    invisible: the body is logged alongside the existing skip notice."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("weekly digest: nothing to report"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        ok = s.run_one_job(
+            {"id": "j-origin", "name": "digest", "deliver": "origin"}, adapters={}, loop=None,
+        )
+
+    assert ok is True
+    msgs = _messages(caplog)
+    assert any("skipping delivery (output saved in last_output)" in m for m in msgs)
+    logged = [m for m in msgs if "output not delivered to any target" in m]
+    assert len(logged) == 1
+    assert "deliver=origin but no origin or home channels" in logged[0]
+    assert "weekly digest: nothing to report" in logged[0]
+    # Still not an error: the job is not marked delivery_failed.
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] is None
+
+
 def test_local_delivery_stays_silent_without_a_platform(platformless_env, monkeypatch, caplog):
     """``deliver: local`` never resolves a target, so nothing is undelivered and nothing is
     logged; the output file remains the record, exactly as before."""
@@ -120,3 +179,74 @@ def test_undelivered_output_log_skips_empty_content(caplog):
     with caplog.at_level(logging.WARNING, logger="cron.scheduler_delivery"):
         sched_delivery._log_undelivered_output({"id": "j-empty"}, "   \n", ["nope"])
     assert not any("output not delivered" in m for m in _messages(caplog))
+
+
+def _bot_chat_receipt(status):
+    """Stub the Bot Chat lane: record a receipt of *status* and return its error string."""
+    def _fake(job, _content, profile):
+        target = f"bot-chat:{profile or '(own)'}"
+        job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+            "status": status, "delivery_id": "abc123",
+        }
+        return f"{target} {status} (receipt abc123): completion unverified"
+    return _fake
+
+
+@pytest.mark.parametrize("status,expect_logged", [("ambiguous", False), ("failed", True)])
+def test_ambiguous_bot_chat_receipt_does_not_log_the_body(
+    platformless_env, monkeypatch, caplog, status, expect_logged
+):
+    """An ``ambiguous`` receipt is the state the delivery code refuses to replay because the
+    live owner may already have consumed the output. Calling that "not delivered to any target"
+    and dumping the body overstates what is known, so it is not logged; a receipt that really
+    failed still is. Either way the receipt bookkeeping (the returned error) is unchanged."""
+    monkeypatch.setattr(sched_delivery, "_deliver_to_bot_chat", _bot_chat_receipt(status))
+    monkeypatch.setattr(sched_delivery, "_record_delivery_verification", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        error = sched_delivery._deliver_result(
+            {"id": f"j-{status}", "name": "bot", "deliver": "bot-chat"},
+            "standup notes for the owner", adapters={}, loop=None,
+        )
+
+    assert error is not None and status in error
+    logged = [m for m in _messages(caplog) if "output not delivered to any target" in m]
+    assert bool(logged) is expect_logged
+    if expect_logged:
+        assert "standup notes for the owner" in logged[0]
+
+
+@pytest.fixture
+def gateway_mode_logging(tmp_path):
+    """Real file logging in gateway mode, torn down after the test (see test_hermes_logging.py)."""
+    home = Path(os.environ["HERMES_HOME"])
+    root = logging.getLogger()
+    pre_existing = list(root.handlers)
+    prev_level = root.level
+    hermes_logging._logging_initialized = False
+    hermes_logging._reset_queued_handlers()
+    log_dir = hermes_logging.setup_logging(hermes_home=home, mode="gateway", force=True)
+    try:
+        yield log_dir
+    finally:
+        hermes_logging._reset_queued_handlers()
+        for handler in list(root.handlers):
+            if handler not in pre_existing:
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(prev_level)
+        hermes_logging._logging_initialized = False
+
+
+def test_undelivered_output_lands_in_agent_log_not_gateway_log(gateway_mode_logging):
+    """Where the line actually goes. It is emitted by the ``cron.scheduler`` logger, and the
+    gateway.log handler carries a component filter for ``gateway.*``, so the output surfaces in
+    agent.log and (as a WARNING) errors.log. The docs and docstrings name those files."""
+    sched_delivery._log_undelivered_output(
+        {"id": "j-route"}, "routed output body", ["telegram not configured/enabled"])
+    hermes_logging.flush_log_queue()
+
+    assert "routed output body" in (gateway_mode_logging / "agent.log").read_text()
+    assert "routed output body" in (gateway_mode_logging / "errors.log").read_text()
+    gateway_log = gateway_mode_logging / "gateway.log"
+    assert not gateway_log.exists() or "routed output body" not in gateway_log.read_text()

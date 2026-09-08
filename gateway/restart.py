@@ -10,7 +10,7 @@ from hermes_cli.config import DEFAULT_CONFIG
 GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
 # EX_CONFIG (sysexits.h): fatal configuration error (token collision, invalid multiplexer config);
 # the s6 finish script maps it to exit 125 so the supervisor stops restarting. A gateway with zero
-# enabled platforms is NOT fatal: it keeps running for cron and housekeeping (#5196).
+# enabled platforms is NOT fatal: it keeps running for cron and housekeeping (upstream #5196).
 # See #51228.
 GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 
