@@ -3,8 +3,13 @@ before the model sees them, and the per-turn voice-first instruction."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import os
+import stat
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +27,9 @@ from acp.schema import (
 from acp_adapter import voice
 from acp_adapter.content import _content_blocks_to_openai_user_content, audio_attachments
 from acp_adapter.server import HermesACPAgent
-from acp_adapter.session import SessionManager, _expand_acp_enabled_toolsets, default_acp_toolsets
+from acp_adapter.session import (
+    QueuedPrompt, SessionManager, _expand_acp_enabled_toolsets, default_acp_toolsets,
+)
 from gateway.run_inbound import _EMPTY_TRANSCRIPT_NOTE, transcribe_clip
 from tools import tts_tool
 
@@ -76,6 +83,16 @@ def config(monkeypatch):
     return data
 
 
+@pytest.fixture
+def audio_cache(tmp_path, monkeypatch):
+    """Redirect the profile audio cache (where embedded clips are materialized) into tmp_path."""
+    from gateway.platforms import base
+
+    cache = tmp_path / "hermes_audio_cache"
+    monkeypatch.setattr(base, "AUDIO_CACHE_DIR", cache)
+    return cache
+
+
 def _agent_with_tts(has_tool=True):
     return SimpleNamespace(valid_tool_names={"text_to_speech", "terminal"} if has_tool else {"terminal"},
                            ephemeral_system_prompt=None)
@@ -87,12 +104,15 @@ def _agent_with_tts(has_tool=True):
 
 
 class TestToolset:
-    def test_hermes_acp_carries_text_to_speech(self):
+    def test_hermes_acp_itself_is_unchanged_by_the_voice_work(self):
+        """text_to_speech rides in on the separate ``tts`` toolset, not on hermes-acp, so every
+        other consumer of hermes-acp sees the list it always had."""
         from toolsets import TOOLSETS
 
         tools = TOOLSETS["hermes-acp"]["tools"]
-        assert "text_to_speech" in tools
+        assert "text_to_speech" not in tools
         assert "clarify" not in tools and "send_message" not in tools
+        assert TOOLSETS["tts"]["tools"] == ["text_to_speech"]
 
     def test_text_to_speech_dropped_when_no_tts_provider(self, monkeypatch):
         """The tool's check_fn is the gate: unconfigured TTS means no tool in the ACP list."""
@@ -104,17 +124,23 @@ class TestToolset:
         monkeypatch.setattr(tts_tool, "_resolve_provider_key", lambda *_a, **_k: None)
         assert tts_tool.check_tts_requirements() is False
 
-    def test_default_toolsets_is_hermes_acp_without_config(self):
-        assert default_acp_toolsets({}) == ["hermes-acp"]
-        assert default_acp_toolsets({"acp": {"toolsets": []}}) == ["hermes-acp"]
+    def test_acp_sessions_get_tts_on_top_by_default(self):
+        assert default_acp_toolsets({}) == ["hermes-acp", "tts"]
+        assert default_acp_toolsets({"acp": {"toolsets": []}}) == ["hermes-acp", "tts"]
+
+    def test_acp_tts_false_opts_out(self):
+        assert default_acp_toolsets({"acp": {"tts": False}}) == ["hermes-acp"]
+        assert default_acp_toolsets({"acp": {"tts": False, "toolsets": ["coding"]}}) == ["coding"]
+        # Any other value keeps the default on; only an explicit false opts out.
+        assert default_acp_toolsets({"acp": {"tts": True}}) == ["hermes-acp", "tts"]
 
     def test_acp_toolsets_override(self):
         assert default_acp_toolsets({"acp": {"toolsets": ["hermes-acp", "tts"]}}) == ["hermes-acp", "tts"]
-        assert default_acp_toolsets({"acp": {"toolsets": "coding"}}) == ["coding"]
+        assert default_acp_toolsets({"acp": {"toolsets": "coding"}}) == ["coding", "tts"]
 
     def test_expand_uses_configured_default(self, config):
         config["acp"]["toolsets"] = ["coding"]
-        assert _expand_acp_enabled_toolsets(None, mcp_server_names=["srv"]) == ["coding", "mcp-srv"]
+        assert _expand_acp_enabled_toolsets(None, mcp_server_names=["srv"]) == ["coding", "tts", "mcp-srv"]
         assert _expand_acp_enabled_toolsets(["hermes-acp"]) == ["hermes-acp"]
 
 
@@ -163,13 +189,78 @@ class TestDetection:
         assert content.endswith("listen")
 
     def test_audio_notes_lead_the_payload(self, tmp_path):
+        """One separator: what is persisted as the user message and what the model sees agree."""
         link = _link(_ogg(tmp_path))
-        content = _content_blocks_to_openai_user_content(
-            [TextContentBlock(type="text", text="what did I say"), link], audio_notes={1: '"hello there"'})
-        assert content == '"hello there"\nwhat did I say'
+        blocks = [TextContentBlock(type="text", text="what did I say"), link]
+        content = _content_blocks_to_openai_user_content(blocks, audio_notes={1: '"hello there"'})
+        assert content == '"hello there"\n\nwhat did I say'
+        turn = voice.VoiceTurn(audio_notes={1: '"hello there"'})
+        assert turn.prompt_text("what did I say") == content
 
     def test_text_only_prompt_unchanged(self):
         assert _content_blocks_to_openai_user_content([TextContentBlock(type="text", text="/help")]) == "/help"
+
+    def test_octet_stream_does_not_beat_an_audio_extension(self, tmp_path):
+        """A host that labels its blob application/octet-stream must not send a voice note down
+        the binary-omitted path."""
+        clip = _ogg(tmp_path, "voice-note.ogg")
+        [att] = audio_attachments([_link(clip, mime="application/octet-stream")])
+        assert att.mime == "audio/ogg" and att.path == clip
+
+    def test_extension_only_classification_checks_the_magic_bytes(self, tmp_path):
+        """A text file named .wav is not audio, so it is never uploaded to STT unsniffed."""
+        fake = tmp_path / "notes.wav"
+        fake.write_text("dear diary, this is not a wav", encoding="utf-8")
+        assert audio_attachments([_link(fake, mime=None)]) == []
+        content = _content_blocks_to_openai_user_content([_link(fake, mime=None)])
+        assert "dear diary" in content
+        # A real container with the same extension-only link still classifies as audio.
+        real = tmp_path / "real.wav"
+        real.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+        assert [a.mime for a in audio_attachments([_link(real, mime=None)])] == ["audio/wav"]
+
+    def test_extension_only_link_to_a_missing_file_stays_audio(self, tmp_path):
+        """Nothing to sniff: keep the extension's verdict so the note names the missing clip."""
+        ghost = tmp_path / "gone.ogg"
+        assert [a.mime for a in audio_attachments([_link(ghost, mime=None)])] == ["audio/ogg"]
+
+    def test_an_explicit_audio_mime_still_wins_without_sniffing(self, tmp_path):
+        notes = tmp_path / "clip.ogg"
+        notes.write_text("not really ogg", encoding="utf-8")
+        assert [a.mime for a in audio_attachments([_link(notes, mime="audio/ogg")])] == ["audio/ogg"]
+
+
+class TestBase64Payloads:
+    """``b64decode(validate=True)`` rejects line-wrapped and URL-safe base64; the old fallback
+    encoded the base64 *text* as the clip and uploaded that to the STT provider."""
+
+    def _block(self, blob):
+        return AudioContentBlock(type="audio", data=blob, mimeType="audio/ogg")
+
+    def test_line_wrapped_base64_decodes_to_the_real_bytes(self):
+        wrapped = base64.encodebytes(OGG_BYTES).decode()
+        assert "\n" in wrapped
+        [att] = audio_attachments([self._block(wrapped)])
+        assert att.data == OGG_BYTES
+
+    def test_urlsafe_alphabet_decodes_to_the_real_bytes(self):
+        payload = b"\xfb\xff" + OGG_BYTES
+        urlsafe = base64.urlsafe_b64encode(payload).decode()
+        assert "-" in urlsafe or "_" in urlsafe
+        [att] = audio_attachments([self._block(urlsafe)])
+        assert att.data == payload
+
+    def test_non_base64_is_refused_rather_than_treated_as_audio(self):
+        [att] = audio_attachments([self._block("this is not base64 at all!!")])
+        assert att.data is None
+
+    @pytest.mark.asyncio
+    async def test_non_base64_never_reaches_stt_or_disk(self, tmp_path, stt, config, audio_cache):
+        turn = await voice.prepare_voice_turn(
+            [self._block("this is not base64 at all!!")], cwd=str(tmp_path), agent=_agent_with_tts())
+        assert stt.calls == [] and turn.temp_paths == []
+        assert "could not be read" in turn.audio_notes[0]
+        assert not audio_cache.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -245,36 +336,109 @@ class TestPrepareVoiceTurn:
         turn = await voice.prepare_voice_turn([_link(clip)], cwd=str(tmp_path / "project"), agent=_agent_with_tts())
         assert stt.calls == [(str(clip), "acp")]
 
+
+# ---------------------------------------------------------------------------
+# (1) Embedded clips: the gateway audio cache, private, cleaned on every exit
+# ---------------------------------------------------------------------------
+
+
+def _blob_block(data=OGG_BYTES, mime="audio/ogg"):
+    return AudioContentBlock(type="audio", data=base64.b64encode(data).decode(), mimeType=mime)
+
+
+class TestEmbeddedClipFiles:
     @pytest.mark.asyncio
-    async def test_embedded_blob_is_materialized_then_cleaned(self, tmp_path, stt, config, monkeypatch):
-        monkeypatch.setattr(voice.tempfile, "gettempdir", lambda: str(tmp_path))
-        block = AudioContentBlock(type="audio", data=base64.b64encode(OGG_BYTES).decode(), mimeType="audio/ogg")
-        turn = await voice.prepare_voice_turn([block], cwd=str(tmp_path), agent=_agent_with_tts())
+    async def test_materialized_into_the_audio_cache_and_cleaned(self, tmp_path, stt, config, audio_cache):
+        """Reuses the gateway helper (issue #29): under HERMES_HOME, so the agent-visible path
+        mapping and the cache sweep both reach it, and container-sniffed for its extension."""
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
         [(path, _)] = stt.calls
-        assert path.startswith(str(tmp_path / "hermes_voice" / "acp_in_")) and path.endswith(".ogg")
+        assert Path(path).parent == audio_cache and path.endswith(".ogg")
         assert turn.temp_paths == [path]
         voice.cleanup_voice_turn(turn)
-        assert not (tmp_path / "hermes_voice").joinpath(path.split("/")[-1]).exists()
+        assert not Path(path).exists()
 
     @pytest.mark.asyncio
-    async def test_failed_embedded_blob_keeps_file_named_in_note(self, tmp_path, stt, config, monkeypatch):
-        monkeypatch.setattr(voice.tempfile, "gettempdir", lambda: str(tmp_path))
-        stt.result = {"success": False, "error": "boom"}
-        block = AudioContentBlock(type="audio", data=base64.b64encode(OGG_BYTES).decode(), mimeType="audio/ogg")
-        turn = await voice.prepare_voice_turn([block], cwd=str(tmp_path), agent=_agent_with_tts())
+    async def test_clip_is_owner_only(self, tmp_path, stt, config, audio_cache):
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
         [path] = turn.temp_paths
-        voice.cleanup_voice_turn(turn)
-        assert (tmp_path / "hermes_voice" / path.split("/")[-1]).exists()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
     @pytest.mark.asyncio
-    async def test_oversized_embedded_blob_never_hits_disk(self, tmp_path, stt, config, monkeypatch):
+    async def test_extension_comes_from_the_bytes_not_the_declared_mime(self, tmp_path, stt, config, audio_cache):
+        """The gateway cache sniffs the container, so a mislabelled voice note still lands as
+        something STT and players can read."""
+        turn = await voice.prepare_voice_turn(
+            [_blob_block(mime="audio/wav")], cwd=str(tmp_path), agent=_agent_with_tts())
+        assert turn.temp_paths[0].endswith(".ogg")
+
+    @pytest.mark.asyncio
+    async def test_failed_transcript_keeps_the_file_the_note_names(self, tmp_path, stt, config, audio_cache):
+        stt.result = {"success": False, "error": "boom"}
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        [path] = turn.temp_paths
+        assert turn.keep_paths == {path}
+        voice.cleanup_voice_turn(turn)
+        assert Path(path).exists()
+        # ...but a turn that never delivered the note takes it with it.
+        voice.cleanup_voice_turn(turn, force=True)
+        assert not Path(path).exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_names_no_file_so_the_clip_goes(self, tmp_path, stt, config, audio_cache):
+        stt.result = {"success": True, "transcript": "  "}
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        [path] = turn.temp_paths
+        assert turn.keep_paths == set()
+        voice.cleanup_voice_turn(turn)
+        assert not Path(path).exists()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_stt_leaves_nothing_behind(
+        self, tmp_path, stt, config, audio_cache, monkeypatch
+    ):
+        """Host disconnect mid-transcription: the VoiceTurn holding the path is discarded, so
+        prepare_voice_turn has to clean up before the CancelledError propagates."""
+        from tools import transcription_tools
+
+        written: list[str] = []
+
+        def _cancel(path, model=None, source=None):
+            written.append(path)
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        assert written and not Path(written[0]).exists()
+        assert list(audio_cache.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_cleanup_is_idempotent(self, tmp_path, stt, config, audio_cache):
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        voice.cleanup_voice_turn(turn)
+        voice.cleanup_voice_turn(turn)
+        assert turn.temp_paths == []
+
+    @pytest.mark.asyncio
+    async def test_oversized_embedded_blob_never_hits_disk(self, tmp_path, stt, config, audio_cache, monkeypatch):
         monkeypatch.setattr(voice, "_MAX_EMBEDDED_AUDIO_BYTES", 16)
-        monkeypatch.setattr(voice.tempfile, "gettempdir", lambda: str(tmp_path))
-        block = AudioContentBlock(type="audio", data=base64.b64encode(OGG_BYTES).decode(), mimeType="audio/ogg")
-        turn = await voice.prepare_voice_turn([block], cwd=str(tmp_path), agent=_agent_with_tts())
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
         assert stt.calls == [] and turn.temp_paths == []
         assert "too large" in turn.audio_notes[0]
-        assert not (tmp_path / "hermes_voice").exists()
+        assert not audio_cache.exists()
+
+    @pytest.mark.asyncio
+    async def test_write_failure_is_a_note_not_a_broken_turn(self, tmp_path, stt, config, monkeypatch):
+        from gateway.platforms import base
+
+        async def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(base, "cache_audio_from_bytes_async", _boom)
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        assert stt.calls == [] and turn.temp_paths == []
+        assert "could not be read" in turn.audio_notes[0]
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +481,22 @@ class TestVoiceReply:
         assert voice.voice_output_dir(str(tmp_path), {}) == str(tmp_path / "voice")
         assert voice.voice_output_dir(str(tmp_path), {"acp": {"voice_dir": "out/audio"}}) == str(tmp_path / "out" / "audio")
         assert voice.voice_output_dir(str(tmp_path), {"acp": {"voice_dir": ""}}) is None
+
+    def test_spaced_cwd_falls_back_to_the_audio_cache_with_a_warning(self, tmp_path, audio_cache, caplog):
+        """A MEDIA: path is read up to the first space, so `~/Documents/My Project/voice` could
+        never be published; bind a directory that can be, and say why."""
         spaced = tmp_path / "my project"
-        assert voice.voice_output_dir(str(spaced), {}) is None
+        with caplog.at_level("WARNING", logger="acp_adapter.server"):
+            bound = voice.voice_output_dir(str(spaced), {})
+        assert bound == str(audio_cache)
+        assert " " not in bound
+        assert any("whitespace" in r.getMessage() for r in caplog.records)
+
+    def test_spaced_cache_fallback_gives_up_rather_than_binding_it(self, tmp_path, monkeypatch):
+        from gateway.platforms import base
+
+        monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path / "cache dir")
+        assert voice.voice_output_dir(str(tmp_path / "my project"), {}) is None
 
     def test_instruction_names_tool_and_media_line(self):
         text = voice.voice_reply_instruction("/work/voice")
@@ -346,6 +524,23 @@ class TestVoiceReply:
         restore = voice.bind_voice_turn(agent, voice.VoiceTurn(voice_reply=False))
         assert agent.ephemeral_system_prompt is None
         restore()
+
+    def test_partial_bind_leaves_nothing_attached(self, tmp_path, monkeypatch):
+        """The caller's ExitStack never sees a bind that raised, so bind_voice_turn has to undo
+        its own half: otherwise the VOICE TURN text stays on the agent for later text turns."""
+        class _Agent:
+            ephemeral_system_prompt = "keep me"
+
+            def __setattr__(self, name, value):
+                raise RuntimeError("agent rejected the ephemeral prompt")
+
+        agent = _Agent()
+        turn = voice.VoiceTurn(voice_reply=True, output_dir=str(tmp_path / "voice"))
+        before = tts_tool._default_output_dir()
+        with pytest.raises(RuntimeError):
+            voice.bind_voice_turn(agent, turn)
+        assert agent.ephemeral_system_prompt == "keep me"
+        assert tts_tool._default_output_dir() == before
 
     def test_explicit_output_path_still_wins_over_bound_dir(self, tmp_path):
         token = tts_tool.set_tts_output_dir(str(tmp_path / "voice"))
@@ -423,8 +618,8 @@ class TestPromptIntegration:
         clip = _ogg(tmp_path)
         seen = await self._drive([_link(clip), TextContentBlock(type="text", text="what did I say")], tmp_path)
         assert stt.calls == [(str(clip), "acp")]
-        assert seen["user_message"] == '"what did I say"\nwhat did I say'
-        assert seen["persist"] == '"what did I say"\n\nwhat did I say'
+        assert seen["user_message"] == '"what did I say"\n\nwhat did I say'
+        assert seen["persist"] == seen["user_message"]
         assert "VOICE TURN" in seen["ephemeral"] and "text_to_speech" in seen["ephemeral"]
         assert seen["tts_dir"] == str(tmp_path / "voice")
         assert seen["ephemeral_after"] is None
@@ -449,6 +644,41 @@ class TestPromptIntegration:
         assert seen["ephemeral"] is None and seen["tts_dir"] != str(tmp_path / "voice")
 
     @pytest.mark.asyncio
+    async def test_embedded_clip_is_gone_when_the_turn_ends(self, tmp_path, stt, config, audio_cache):
+        seen = await self._drive([_blob_block()], tmp_path)
+        assert seen["user_message"] == '"what did I say"'
+        assert list(audio_cache.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_prompt_leaves_no_clip_behind(self, tmp_path, stt, config, audio_cache, monkeypatch):
+        """Host disconnect while STT is running: the prompt task is cancelled and the VoiceTurn
+        holding the path is discarded, so the clip has to be removed on the way out."""
+        from tools import transcription_tools
+
+        started, release = threading.Event(), threading.Event()
+
+        def _hang(path, model=None, source=None):
+            started.set()
+            release.wait(5)
+            return {"success": True, "transcript": "never delivered"}
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", _hang)
+        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+        server = HermesACPAgent(session_manager=manager)
+        resp = await server.new_session(cwd=str(tmp_path))
+        server._conn = None
+
+        task = asyncio.create_task(server.prompt(prompt=[_blob_block()], session_id=resp.session_id))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        assert len(list(audio_cache.iterdir())) == 1  # written, STT in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert list(audio_cache.iterdir()) == []
+        release.set()
+
+    @pytest.mark.asyncio
     async def test_stt_exception_does_not_break_the_turn(self, tmp_path, stt, config, monkeypatch):
         from tools import transcription_tools
 
@@ -461,6 +691,69 @@ class TestPromptIntegration:
         assert seen["user_message"].endswith("hello")
         assert "could not be transcribed" in seen["user_message"]
         assert "VOICE TURN" in seen["ephemeral"]
+
+
+class TestQueuedVoiceNote:
+    """A voice note that arrives while the session is busy is transcribed and queued as text; the
+    replay must still answer voice-first, or the user gets a text reply to a voice message."""
+
+    @pytest.mark.asyncio
+    async def test_queue_entry_carries_the_voice_flag(self, tmp_path, stt, config):
+        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+        server = HermesACPAgent(session_manager=manager)
+        resp = await server.new_session(cwd=str(tmp_path))
+        state = manager.get_session(resp.session_id)
+        state.agent.valid_tool_names = {"text_to_speech"}
+        state.agent.ephemeral_system_prompt = None
+        state.is_running = True  # a turn is already in flight
+        conn = MagicMock(spec=acp.Client)
+        conn.session_update = AsyncMock()
+        server._conn = conn
+
+        await server.prompt(prompt=[_link(_ogg(tmp_path))], session_id=resp.session_id)
+        assert state.queued_prompts == [QueuedPrompt('"what did I say"', voice=True)]
+
+    def test_slash_queue_stays_a_text_turn(self):
+        from acp_adapter.commands import _queue_prompt
+
+        state = SimpleNamespace(runtime_lock=threading.Lock(), queued_prompts=[])
+        _queue_prompt(state, "type this out")
+        assert state.queued_prompts == [QueuedPrompt("type this out", voice=False)]
+
+    @pytest.mark.asyncio
+    async def test_replay_rebinds_the_voice_first_instruction(self, tmp_path, stt, config):
+        """The replayed prompt is a plain TextContentBlock, so the flag is the only carrier."""
+        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+        server = HermesACPAgent(session_manager=manager)
+        resp = await server.new_session(cwd=str(tmp_path))
+        state = manager.get_session(resp.session_id)
+        seen = {}
+
+        def _run(*_args, **kwargs):
+            seen["user_message"] = kwargs.get("user_message")
+            seen["ephemeral"] = state.agent.ephemeral_system_prompt
+            seen["tts_dir"] = tts_tool._default_output_dir()
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model, state.agent.provider = "test-model", "openrouter"
+        state.agent.ephemeral_system_prompt = None
+        state.agent.valid_tool_names = {"text_to_speech", "terminal"}
+        conn = MagicMock(spec=acp.Client)
+        conn.session_update = AsyncMock()
+        server._conn = conn
+
+        await server.prompt(prompt=[TextContentBlock(type="text", text='"second note"')],
+                            session_id=resp.session_id, queued_voice=True)
+        assert seen["user_message"] == '"second note"'
+        assert "VOICE TURN" in seen["ephemeral"]
+        assert seen["tts_dir"] == str(tmp_path / "voice")
+        assert state.agent.ephemeral_system_prompt is None
+
+    def test_replay_turn_is_none_when_the_session_would_not_speak(self, tmp_path, config):
+        assert voice.replay_voice_turn(cwd=str(tmp_path), agent=_agent_with_tts(has_tool=False)) is None
+        config["voice"]["auto_tts"] = False
+        assert voice.replay_voice_turn(cwd=str(tmp_path), agent=_agent_with_tts()) is None
 
 
 def test_tts_tool_result_reports_media_path():
