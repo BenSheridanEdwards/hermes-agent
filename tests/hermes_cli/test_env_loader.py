@@ -1085,22 +1085,32 @@ def test_acp_hosted_managed_env_still_beats_host(tmp_path, monkeypatch):
 def test_acp_hosted_beats_an_override_existing_secret_source(tmp_path, monkeypatch):
     """A profile mapping BUZZ_PRIVATE_KEY from a vault with override_existing:
     true writes over a pre-existing env value, so the restore has to run after
-    external secret sources, not only after the dotenv loads."""
+    external secret sources, not only after the dotenv loads.
+
+    The same hook is the reader probe for the other end of the window. Nothing
+    outside the loader takes the ACP lock: the Buzz plugin signing a kind-22242
+    event, _sanitize_subprocess_env and hermes_subprocess_env all read
+    os.environ directly. A restore that only ran at the tail would leave the
+    profile's key visible across the project .env load and this vault round
+    trip, so the host value has to be back in place by the time this runs."""
     import hermes_cli.env_loader as env_loader
 
     home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
     _clear_buzz_env(monkeypatch)
     monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
     monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
-    monkeypatch.setattr(
-        env_loader,
-        "_apply_external_secret_sources",
-        lambda _home: os.environ.__setitem__("BUZZ_PRIVATE_KEY", "vault-key"),
-    )
+    seen_mid_window: list = []
+
+    def vault_fetch(_home):
+        seen_mid_window.append(os.environ.get("BUZZ_PRIVATE_KEY"))
+        os.environ["BUZZ_PRIVATE_KEY"] = "vault-key"
+
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", vault_fetch)
     _mark_acp_hosted(monkeypatch, env_loader)
 
     load_hermes_dotenv(hermes_home=home)
 
+    assert seen_mid_window == ["managed-key"]
     assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
 
 
@@ -1113,11 +1123,10 @@ def test_dotenv_key_scanner_ignores_multi_line_quoted_values(tmp_path):
 
     env_file = tmp_path / ".env"
     env_file.write_text(
-        'BUZZ_AUTH_TAG=\'{\n'
-        '  "kind": 22242,\n'
-        '  "BUZZ_RELAY_URL": "ws://not-an-assignment"\n'
-        '}\'\n'
-        'HERMES_ACP_AUTH_METHOD=cursor_login\n'
+        "BUZZ_AUTH_TAG='kind=22242\n"
+        "BUZZ_RELAY_URL=ws://inside-the-quoted-value\n"
+        "end'\n"
+        "HERMES_ACP_AUTH_METHOD=cursor_login\n"
         'BUZZ_PRIVATE_KEY="single-line"\n',
         encoding="utf-8",
     )
