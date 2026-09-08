@@ -75,8 +75,9 @@ def _load_env() -> None:
     """Load .env from HERMES_HOME (default ``~/.hermes``) in ACP-hosted mode.
 
     The host process (editor or agent harness) owns this agent's identity and passes it in as env
-    (``HERMES_HOME``, ``BUZZ_*``); ``mark_acp_hosted`` makes every dotenv load in this process keep those
-    values over the profile's ``.env`` instead of letting the file override them (see env_loader)."""
+    (``HERMES_HOME``, and ``BUZZ_*`` when it is Buzz Desktop's managed-agent harness);
+    ``mark_acp_hosted`` snapshots those here, before the first load, so no dotenv load in this process
+    (including the ones on background MCP-discovery threads) can override them (see env_loader)."""
     from hermes_cli.env_loader import load_hermes_dotenv, mark_acp_hosted
 
     mark_acp_hosted()
