@@ -222,12 +222,16 @@ def test_ambiguous_bot_chat_receipt_does_not_log_the_body(
 
 
 @pytest.fixture
-def gateway_mode_logging(tmp_path):
-    """Real file logging in gateway mode, torn down after the test (see test_hermes_logging.py)."""
+def gateway_mode_logging():
+    """Real file logging in gateway mode, torn down after the test (see test_hermes_logging.py).
+
+    The home directory comes from ``HERMES_HOME``, which the autouse ``_hermetic_environment``
+    fixture already points at a per-test temporary directory."""
     home = Path(os.environ["HERMES_HOME"])
     root = logging.getLogger()
     pre_existing = list(root.handlers)
     prev_level = root.level
+    prev_initialized = hermes_logging._logging_initialized
     hermes_logging._logging_initialized = False
     hermes_logging._reset_queued_handlers()
     log_dir = hermes_logging.setup_logging(hermes_home=home, mode="gateway", force=True)
@@ -240,7 +244,7 @@ def gateway_mode_logging(tmp_path):
                 root.removeHandler(handler)
                 handler.close()
         root.setLevel(prev_level)
-        hermes_logging._logging_initialized = False
+        hermes_logging._logging_initialized = prev_initialized
 
 
 def test_undelivered_output_lands_in_agent_log_not_gateway_log(gateway_mode_logging):
@@ -378,3 +382,28 @@ def test_a_delivered_co_target_suppresses_the_body_for_a_failed_one(
     assert not any("output not delivered" in m for m in _messages(caplog))
 
 
+def test_component_cron_filter_shows_the_header_but_drops_the_body(gateway_mode_logging):
+    """Why the docs point operators at plain ``hermes logs`` and not ``--component cron``.
+
+    ``hermes logs`` filters line by line and ``_line_matches_component`` needs a logger name on
+    the line. This record is multi line: only the header carries the name, so a component filter
+    prints the announcement and hides the output it announces. The docs used to recommend exactly
+    that command. Run against real formatted lines so a format change cannot make this vacuous."""
+    from hermes_cli import logs as cli_logs
+    from hermes_logging import COMPONENT_PREFIXES
+
+    sched_delivery._log_undelivered_output(
+        {"id": "j-doc"}, "nightly brief\nall quiet on the fleet",
+        ["platform 'telegram' not configured/enabled"])
+    hermes_logging.flush_log_queue()
+
+    lines = (gateway_mode_logging / "agent.log").read_text().splitlines()
+    header = next(l for l in lines if "output not delivered to any target" in l)
+    body = next(l for l in lines if l.strip() == "all quiet on the fleet")
+
+    prefixes = COMPONENT_PREFIXES["cron"]
+    assert cli_logs._line_matches_component(header, prefixes) is True
+    assert cli_logs._line_matches_component(body, prefixes) is False
+    # Unfiltered and level-filtered reads keep both: lines without a level pass the level filter.
+    assert cli_logs._matches_filters(body) is True
+    assert cli_logs._matches_filters(body, min_level="INFO") is True
