@@ -773,7 +773,7 @@ def _is_voice_note(filename: str, mime_type: str) -> bool:
 class _VoiceNoteMedia(CachedMedia):
     """A cached voice note: speech the gateway should transcribe, unlike an ordinary audio attachment.
 
-    The media cache names files by content, so the ``voice-note-`` marker survives only as this type.
+    The media cache renames every file to a fresh UUID, so the ``voice-note-`` marker survives only as this type.
     """
 
     @classmethod
@@ -2324,10 +2324,12 @@ class BuzzAdapter(BasePlatformAdapter):
         # Same-relay URL refs are localized in addition to the caller's imeta attachments (both explicit-True gated).
         localized = await self._localize_inbound_media(text, message_id, user_id=user_id, chat_type=chat_type, chat_id=chat_id)
         text, localized_urls, localized_types, localized_type = localized
-        # The media cache names files by content, not by source, so one blob referenced both by imeta and by its
-        # URL in the text lands twice under different names. Keep the first copy only: a voice note that appeared
-        # twice would be transcribed twice, and a lone duplicate must not turn VOICE into a mixed DOCUMENT.
-        known_digests = {await asyncio.to_thread(_content_digest, path) for path in media_urls}
+        # The media cache renames every file to a fresh UUID, so one blob referenced both by imeta and by its URL
+        # in the text lands twice under names that never match. Compare content digests instead and keep the
+        # first copy only: a voice note that appeared twice would be transcribed twice, and a lone duplicate
+        # must not turn VOICE into a mixed DOCUMENT. Nothing to compare against when the text contributed no
+        # media, which is the common case, so skip the hashing entirely there.
+        known_digests = {await asyncio.to_thread(_content_digest, path) for path in media_urls} if localized_urls else set()
         distinct_localized: List[str] = []
         for path, mime in zip(localized_urls, localized_types):
             digest = await asyncio.to_thread(_content_digest, path)
