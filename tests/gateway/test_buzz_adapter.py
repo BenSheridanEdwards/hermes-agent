@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2634,6 +2635,33 @@ class TestVoiceNoteDelivery:
         assert await adapter._relay_supports_audio() is False
         assert adapter._audio_extension_cache[0] is False
 
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_follows_a_redirect_to_https(self, monkeypatch):
+        """An http:// relay URL that 301s to https must not cache "no audio" for the whole TTL."""
+        import httpx
+
+        nip11 = _nip11(["buzz-audio"])
+
+        def handler(request):
+            if request.url.scheme == "http":
+                return httpx.Response(301, headers={"location": "https://test.relay/"})
+            return nip11(request)
+
+        requests = _mock_http(monkeypatch, handler)
+        adapter = _make_adapter({"relay_url": "http://test.relay"})
+
+        assert await adapter._relay_supports_audio() is True
+        assert [r.url.scheme for r in requests] == ["http", "https"]
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_survives_a_non_object_nip11_body(self, monkeypatch):
+        import httpx
+
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, json=["buzz-audio"]))
+        adapter = _make_adapter()
+
+        assert await adapter._relay_supports_audio() is False
+
     def test_blossom_auth_header_is_signed_upload_event(self):
         adapter = _make_adapter({"relay_url": "wss://test.relay:8443/relay"})
         adapter._private_key = TEST_PRIVATE_KEY
@@ -2718,7 +2746,7 @@ class TestVoiceNoteDelivery:
             "size 10",
             "duration 3.2",
             "filename voice-note-7.mp3",
-            "alt hellothere\nfriend",
+            "alt hello there\nfriend",  # the tab becomes a space; the NUL is dropped
         ]
         assert "alt" not in " ".join(BuzzAdapter._voice_note_imeta({"url": "u"}, "voice-note-8.mp4", "video/mp4", "  "))
 
@@ -2882,6 +2910,9 @@ class TestVoiceNoteDelivery:
         assert "alt spoken words" in event["tags"][1]
         assert event["tags"][2] == ["e", "root", "", "reply"]
         assert event["id"] in adapter._channel_state[CHANNEL]["seen"]
+        # Parity with send(): without the meta row a thread reply to the card alone would not read as a
+        # reply to our own message in a require_mention channel, because our own relay echo is suppressed.
+        assert adapter._channel_state[CHANNEL]["event_meta"][event["id"]] == (SELF_PUBKEY, event["content"])
 
     @pytest.mark.asyncio
     async def test_publish_voice_note_reports_relay_rejection(self, monkeypatch):
@@ -2923,10 +2954,26 @@ class TestVoiceNoteDelivery:
 
         skipped_text = await adapter._play_tts_file(event, "spoken reply", "/tmp/tts.mp3", True, {"thread_id": "root"}, deliveries.append)
 
+        # False on purpose: the text reply keeps going out on its own, through send(), which is the only
+        # path with mention resolution and length chunking. A caption would lose both, and would lose the
+        # text entirely whenever the voice paths degrade to a plain file attachment.
         assert skipped_text is False
         assert deliveries[0].message_id == "evt-tts"
         adapter.send_voice.assert_awaited_once_with(
             chat_id=CHANNEL, audio_path="/tmp/tts.mp3", metadata={"thread_id": "root", "transcript": "spoken reply"})
+
+    @pytest.mark.asyncio
+    async def test_play_tts_file_transcribes_the_first_chunk_only(self):
+        """A reply split into several TTS files must not repeat the whole transcript under every card."""
+        adapter = _make_adapter()
+        adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="evt-tts"))
+        event = SimpleNamespace(source=SimpleNamespace(chat_id=CHANNEL))
+
+        await adapter._play_tts_file(event, "spoken reply", "/tmp/a.mp3", True, {}, lambda _r: None)
+        await adapter._play_tts_file(event, "spoken reply", "/tmp/b.mp3", False, {}, lambda _r: None)
+
+        metadatas = [call.kwargs["metadata"] for call in adapter.send_voice.await_args_list]
+        assert metadatas == [{"transcript": "spoken reply"}, {}]
 
     def test_mp3_conversion_copies_mp3_frames_and_reencodes_other_formats(self, monkeypatch, tmp_path):
         calls = _fake_ffmpeg(monkeypatch)
@@ -2947,12 +2994,155 @@ class TestVoiceNoteDelivery:
         assert _buzz_mod._convert_audio_to_clean_mp3(tmp_path / "missing.mp3") is None
 
     def test_ffmpeg_failure_yields_no_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         _fake_ffmpeg(monkeypatch, returncode=1)
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"x")
 
         assert _buzz_mod._convert_audio_to_clean_mp3(src) is None
         assert _buzz_mod._wrap_audio_in_voice_note_envelope(src) is None
+        # The mkstemp placeholder goes too; a failed transcode must not leave an empty file behind.
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    def test_converted_voice_files_get_unique_names(self, monkeypatch, tmp_path):
+        """Millisecond stamps collide across the gateways sharing this host's temp dir; mkstemp names cannot."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"x")
+
+        names = {_buzz_mod._convert_audio_to_clean_mp3(src).name for _ in range(5)}
+        names |= {_buzz_mod._wrap_audio_in_voice_note_envelope(src).name for _ in range(5)}
+
+        assert len(names) == 10
+        assert all(n.startswith(_buzz_mod._VOICE_NOTE_PREFIX) for n in names)
+        assert sorted(n[-4:] for n in names) == [".mp3"] * 5 + [".mp4"] * 5
+
+    def test_ffmpeg_lookup_prefers_the_env_override_then_path(self, monkeypatch, tmp_path):
+        """No hard-coded Homebrew path: BUZZ_FFMPEG_PATH wins, then PATH, then the usual install roots."""
+        override = tmp_path / "custom-ffmpeg"
+        override.write_bytes(b"#!/bin/sh\n")
+        on_path = tmp_path / "path-ffmpeg"
+        on_path.write_bytes(b"#!/bin/sh\n")
+        monkeypatch.setattr(_buzz_mod.shutil, "which", lambda name: str(on_path))
+
+        monkeypatch.setenv("BUZZ_FFMPEG_PATH", str(override))
+        assert _buzz_mod._ffmpeg_path() == str(override)
+
+        monkeypatch.setenv("BUZZ_FFMPEG_PATH", str(tmp_path / "does-not-exist"))
+        assert _buzz_mod._ffmpeg_path() == str(on_path)
+
+        monkeypatch.delenv("BUZZ_FFMPEG_PATH")
+        monkeypatch.setattr(_buzz_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(_buzz_mod, "_FFMPEG_FALLBACKS", (str(tmp_path / "nope"), str(on_path)))
+        assert _buzz_mod._ffmpeg_path() == str(on_path)
+
+        monkeypatch.setattr(_buzz_mod, "_FFMPEG_FALLBACKS", ())
+        assert _buzz_mod._ffmpeg_path() is None
+
+    @pytest.mark.asyncio
+    async def test_send_voice_unlinks_every_converted_file(self, monkeypatch, tmp_path):
+        """Auto-TTS runs on every voice turn across every gateway; the scratch dir must not grow."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        uploaded = []
+
+        async def upload(path, mime):
+            uploaded.append((Path(path).name, Path(path).is_file()))
+            return {"url": "https://test.relay/media/x.mp3"}, None
+
+        adapter._blossom_upload = upload
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=True, message_id="evt-clean"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True
+        # The file still exists while it is being uploaded, and is gone once send_voice returns.
+        assert len(uploaded) == 1 and uploaded[0][1] is True and uploaded[0][0].startswith(_buzz_mod._VOICE_NOTE_PREFIX)
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_unlinks_scratch_files_on_the_fallback_path(self, monkeypatch, tmp_path):
+        """The re-encode retry, the envelope, and the plain-file fallback all clean up after themselves."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=[(None, "HTTP 422: bad frames"), (None, "HTTP 422: bad frames")])
+        cli = _ScriptedCli()
+        cli.script("upload", "file", {"url": "https://test.relay/media/x.mp4"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=False, error="nope"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert adapter._blossom_upload.await_count == 2  # copied stream, then the re-encode
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_reports_a_signing_failure_instead_of_raising(self, monkeypatch, tmp_path):
+        """send_voice runs inside the gateway's TTS hook, which has no ``except``: a raise drops the text reply."""
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(b"x")
+        adapter = _make_adapter()
+        adapter._private_key = ""
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert desc is None and error.startswith("ValueError")
+
+    @pytest.mark.asyncio
+    async def test_send_voice_returns_a_result_when_the_key_cannot_sign(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._private_key = ""
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        cli = _ScriptedCli()
+        cli.script("upload", "file", {"url": "https://test.relay/media/x.mp4"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=False, error="unsigned"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_resolves_credentials_lazily(self, monkeypatch, tmp_path):
+        """A send that reaches an adapter whose connect() never ran still signs, the way _run_cli does."""
+        import httpx
+
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: TEST_PRIVATE_KEY)
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: '["auth","lazy"]')
+        payload = b"mp3 frames"
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(payload)
+        descriptor = {"url": "https://test.relay/media/x.mp3"}
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, json=descriptor))
+        adapter = _make_adapter()
+        adapter._private_key = adapter._auth_tag = ""
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert (desc, error) == (descriptor, None)
+        assert requests[0].headers["x-auth-tag"] == '["auth","lazy"]'
+        assert _tag_map(_decode_nostr_token(requests[0].headers["authorization"]))["x"] == hashlib.sha256(payload).hexdigest()
 
 
 class TestVoiceNoteInbound:
@@ -3049,6 +3239,20 @@ class TestAttachmentReadAuthorization:
         assert tags["x"] == digest
         assert tags["server"] == "test.relay"
         assert int(tags["expiration"]) > event["created_at"]
+
+    def test_blossom_auth_header_server_tag_drops_userinfo_and_keeps_odd_ports(self):
+        """The relay normalizes scheme, path and default ports away, but not userinfo: never sign it in."""
+        for relay_url, expected in (
+            ("wss://user:pw@test.relay/relay", "test.relay"),
+            ("wss://test.relay:443", "test.relay"),
+            ("https://TEST.Relay./media", "test.relay"),
+            ("wss://test.relay:8443", "test.relay:8443"),
+            ("http://test.relay:8080", "test.relay:8080"),
+        ):
+            adapter = _make_adapter({"relay_url": relay_url})
+            adapter._private_key = TEST_PRIVATE_KEY
+            event = _decode_nostr_token(adapter._blossom_auth_header("cd" * 32))
+            assert _tag_map(event)["server"] == expected, relay_url
 
     def test_request_headers_carry_get_auth_and_owner_tag(self):
         adapter = _make_adapter()
