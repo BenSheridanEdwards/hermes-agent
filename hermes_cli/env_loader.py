@@ -45,6 +45,60 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_CLI_PATH", "COPILOT_ACP_BASE_URL",
 })
 
+# ACP hosting (``hermes acp`` / ``hermes-acp`` under an editor or agent harness such as Buzz Desktop):
+# the host process owns the agent's identity and injects it as env (``HERMES_HOME=<profile>``,
+# ``BUZZ_PRIVATE_KEY=<managed key>``, ``BUZZ_AUTH_TAG``, ``BUZZ_RELAY_URL``). Every gateway-plugin profile
+# also carries its own ``BUZZ_PRIVATE_KEY`` in ``.env``, so the override=True load below used to replace
+# the managed key, the agent signed as the wrong identity and every relay send failed auth-tag
+# verification. While ACP-hosted these keys keep the value the host passed in; ``.env`` only fills gaps.
+#
+# Deliberately a narrow, documented set rather than a blanket override=False: editor hosts (Zed, VS Code)
+# hand Hermes the user's login-shell env, so "host wins for everything" would let a stale
+# ``OPENAI_API_KEY`` export beat the ``.env`` written by ``hermes setup``, the exact thing override=True
+# exists to prevent. The managed-scope ``.env`` (admin lockdown) still beats the host. An empty host value
+# counts as "not provided" and may be filled from ``.env``.
+_ACP_HOST_OWNED_ENV_KEYS: frozenset[str] = frozenset({"HERMES_HOME"})
+_ACP_HOST_OWNED_ENV_PREFIXES: tuple[str, ...] = ("BUZZ_",)
+_ACP_HOSTED = False  # set once per process by mark_acp_hosted(); never cleared outside tests
+
+
+def mark_acp_hosted(enabled: bool = True) -> None:
+    """Flag this process as ACP-hosted so every later :func:`load_hermes_dotenv` keeps host-owned env
+    (``_ACP_HOST_OWNED_ENV_KEYS`` / ``_ACP_HOST_OWNED_ENV_PREFIXES``) over the profile's ``.env``.
+
+    Called by ``acp_adapter.entry`` before its first load and by ``hermes_cli.main`` when the subcommand is
+    ``acp`` (its import-time load runs before the subcommand dispatches). Process-wide on purpose:
+    ``run_agent`` and lazy MCP loads call :func:`load_hermes_dotenv` again later in the same process and
+    would otherwise re-clobber the host's values."""
+    global _ACP_HOSTED
+    _ACP_HOSTED = bool(enabled)
+
+
+def is_acp_hosted() -> bool:
+    """True once :func:`mark_acp_hosted` ran in this process."""
+    return _ACP_HOSTED
+
+
+def _is_acp_host_owned_env_key(name: str) -> bool:
+    return name in _ACP_HOST_OWNED_ENV_KEYS or name.startswith(_ACP_HOST_OWNED_ENV_PREFIXES)
+
+
+def _snapshot_acp_host_env() -> dict[str, str]:
+    """Host-owned keys currently in ``os.environ`` with a non-empty value (empty means "not provided")."""
+    if not _ACP_HOSTED:
+        return {}
+    return {k: v for k, v in os.environ.items() if v and _is_acp_host_owned_env_key(k)}
+
+
+def _restore_acp_host_env(snapshot: dict[str, str]) -> None:
+    """Re-assert the host's values after the dotenv loads; logs the key names (never values) that ``.env``
+    would otherwise have replaced."""
+    replaced = [k for k, v in snapshot.items() if os.environ.get(k) != v]
+    for key in replaced:
+        os.environ[key] = snapshot[key]
+    if replaced:
+        logger.debug("acp: host-owned env kept over profile .env for %s", ", ".join(sorted(replaced)))
+
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     """KEY names assigned in a dotenv file (including empty ``KEY=``). A fast line scanner (works in early
@@ -315,7 +369,10 @@ def load_hermes_dotenv(
     load_external_secrets: bool = True,
 ) -> list[Path]:
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
-    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
+    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not).
+
+    Exception: once :func:`mark_acp_hosted` ran, host-owned keys (``HERMES_HOME``, ``BUZZ_*``) passed in by
+    the ACP host process keep their inherited value; ``.env`` only fills the ones the host left unset."""
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
     # Multiplex gateway: while a routed profile-home override is active, copying that profile's .env
@@ -346,6 +403,8 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
+    host_env = _snapshot_acp_host_env()  # ACP-hosted only: taken before any file load, restored after
+
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
@@ -361,6 +420,11 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    # Host-owned keys win over user/project .env while ACP-hosted (see _ACP_HOST_OWNED_ENV_KEYS). Restored
+    # BEFORE the managed overlay so an admin-managed .env keeps its documented top-of-stack precedence.
+    if host_env:
+        _restore_acp_host_env(host_env)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
     # import optional secret-manager libs (Bitwarden → cryptography → _rust.pyd) into the process replacing
