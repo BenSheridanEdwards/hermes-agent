@@ -2752,19 +2752,20 @@ class TestVoiceNoteDelivery:
 
     @pytest.mark.asyncio
     async def test_send_voice_prefers_mp3_upload_on_audio_relay(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"audio")
         clean = tmp_path / "voice-note-1.mp3"
         clean.write_bytes(b"clean")
         conversions = []
 
-        def convert(path, *, reencode=False):
-            conversions.append((path, reencode))
+        def convert(path, out, *, reencode=False):
+            conversions.append((path, out, reencode))
             return clean
 
         monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
         monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", convert)
-        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path: pytest.fail("envelope not needed"))
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda *a: pytest.fail("envelope not needed"))
         adapter = _make_adapter()
         adapter._relay_supports_audio = AsyncMock(return_value=True)
         desc = {"url": "https://test.relay/media/x.mp3"}
@@ -2775,20 +2776,25 @@ class TestVoiceNoteDelivery:
         result = await adapter.send_voice(CHANNEL, str(src), caption="hi", reply_to="parent", metadata={"transcript": "hi"})
 
         assert result.success is True and result.message_id == "evt-voice"
-        assert conversions == [(src, False)]
+        # The destination is allocated by send_voice before the transcode starts, so a cancelled turn
+        # cannot orphan it, and it is unlinked once the upload that reads it has finished.
+        (source, out, reencode), = conversions
+        assert (source, reencode) == (src, False)
+        assert out.parent == _buzz_mod._voice_note_workdir() and out.suffix == ".mp3" and not out.exists()
         adapter._blossom_upload.assert_awaited_once_with(clean, "audio/mpeg")
         adapter._publish_voice_note.assert_awaited_once_with(
             CHANNEL, desc, "voice-note-1.mp3", "audio/mpeg", caption="hi", reply_to="parent", metadata={"transcript": "hi"})
 
     @pytest.mark.asyncio
     async def test_send_voice_reencodes_once_when_copied_stream_is_rejected(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"audio")
         clean = tmp_path / "voice-note-2.mp3"
         clean.write_bytes(b"clean")
         conversions = []
 
-        def convert(path, *, reencode=False):
+        def convert(path, out, *, reencode=False):
             conversions.append(reencode)
             return clean
 
@@ -2806,13 +2812,14 @@ class TestVoiceNoteDelivery:
 
     @pytest.mark.asyncio
     async def test_send_voice_uses_envelope_when_relay_lacks_audio(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"audio")
         wrapped = tmp_path / "voice-note-3.mp4"
         wrapped.write_bytes(b"mp4")
         monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
         monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", lambda *a, **k: pytest.fail("mp3 path not expected"))
-        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path: wrapped)
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path, out: wrapped)
         adapter = _make_adapter()
         adapter._relay_supports_audio = AsyncMock(return_value=False)
         adapter._blossom_upload = AsyncMock(side_effect=AssertionError("no direct upload without buzz-audio"))
@@ -2832,12 +2839,13 @@ class TestVoiceNoteDelivery:
     @pytest.mark.asyncio
     async def test_send_voice_falls_back_to_plain_attachment(self, monkeypatch, tmp_path):
         """A rejected publish degrades to the envelope as a plain --file upload; no ffmpeg degrades to the source."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"audio")
         wrapped = tmp_path / "voice-note-4.mp4"
         wrapped.write_bytes(b"mp4")
         monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
-        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path: wrapped)
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path, out: wrapped)
         adapter = _make_adapter()
         adapter._relay_supports_audio = AsyncMock(return_value=False)
         cli = _ScriptedCli()
@@ -2976,22 +2984,27 @@ class TestVoiceNoteDelivery:
         assert metadatas == [{"transcript": "spoken reply"}, {}]
 
     def test_mp3_conversion_copies_mp3_frames_and_reencodes_other_formats(self, monkeypatch, tmp_path):
+        # tempdir is redirected and every destination is caller-allocated under tmp_path: a unit test must
+        # not drop scratch files into the workdir that every gateway on this host shares.
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         calls = _fake_ffmpeg(monkeypatch)
         mp3 = tmp_path / "reply.mp3"
         mp3.write_bytes(b"x")
         ogg = tmp_path / "reply.ogg"
         ogg.write_bytes(b"x")
+        dest = [tmp_path / f"voice-note-{i}.mp3" for i in range(4)]
 
-        out = _buzz_mod._convert_audio_to_clean_mp3(mp3)
-        _buzz_mod._convert_audio_to_clean_mp3(mp3, reencode=True)
-        _buzz_mod._convert_audio_to_clean_mp3(ogg)
+        out = _buzz_mod._convert_audio_to_clean_mp3(mp3, dest[0])
+        _buzz_mod._convert_audio_to_clean_mp3(mp3, dest[1], reencode=True)
+        _buzz_mod._convert_audio_to_clean_mp3(ogg, dest[2])
 
-        assert out is not None and out.name.startswith("voice-note-") and out.suffix == ".mp3"
+        assert out == dest[0]
         assert out.read_bytes() == b"ID3fake-mp3"
         codecs = [cmd[cmd.index("-c:a") + 1] for cmd in calls]
         assert codecs == ["copy", "libmp3lame", "libmp3lame"]
         assert all(cmd[0] == "/fake/ffmpeg" and "-map_metadata" in cmd and "-id3v2_version" in cmd for cmd in calls)
-        assert _buzz_mod._convert_audio_to_clean_mp3(tmp_path / "missing.mp3") is None
+        assert _buzz_mod._convert_audio_to_clean_mp3(tmp_path / "missing.mp3", dest[3]) is None
+        assert not (tmp_path / "hermes-buzz-voice").exists()
 
     def test_ffmpeg_failure_yields_no_file(self, monkeypatch, tmp_path):
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -2999,20 +3012,17 @@ class TestVoiceNoteDelivery:
         src = tmp_path / "reply.mp3"
         src.write_bytes(b"x")
 
-        assert _buzz_mod._convert_audio_to_clean_mp3(src) is None
-        assert _buzz_mod._wrap_audio_in_voice_note_envelope(src) is None
+        assert _buzz_mod._convert_audio_to_clean_mp3(src, _buzz_mod._voice_note_tempfile(".mp3")) is None
+        assert _buzz_mod._wrap_audio_in_voice_note_envelope(src, _buzz_mod._voice_note_tempfile(".mp4")) is None
         # The mkstemp placeholder goes too; a failed transcode must not leave an empty file behind.
         assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
 
     def test_converted_voice_files_get_unique_names(self, monkeypatch, tmp_path):
         """Millisecond stamps collide across the gateways sharing this host's temp dir; mkstemp names cannot."""
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-        _fake_ffmpeg(monkeypatch)
-        src = tmp_path / "reply.mp3"
-        src.write_bytes(b"x")
 
-        names = {_buzz_mod._convert_audio_to_clean_mp3(src).name for _ in range(5)}
-        names |= {_buzz_mod._wrap_audio_in_voice_note_envelope(src).name for _ in range(5)}
+        names = {_buzz_mod._voice_note_tempfile(".mp3").name for _ in range(5)}
+        names |= {_buzz_mod._voice_note_tempfile(".mp4").name for _ in range(5)}
 
         assert len(names) == 10
         assert all(n.startswith(_buzz_mod._VOICE_NOTE_PREFIX) for n in names)
@@ -3085,6 +3095,90 @@ class TestVoiceNoteDelivery:
 
         assert result.success is True and result.message_id == "evt-plain"
         assert adapter._blossom_upload.await_count == 2  # copied stream, then the re-encode
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_degrades_to_a_plain_file_when_no_scratch_file_can_be_made(self, monkeypatch, tmp_path):
+        """A full or read-only TMPDIR must cost the voice card, not the whole turn.
+
+        send_voice runs inside the gateway's TTS hook, which has no ``except``: an OSError out of mkstemp
+        would land in the turn's outer handler and the text reply would never be sent.
+        """
+        import errno
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+
+        def no_space(**kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkstemp", no_space)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=AssertionError("nothing was converted to upload"))
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert cli.calls[-1][0][cli.calls[-1][0].index("--file") + 1] == str(src)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_returns_a_failure_result_instead_of_raising(self, monkeypatch, tmp_path):
+        """Whatever goes wrong, send_voice answers with a SendResult so the text reply still goes out."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=RuntimeError("upload exploded"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is False and "upload exploded" in result.error
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []  # the scratch file goes even so
+
+    @pytest.mark.asyncio
+    async def test_send_voice_cleans_up_a_transcode_that_is_cancelled_mid_flight(self, monkeypatch, tmp_path):
+        """Interrupts are routine on this fleet, and the transcode thread outlives the cancelled turn.
+
+        The destination is allocated and registered before ``asyncio.to_thread`` starts, so the ``finally``
+        unlinks it; the worker holds the open handle and its bytes go with the unlinked inode.
+        """
+        import threading
+        import time as _time
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        started = threading.Event()
+
+        def slow_convert(source, out, *, reencode=False):
+            with out.open("wb") as handle:  # ffmpeg opens the destination before it writes anything
+                started.set()
+                _time.sleep(0.3)
+                handle.write(b"late frames")
+            return out
+
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", slow_convert)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+
+        task = asyncio.create_task(adapter.send_voice(CHANNEL, str(src)))
+        await asyncio.to_thread(started.wait, 5)
+        # The path exists, and is on send_voice's cleanup list, while the worker is still transcoding.
+        assert len(list(_buzz_mod._voice_note_workdir().iterdir())) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.to_thread(_time.sleep, 0.5)  # let the worker thread finish writing
+
         assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
 
     @pytest.mark.asyncio
@@ -3193,6 +3287,41 @@ class TestVoiceNoteInbound:
         assert cached is not None
         assert cached.kind == "video"
         assert cached.display_name == "voice-note-1710000000.mp4"
+
+    @pytest.mark.asyncio
+    async def test_envelope_demux_fails_soft_when_a_scratch_file_cannot_be_made(self, monkeypatch, tmp_path):
+        """A second scratch file that cannot be created must cost the demux, not the whole inbound event.
+
+        ``_download_attachment`` only wraps its HTTP block, so an OSError from here would propagate through
+        ``_cache_inbound_attachments`` into ``_handle_event`` and drop every attachment on the message. The
+        first file must not leak either.
+        """
+        import errno
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        payload = b"\x00\x00\x00\x18ftypmp42 envelope bytes"
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        _fake_ffmpeg(monkeypatch)
+        real_mkstemp = tempfile.mkstemp
+        made = []
+
+        def second_one_fails(**kwargs):
+            made.append(kwargs)
+            if len(made) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_mkstemp(**kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", second_one_fails)
+        adapter = _make_adapter()
+
+        cached = await adapter._download_attachment(self._envelope_metadata(payload))
+
+        # The envelope is cached as the video it arrived as, and no scratch file is left behind.
+        assert cached is not None and cached.kind == "video"
+        assert len(made) == 2
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_plain_mp4_is_not_demuxed(self, monkeypatch, tmp_path):
