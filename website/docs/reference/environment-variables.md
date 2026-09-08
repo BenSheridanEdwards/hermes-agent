@@ -726,7 +726,7 @@ Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other
 | `BUZZ_POLL_INTERVAL` | Seconds between inbound poll sweeps (default: `4`) |
 | `BUZZ_AUTH_TAG` | Optional NIP-OA owner-attestation auth tag JSON for NIP-42 WebSocket auth |
 | `BUZZ_CLI_PATH` | Path to the buzz CLI binary (default: `buzz` on PATH, then `~/bin/buzz`) |
-| `BUZZ_MANAGED_AGENT` | Set to `1` by Buzz Desktop's `buzz-acp` harness on the Hermes subprocess it spawns. Not user configuration. Marks the agent identity as host-managed, which passes `BUZZ_*` through to terminal children and, under ACP, makes the injected `BUZZ_*` credentials win over `.env` as one group ([details](/user-guide/features/acp#precedence-under-an-acp-host)) |
+| `BUZZ_MANAGED_AGENT` | Set to a non-empty value (the Desktop app instance id) by Buzz Desktop's `buzz-acp` harness on the Hermes subprocess it spawns. Not user configuration. Marks the agent identity as host-managed, which passes `BUZZ_*` through to terminal children and, under ACP, makes the injected `BUZZ_*` credentials win over `.env` as one group ([details](/user-guide/features/acp#precedence-under-an-acp-host)) |
 
 `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG` and `BUZZ_RELAY_URL` are one credential: the auth tag is an attestation bound to the private key, and the relay URL travels in the same signed auth event. Supply all three from the same place, or the relay rejects the agent's auth.
 

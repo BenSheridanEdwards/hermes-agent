@@ -377,28 +377,38 @@ keeps the normal rule: `.env` wins.
 The `BUZZ_*` variables are treated as **one credential, not three**.
 `BUZZ_AUTH_TAG` is an owner attestation bound to the key in `BUZZ_PRIVATE_KEY`,
 and `BUZZ_RELAY_URL` is carried in the same signed auth event. So when a managed
-host supplies any one of them, `.env` may not supply the others: the profile's
-`BUZZ_*` values are dropped rather than merged, since an agent that signs with
-one identity and presents another fails relay verification.
+host supplies `BUZZ_PRIVATE_KEY` or `BUZZ_AUTH_TAG`, the profile may not supply
+the others: its `BUZZ_*` values are dropped rather than merged, since an agent
+that signs with one identity and presents another fails relay verification. That
+covers every route the profile has into the environment (`.env`, the project
+`.env`, `.op.env` and external secret sources), not just the `.env` file.
+
+`BUZZ_RELAY_URL` is a member of that group but does not by itself claim it: it
+is a non-secret endpoint, so a host passing only a relay URL leaves the
+profile's own key and tag in place rather than deleting them.
 
 Without `BUZZ_MANAGED_AGENT` the host is a plain editor (Zed, VS Code) and
 nothing changes: the shell-export flow documented above for `buzz-acp` keeps
 working, and `.env` keeps its usual precedence over it.
 
 Set `HERMES_ACP_HOST_ENV=0` to turn the whole exception off and put every
-variable back on the normal `.env`-wins rule.
+variable back on the normal `.env`-wins rule. It is read from the **environment
+of the spawned Hermes process**, so set it on the host's spawn (the managed-agent
+definition, or the shell that launches the editor), not as a `.env` or
+`config.yaml` key: the exception is decided before the profile `.env` is read.
 
 ## Host integration
 
 These variables are set by an **ACP host process** (an editor or another agent
 harness) on the Hermes subprocess it spawns. They are not user configuration —
-do not set them by hand in `.env` or `config.yaml`.
+do not set them by hand in `.env` or `config.yaml`. The one an operator may set
+is `HERMES_ACP_HOST_ENV`, and it too goes on the spawn.
 
 | Variable | Value | Effect |
 |----------|-------|--------|
 | `HERMES_ACP_SKIP_CONFIGURED_MCP` | `1` | Skip starting the **globally configured** MCP servers from `config.yaml` before the ACP JSON-RPC loop begins. |
-| `BUZZ_MANAGED_AGENT` | `1` | Set by Buzz Desktop's `buzz-acp` harness. Marks the agent's identity as host-managed: the injected `BUZZ_*` credentials then win over the profile `.env`, as one group. See [Precedence under an ACP host](#precedence-under-an-acp-host). |
-| `HERMES_ACP_HOST_ENV` | `0` | Operator opt-out: turns that precedence exception off, so `.env` wins for every variable as it does outside ACP mode. |
+| `BUZZ_MANAGED_AGENT` | any non-empty value | Set by Buzz Desktop's `buzz-acp` harness to the app instance id; only its truthiness is read. Marks the agent's identity as host-managed: the injected `BUZZ_*` credentials then win over the profile `.env`, as one group. See [Precedence under an ACP host](#precedence-under-an-acp-host). |
+| `HERMES_ACP_HOST_ENV` | `0` | Operator opt-out: turns that precedence exception off, so `.env` wins for every variable as it does outside ACP mode. The one variable in this table an operator is meant to set, and still on the spawn rather than in `.env`. |
 
 Hermes normally starts every MCP server configured in `config.yaml` before it
 enters the ACP JSON-RPC loop. A host that owns MCP itself — passing the
