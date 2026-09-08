@@ -491,16 +491,31 @@ error. A delivery failure does not count toward the job's `failure_streak`
 When no target accepts the output at all (every platform target failed, no
 target resolves because the gateway runs with no messaging platform enabled,
 or `deliver: origin` on a job that never captured an origin), the output is
-also written to the log as a warning (`output not delivered to any target`,
-capped at 4000 characters) so the result stays visible. The line comes from
-the `cron` component, so it lands in `logs/agent.log` and `logs/errors.log`
-(and the gateway's stderr), not in `logs/gateway.log`; `hermes logs
---component cron` shows it. The logged body passes through the same secret
-redactor as every other log line, so recognised keys and tokens are masked;
-setting `security.redact_secrets: false` disables that and writes the output
-verbatim into the log files. `deliver: local` never needs a target and stays
-silent, and a `bot-chat` target that was queued, claimed or left ambiguous by
-a live owner counts as delivered (the output may already have been consumed).
+also written to the log (`output not delivered to any target`, capped at 4000
+characters) so the result stays visible. The line comes from the `cron`
+component, so it lands in `logs/agent.log` (and the gateway's stderr), not in
+`logs/gateway.log`. A genuine delivery failure logs it at `WARNING`, so it is
+in `logs/errors.log` too; the origin-less `deliver: origin` case is not a
+failure (the run is recorded `ok`) and logs at `INFO`, so successful runs do
+not fill the error log.
+
+To read one of these lines, use plain `hermes logs` or `hermes logs --level
+INFO`. Do not use `hermes logs --component cron` for this: the component
+filter matches line by line, and only the header line carries a logger name,
+so the body underneath it is dropped.
+
+The logged body passes through the same secret redactor as every other log
+line, so recognised keys and tokens are masked; setting
+`security.redact_secrets: false` disables that and writes the output verbatim
+into the log files. Bytes that are not valid UTF-8 (a script writing latin-1,
+say) are replaced rather than dropped.
+
+`deliver: local` never needs a target and stays silent, and a `bot-chat`
+target that was queued, claimed or left ambiguous by a live owner counts as
+delivered (the output may already have been consumed). The check is per job,
+not per target: if any target took the output, the body is not logged even
+when another target in the same job failed. That failure is still reported in
+`last_delivery_error` and by `hermes cron list`.
 
 ### Bot Chat delivery (`bot-chat`)
 
