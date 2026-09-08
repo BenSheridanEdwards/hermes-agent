@@ -571,7 +571,13 @@ if sys.platform == "win32":
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import load_hermes_dotenv, mark_acp_hosted
+
+# ``hermes acp`` runs under an ACP host that owns the agent identity it passed in as env (HERMES_HOME,
+# BUZZ_*). This import-time load runs before cmd_acp dispatches, so the marker has to be set here or the
+# profile's .env would already have replaced the host's values (acp_adapter.entry sets it for hermes-acp).
+if sys.argv[1:2] == ["acp"]:
+    mark_acp_hosted()
 
 # ``update`` must not import optional secret-manager libs before ``uv``
 # replaces the environment: on Windows Bitwarden's cryptography import maps
