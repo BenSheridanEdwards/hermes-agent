@@ -114,27 +114,68 @@ class AudioAttachment:
         return _AUDIO_MIME_SUFFIX.get(_mime_main(self.mime), ".bin")
 
 
+# "I have bytes but no idea what they are" MIME types. Treating them as an explicit type would
+# let ``application/octet-stream`` on a ``voice-note.ogg`` beat the extension and land the clip in
+# the binary-omitted path, so they are read as "no MIME" and the extension decides.
+_UNTYPED_MIME_TYPES = {"application/octet-stream", "binary/octet-stream", "application/binary"}
+
+# Enough for every magic-byte check in ``tools.audio_container`` (ftyp brand ends at byte 12).
+_SNIFF_BYTES = 16
+
+
+def _extension_audio_mime(path: Path) -> str | None:
+    """Audio MIME for a linked file that has no usable MIME type, or ``None`` when it is not audio.
+
+    The extension only nominates: the file's own magic bytes confirm. Without that, a text file
+    named ``notes.wav`` is uploaded to the STT provider unsniffed (the STT validators check
+    symlink, existence, size and extension only). A file that cannot be read keeps the extension's
+    verdict so the caller still reports it as a missing attachment instead of inlining it."""
+    mime = _AUDIO_SUFFIX_MIME.get(path.suffix.lower())
+    if mime is None:
+        return None
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_SNIFF_BYTES)
+    except OSError:
+        return mime
+    from tools.audio_container import sniff_container
+
+    return mime if sniff_container(head) is not None else None
+
+
 def _audio_mime_for(mime_type: str | None, path: Path | None) -> str | None:
     """Effective audio MIME for a block, or ``None`` when it is not audio. An explicit non-audio
     MIME wins over the extension (a ``text/plain`` file named ``notes.wav`` stays text)."""
-    if mime_type:
+    if mime_type and _mime_main(mime_type) not in _UNTYPED_MIME_TYPES:
         return mime_type if _is_audio_resource(mime_type) else None
     if path is not None:
-        return _AUDIO_SUFFIX_MIME.get(path.suffix.lower())
+        return _extension_audio_mime(path)
     return None
 
 
-def _decode_blob(blob: str) -> bytes:
-    try:
-        return base64.b64decode(blob, validate=True)
-    except Exception:
-        return blob.encode("utf-8", errors="replace")
+def _decode_blob(blob: str) -> bytes | None:
+    """Base64 payload -> bytes, or ``None`` when it is not base64 at all.
+
+    Line-wrapped payloads (``base64.encodebytes``, MIME encoders) and the URL-safe alphabet are
+    normalised deliberately, because ``b64decode(validate=True)`` rejects both. Anything else is
+    refused rather than re-encoded as its own UTF-8 bytes: for audio that fallback writes the
+    base64 *text* to disk as a clip and uploads it to the STT provider."""
+    compact = "".join(blob.split())
+    if not compact:
+        return None
+    for altchars in (None, b"-_"):
+        try:
+            return base64.b64decode(compact, altchars=altchars, validate=True)
+        except Exception:
+            continue
+    return None
 
 
 def audio_attachment_from_block(index: int, block: Any) -> AudioAttachment | None:
     """Classify one prompt block as audio: a ``resource_link``/embedded ``resource`` whose MIME is
-    ``audio/*`` (or, without a MIME, whose file extension is a known audio type), or an ``audio``
-    content block. Returns ``None`` for everything else. Never reads or decodes file contents."""
+    ``audio/*`` (or, without a MIME, whose file extension is a known audio type *and* whose magic
+    bytes agree), or an ``audio`` content block. Returns ``None`` for everything else. Reads at
+    most ``_SNIFF_BYTES`` of a linked file and never inlines its contents."""
     if isinstance(block, AudioContentBlock):
         data = _attr(block, "data") or ""
         if data.startswith("data:") and "," in data:
@@ -174,9 +215,19 @@ def audio_attachments(prompt: list[PromptBlock]) -> list[AudioAttachment]:
     return [att for att in found if att is not None]
 
 
+def join_audio_notes(notes: list[str], text: str) -> str:
+    """Transcript notes ahead of the typed text, blank-line separated (the gateway's
+    ``_prepend_media_prefix`` shape). The one joiner, so what is persisted as the user message and
+    what the model is shown cannot drift apart."""
+    joined = "\n\n".join(notes)
+    if joined and text:
+        return f"{joined}\n\n{text}"
+    return joined or text
+
+
 def _audio_fallback_note(att: AudioAttachment) -> str:
     """Prompt text for an audio block that went through no voice preprocessing: name the file when
-    there is one so the agent knows a clip was attached; never inline or decode the bytes."""
+    there is one so the agent knows a clip was attached; never inline the bytes."""
     if att.path is not None:
         from gateway.run_inbound import voice_message_attached_note
         return voice_message_attached_note(str(att.path))
@@ -310,9 +361,9 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
 
     if isinstance(resource, BlobResourceContents):
         blob = resource.blob or ""
-        try:
-            data = base64.b64decode(blob, validate=True)
-        except Exception:
+        # Not base64 at all: show the payload as the text it apparently is rather than dropping it.
+        data = _decode_blob(blob)
+        if data is None:
             data = blob.encode("utf-8", errors="replace")
 
         if _is_image_resource(mime_type):
@@ -363,18 +414,23 @@ def _append_parts(parts: list, text_parts: list[str], new_parts: list[dict[str, 
 
 def _content_blocks_to_openai_user_content(
     prompt: list[PromptBlock], audio_notes: dict[int, str] | None = None,
+    attachments: dict[int, AudioAttachment] | None = None,
 ) -> str | list[dict[str, Any]]:
     """Convert ACP prompt blocks into a Hermes/OpenAI-compatible user content payload.
 
     Audio blocks never reach the binary/text inlining path: each becomes the note in
     ``audio_notes`` (block index -> transcript or marker, from ``acp_adapter.voice``) or a
-    fallback marker, and the notes lead the payload the way the gateway prepends transcripts."""
+    fallback marker, and the notes lead the payload the way the gateway prepends transcripts.
+    ``attachments`` is the classification ``acp_adapter.voice`` already did for this prompt; pass
+    it so embedded blobs are base64-decoded once per turn rather than once per pass."""
     parts: list[dict[str, Any]] = []
     text_parts: list[str] = []
     audio_parts: list[str] = []
 
     for index, block in enumerate(prompt):
-        attachment = audio_attachment_from_block(index, block)
+        attachment = (
+            attachments.get(index) if attachments is not None else audio_attachment_from_block(index, block)
+        )
         if attachment is not None:
             audio_parts.append((audio_notes or {}).get(index) or _audio_fallback_note(attachment))
         elif isinstance(block, TextContentBlock):
@@ -392,13 +448,12 @@ def _content_blocks_to_openai_user_content(
 
     if audio_parts:
         parts = [{"type": "text", "text": note} for note in audio_parts] + parts
-        text_parts = audio_parts + text_parts
 
     if not parts:
         return _extract_text(prompt)
 
     # Pure text stays a string (slash commands, text-only providers); structured only for media.
     if all(part.get("type") == "text" for part in parts):
-        return "\n".join(text_parts)
+        return join_audio_notes(audio_parts, "\n".join(text_parts))
 
     return parts

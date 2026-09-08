@@ -94,7 +94,7 @@ Platform toolsets define the complete tool configuration for a deployment target
 | Toolset | Differences from `hermes-cli` |
 |---------|-------------------------------|
 | `hermes-cli` | Full toolset — the default for interactive CLI sessions. Includes file, terminal, web, browser, memory, skills, vision, image_gen, todo, tts, delegation, code_execution, cronjob, session_search, clarify, computer_use, Home Assistant, and the kanban tools (all check_fn-gated at runtime). |
-| `hermes-acp` | Drops `clarify`, `cronjob`, `image_generate`, `computer_use`, all four Home Assistant tools, and the kanban tools. Keeps `text_to_speech` (present only when a TTS provider is configured) so hosts that carry attachments can receive voice-note replies. Focused on coding tasks in IDE context; override with `acp.toolsets`. |
+| `hermes-acp` | Drops `clarify`, `cronjob`, `image_generate`, `text_to_speech`, `computer_use`, all four Home Assistant tools, and the kanban tools. Focused on coding tasks in IDE context. ACP sessions add the `tts` toolset on top by default, so `text_to_speech` is present whenever a TTS provider is configured; set `acp.tts: false` to opt out, or `acp.toolsets` to replace the base list. |
 | `hermes-api-server` | Drops `clarify`, `text_to_speech`, `computer_use`, and the kanban tools. Keeps everything else — suitable for programmatic access where user interaction isn't possible. |
 | `hermes-cron` | Same as `hermes-cli`. |
 | `hermes-telegram` | Same as `hermes-cli`. |

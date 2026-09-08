@@ -33,8 +33,12 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets, default_acp_toolsets
-from acp_adapter.voice import VoiceTurn, bind_voice_turn, cleanup_voice_turn, prepare_voice_turn
+from acp_adapter.session import (
+    QueuedPrompt, SessionManager, SessionState, _expand_acp_enabled_toolsets, default_acp_toolsets,
+)
+from acp_adapter.voice import (
+    VoiceTurn, bind_voice_turn, cleanup_voice_turn, prepare_voice_turn, replay_voice_turn,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -690,10 +694,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return user_text, user_content
 
     def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
+        voice: bool = False,
     ) -> str | None:
         """Mark the session running; if a turn is active, redirect it (text-only, supported
-        runtime) or queue it. Returns the client message when absorbed, else None."""
+        runtime) or queue it. Returns the client message when absorbed, else None.
+
+        ``voice`` rides along with the queued text so the replay still answers voice-first: the
+        transcript is plain text by then, and re-deriving the flag from the blocks would lose it."""
         with state.runtime_lock:
             if not state.is_running:
                 state.is_running = True
@@ -707,7 +715,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
+            state.queued_prompts.append(QueuedPrompt(user_text or "[Image attachment]", voice=voice))
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
@@ -779,8 +787,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
 
-    async def prompt(self, prompt: list[PromptBlock], session_id: str, **kwargs: Any) -> PromptResponse:
-        """Run Hermes on the user's prompt and stream events back to the editor."""
+    async def prompt(
+        self, prompt: list[PromptBlock], session_id: str, queued_voice: bool = False, **kwargs: Any
+    ) -> PromptResponse:
+        """Run Hermes on the user's prompt and stream events back to the editor.
+
+        ``queued_voice`` marks the replay of a voice note that was queued while the session was
+        busy: its clip is already a transcript, but the turn still answers voice-first."""
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.error("prompt: session %s not found", session_id)
@@ -791,65 +804,80 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         voice_turn: VoiceTurn | None = None
         try:
             voice_turn = await prepare_voice_turn(prompt, cwd=state.cwd, agent=state.agent)
+            if voice_turn is None and queued_voice:
+                voice_turn = replay_voice_turn(cwd=state.cwd, agent=state.agent)
         except Exception:
             logger.warning("Session %s: voice preprocessing failed; prompt continues as text", session_id, exc_info=True)
 
-        user_text = _extract_text(prompt).strip()
-        user_content = _content_blocks_to_openai_user_content(
-            prompt, audio_notes=voice_turn.audio_notes if voice_turn else None)
-        if voice_turn is not None:
-            user_text = voice_turn.prompt_text(user_text)
-        text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        if not user_text and not (isinstance(user_content, list) and user_content):
-            cleanup_voice_turn(voice_turn)
-            return PromptResponse(stop_reason="end_turn")
-
-        user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
-
-        # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
-            if response_text is not None:
-                if self._conn:
-                    await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
-                    await self._send_usage_update(state)
+        # Every exit below runs through the finally: a clip materialized for STT is removed even
+        # when the turn is cancelled (host disconnect) or never reaches the model. ``handed_on``
+        # marks the paths a note has actually promised the agent or the queue; short of that,
+        # nothing will ever read the note, so even a kept-on-failure clip goes.
+        handed_on = False
+        try:
+            user_text = _extract_text(prompt).strip()
+            user_content = _content_blocks_to_openai_user_content(
+                prompt, audio_notes=voice_turn.audio_notes if voice_turn else None,
+                attachments=voice_turn.attachments if voice_turn else None)
+            if voice_turn is not None:
+                user_text = voice_turn.prompt_text(user_text)
+            text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
+            if not user_text and not (isinstance(user_content, list) and user_content):
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
-        if absorbed is not None:
-            cleanup_voice_turn(voice_turn)
-            if self._conn:
-                await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
-            return PromptResponse(stop_reason="end_turn")
+            user_text, user_content = self._rewrite_prompt_for_interrupt(
+                state, user_text, user_content, text_only_prompt)
 
-        logger.info("Prompt on session %s: %s", session_id, user_text[:100])
-        conn, loop = self._conn, asyncio.get_running_loop()
-        if state.cancel_event:
-            state.cancel_event.clear()
-        cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
+            # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
+            if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+                response_text = self._handle_slash_command(user_text, state)
+                if response_text is not None:
+                    if self._conn:
+                        await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
+                        await self._send_usage_update(state)
+                    return PromptResponse(stop_reason="end_turn")
 
-        def _run_agent() -> dict:
-            return self._run_agent_turn(
-                state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
-                loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
-                voice_turn=voice_turn,
-            )
+            absorbed = self._claim_turn_or_queue(
+                state, session_id, user_text, user_content, text_only_prompt,
+                voice=bool(voice_turn and voice_turn.voice_reply))
+            if absorbed is not None:
+                handed_on = True  # the notes are in the queued text, to be replayed
+                if self._conn:
+                    await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
+                return PromptResponse(stop_reason="end_turn")
 
-        try:
-            # ACP `session_id` is the stable handle; agent.session_id is the internal head that
-            # compression may rotate — snapshot it to detect rotation after the turn.
-            pre_turn_hermes_id = getattr(state.agent, "session_id", None)
-            # Fresh context copy: concurrent sessions on the shared executor must not share ContextVars.
-            ctx = contextvars.copy_context()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
-        except Exception:
-            logger.exception("Executor error for session %s", session_id)
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
-            return PromptResponse(stop_reason="end_turn")
+            logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+            conn, loop = self._conn, asyncio.get_running_loop()
+            if state.cancel_event:
+                state.cancel_event.clear()
+            cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
+
+            def _run_agent() -> dict:
+                return self._run_agent_turn(
+                    state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
+                    loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
+                    voice_turn=voice_turn,
+                )
+
+            try:
+                # ACP `session_id` is the stable handle; agent.session_id is the internal head that
+                # compression may rotate — snapshot it to detect rotation after the turn.
+                pre_turn_hermes_id = getattr(state.agent, "session_id", None)
+                # Fresh context copy: concurrent sessions on the shared executor must not share ContextVars.
+                ctx = contextvars.copy_context()
+                # Handed on before the await, not after: cancelling the await does not stop the
+                # executor thread, and a clip the agent may still be reading must not vanish
+                # under it. The cache sweep collects whatever a cancelled turn leaves.
+                handed_on = True
+                result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+            except Exception:
+                logger.exception("Executor error for session %s", session_id)
+                with state.runtime_lock:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+                return PromptResponse(stop_reason="end_turn")
         finally:
-            cleanup_voice_turn(voice_turn)
+            cleanup_voice_turn(voice_turn, force=not handed_on)
 
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 
@@ -933,8 +961,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     break
                 next_prompt = state.queued_prompts.pop(0)
             if conn:
-                await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
-            await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
+                await conn.session_update(session_id, acp.update_user_message_text(next_prompt.text))
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=next_prompt.text)], session_id=session_id,
+                queued_voice=next_prompt.voice,
+            )
 
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
