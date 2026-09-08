@@ -68,12 +68,23 @@ def _run_probe(tmp_path, argv, env_extra):
         ["hermes", "--dev", "acp"],
         ["hermes", "--yolo", "--dev", "acp"],
         ["hermes", "--profile=work", "acp"],
+        # Value-taking top-level flags: the VALUE is a non-flag token sitting in the subcommand slot, so a
+        # first-non-flag scan reads "gpt-5" as the subcommand and skips the marker.
+        ["hermes", "-m", "gpt-5", "acp"],
+        ["hermes", "--model", "gpt-5", "acp"],
+        ["hermes", "--reasoning", "high", "acp"],
+        ["hermes", "--provider", "openai", "acp"],
+        ["hermes", "-t", "core", "acp"],
+        ["hermes", "--yolo", "-m", "gpt-5", "acp"],
+        ["hermes", "--model=gpt-5", "acp"],
+        ["hermes", "--", "acp"],
     ],
 )
 def test_argv_selects_acp_accepts_flags_before_the_subcommand(argv):
-    """Zero-arg top-level options are legal before the subcommand, and
-    BUZZ_ACP_AGENT_ARGS is operator-supplied, so the gate must not assume the
-    subcommand sits at argv[1]."""
+    """Zero-arg top-level options are legal before the subcommand, and eleven
+    top-level options take a value, so the gate must skip flag VALUES rather
+    than stop at the first non-flag token. BUZZ_ACP_AGENT_ARGS is
+    operator-supplied, so any of these spellings can reach the harness."""
     assert _argv_selects_acp(argv[1:]) is True
 
 
@@ -86,12 +97,33 @@ def test_argv_selects_acp_accepts_flags_before_the_subcommand(argv):
         ["update"],
         ["--yolo"],
         ["acp-ish"],
+        # False positives of the first-non-flag scan: these dispatch chat, and arming the ACP host-env
+        # exception for a plain chat session is the blanket-host-wins hazard the module deliberately avoids.
+        ["--continue", "acp"],
+        ["-c", "acp"],
+        ["--resume", "acp"],
+        ["-m", "acp", "chat"],
+        ["-m", "acp"],
     ],
 )
 def test_argv_selects_acp_rejects_everything_else(argv):
     """Only the acp subcommand arms the marker; no other entrypoint changes
-    precedence."""
+    precedence. `--continue`/`-c` are nargs="?" and `--resume` takes a value, so
+    a literal "acp" after them is a session name, not the subcommand."""
     assert _argv_selects_acp(argv) is False
+
+
+def test_argv_gate_value_flags_come_from_the_parser_not_a_local_copy(monkeypatch):
+    """AGENTS.md: flag sets are DERIVED from the parser, never hand-written
+    (#93530). Pin the wiring, not just today's answers: neutralize the derived
+    sets and the gate must lose the value-flag knowledge entirely."""
+    import hermes_cli._parser as parser_mod
+
+    assert _argv_selects_acp(["--reasoning", "high", "acp"]) is True
+    monkeypatch.setattr(
+        parser_mod, "top_level_value_flag_sets", lambda: (frozenset(), frozenset())
+    )
+    assert _argv_selects_acp(["--reasoning", "high", "acp"]) is False
 
 
 def test_argv_selects_acp_defaults_to_sys_argv(monkeypatch):
@@ -103,8 +135,15 @@ def test_argv_selects_acp_defaults_to_sys_argv(monkeypatch):
     assert _argv_selects_acp() is False
 
 
-def test_flagged_acp_invocation_keeps_the_managed_identity(tmp_path):
-    """End to end through main's import-time load: `hermes --yolo acp` under the
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "--yolo", "acp"],          # zero-arg flag before the subcommand
+        ["hermes", "-m", "gpt-5", "acp"],     # value flag: its value occupies the subcommand slot
+    ],
+)
+def test_flagged_acp_invocation_keeps_the_managed_identity(tmp_path, argv):
+    """End to end through main's import-time load: `hermes <flags> acp` under the
     Buzz managed-agent harness keeps the host's key and does not let the profile
     .env supply the auth tag that belongs to a different key."""
     home = tmp_path / "hermes" / "profiles" / "p1"
@@ -115,7 +154,7 @@ def test_flagged_acp_invocation_keeps_the_managed_identity(tmp_path):
 
     out = _run_probe(
         tmp_path,
-        ["hermes", "--yolo", "acp"],
+        argv,
         {"HERMES_HOME": str(home), "BUZZ_MANAGED_AGENT": "1", "BUZZ_PRIVATE_KEY": "managed-key"},
     )
 
