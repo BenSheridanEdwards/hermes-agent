@@ -7,10 +7,15 @@ both shapes of "nothing took it": a target that resolved and refused (``telegram
 lane that resolves to no target at all on a platform-less gateway (``all``, and ``origin`` on a
 CLI-created job with no captured origin).
 
-The line comes from the ``cron.scheduler`` logger, so it lands in ``agent.log``/``errors.log``,
-NOT in ``gateway.log`` (pinned by ``test_undelivered_output_lands_in_agent_log_not_gateway_log``).
-``local`` never wanted a target and stays silent; a ``bot-chat`` receipt the live owner may have
-consumed is not treated as undelivered.
+The line comes from the ``cron.scheduler`` logger, so it lands in ``agent.log`` and NOT in
+``gateway.log`` (pinned by ``test_undelivered_output_lands_in_agent_log_not_gateway_log``). It
+reaches ``errors.log`` only when it is a real delivery failure: that lane logs at WARNING, while
+the origin-less ``origin`` lane, which is recorded as a successful run, logs at INFO so routine
+output does not rotate the error history away.
+
+``local`` never wanted a target and stays silent (in any case or spacing); a ``bot-chat`` receipt
+the live owner may have consumed is not treated as undelivered, and the gate is per job, so a
+delivered co-target suppresses the body for a failed one.
 """
 
 import logging
@@ -250,3 +255,57 @@ def test_undelivered_output_lands_in_agent_log_not_gateway_log(gateway_mode_logg
     assert "routed output body" in (gateway_mode_logging / "errors.log").read_text()
     gateway_log = gateway_mode_logging / "gateway.log"
     assert not gateway_log.exists() or "routed output body" not in gateway_log.read_text()
+
+
+def _undelivered_records(caplog):
+    return [r for r in caplog.records if "output not delivered to any target" in r.getMessage()]
+
+
+def test_failed_delivery_logs_the_body_at_warning(platformless_env, monkeypatch, caplog):
+    """A real delivery failure belongs in ``errors.log``, so it logs at WARNING."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("failed-lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-warn", "name": "warn", "deliver": "all"}, adapters={}, loop=None,
+        )
+
+    records = _undelivered_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+
+
+def test_origin_without_an_origin_logs_the_body_at_info(platformless_env, monkeypatch, caplog):
+    """The origin-less ``deliver: origin`` lane is NOT a delivery failure: the run is recorded ok.
+    ``deliver`` defaults to ``origin`` for agent- and blueprint-created jobs, and CLI/TUI sessions
+    never capture an origin, so on a home-channel-less gateway this lane fires on every run. At
+    WARNING the body would land in ``logs/errors.log`` each time and rotate the real error history
+    away, so this lane logs at INFO: still in ``agent.log``, still under ``hermes logs``."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("origin-lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-info", "name": "info", "deliver": "origin"}, adapters={}, loop=None,
+        )
+
+    records = _undelivered_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "origin-lane body" in records[0].getMessage()
+    # The lane is still not an error, which is exactly why it must not be a WARNING.
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] is None
+
+
+def test_origin_lane_body_stays_out_of_the_error_log(gateway_mode_logging):
+    """The level pin, through the real file handlers: INFO reaches agent.log only."""
+    sched_delivery._log_undelivered_output(
+        {"id": "j-lvl"}, "info lane body", ["deliver=origin but no origin or home channels"],
+        level=logging.INFO)
+    hermes_logging.flush_log_queue()
+
+    assert "info lane body" in (gateway_mode_logging / "agent.log").read_text()
+    errors_log = gateway_mode_logging / "errors.log"
+    assert not errors_log.exists() or "info lane body" not in errors_log.read_text()
+
+
