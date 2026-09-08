@@ -1488,15 +1488,15 @@ def _standalone_send(
 
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
-    """Standalone fallback for a target the live lane did not deliver."""
+) -> bool:
+    """Standalone fallback for a target the live lane did not deliver; True once delivered."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
@@ -1505,7 +1505,7 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        return
+        return False
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1518,6 +1518,27 @@ def _deliver_standalone(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
+
+
+# Bounded so a long report cannot flood gateway.log; the full text stays in ``last_output``.
+_UNDELIVERED_OUTPUT_LOG_LIMIT = 4000
+
+
+def _log_undelivered_output(job: dict, content: str, errors: list) -> None:
+    """Every resolved target refused the send: surface the output in the log. A gateway running with
+    no messaging platform (scheduled work only) still produces results, and without this line they
+    would exist only in ``last_output``, invisible to anyone tailing gateway.log."""
+    text = (content or "").strip()
+    if not text:
+        return
+    suffix = ""
+    if len(text) > _UNDELIVERED_OUTPUT_LOG_LIMIT:
+        suffix = f" (truncated, {len(text)} chars total; full text in last_output)"
+        text = text[:_UNDELIVERED_OUTPUT_LOG_LIMIT]
+    logger.warning(
+        "Job '%s': output not delivered to any target (%s); output follows%s:\n%s",
+        job.get("id", "?"), "; ".join(errors) or "no target accepted the send", suffix, text)
 
 
 def _prepare_target_delivery(
@@ -1741,6 +1762,7 @@ def _deliver_result(
         return msg
 
     delivery_errors = []
+    delivered_targets = 0
     for target in targets:
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
@@ -1750,8 +1772,13 @@ def _deliver_result(
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
                 if not receipt or receipt["status"] not in ("queued", "claimed"):
                     delivery_errors.append(bot_chat_error)
+                else:
+                    # Queued/claimed by the live Bot Chat owner: the output reached someone.
+                    delivered_targets += 1
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            else:
+                delivered_targets += 1
             continue
 
         t = _prepare_target_delivery(
@@ -1767,8 +1794,14 @@ def _deliver_result(
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
+            delivered = _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        if delivered:
+            delivered_targets += 1
+
+    # Nothing reached anyone (typically a gateway with no live platform): keep the result visible.
+    if delivered_targets == 0:
+        _log_undelivered_output(job, content, delivery_errors)
 
     # Filter-time drops apply to every target; report them once.
     delivery_errors.extend(policy_drop_errors)

@@ -260,6 +260,17 @@ The gateway runs periodic maintenance alongside message handling:
 - **Memory flush** — commits memory before soft cache eviction
 - **Cache refresh** — refreshes model lists and provider status
 
+### Running with no messaging platform
+
+A gateway with zero enabled platforms is a supported mode, not a configuration error. `GatewayRunner.start()` logs `No messaging platforms enabled.` and continues: the run loop, control socket, cron ticker, housekeeping thread and watchers all start exactly as they do with a platform connected. Use it when another surface owns the chat face (for example a managed harness) but the profile still needs its cron jobs, heartbeats and scheduled work.
+
+What changes for cron output:
+
+- `deliver: local` and `bot-chat:<profile>` targets work unchanged (neither needs a platform adapter).
+- A platform target (`telegram:123`, `origin`, `all`) has nothing to send through. The job is recorded as `delivery_failed` with the reason, and the output is written to the gateway log (`Job '<id>': output not delivered to any target ...`, bounded to 4000 characters) so the result is still visible. The full text stays in `last_output`.
+
+The fatal `EX_CONFIG` (78) exit is reserved for real configuration conflicts: a token already polled by another gateway, or an invalid multiplexer config. Disabling every platform never triggers it.
+
 ## Process Management
 
 The gateway runs as a long-lived process, managed via:

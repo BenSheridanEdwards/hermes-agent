@@ -488,6 +488,12 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
+When no target accepts the output at all (every platform target failed, or
+the gateway is running with no messaging platform enabled), the output is
+also written to the gateway log as a warning (`output not delivered to any
+target`, capped at 4000 characters) so the result stays visible. `local` and
+`bot-chat` targets never need a platform and are unaffected.
+
 ### Bot Chat delivery (`bot-chat`)
 
 `bot-chat` delivers the output **into a profile's canonical "Bot Chat" session as a real message**. Unlike every other target — where the recipient is a human reading a channel — the recipient here is the bot itself: it receives the output as an incoming message, acts on anything that needs action, and responds in its chat. Use it when scheduled output should be *processed*, not just posted.
