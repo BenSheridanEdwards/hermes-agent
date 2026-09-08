@@ -309,3 +309,30 @@ def test_origin_lane_body_stays_out_of_the_error_log(gateway_mode_logging):
     assert not errors_log.exists() or "info lane body" not in errors_log.read_text()
 
 
+def test_undelivered_output_survives_undecodable_job_output(gateway_mode_logging):
+    """Job output is decoded with ``surrogateescape``, so a non-UTF-8 byte from a script arrives
+    as a lone surrogate. The rotating file handlers encode UTF-8 with no ``errors=``, so emitting
+    one raises UnicodeEncodeError inside logging: the record is dropped whole and a traceback goes
+    to stderr, losing the one line this change exists to write. Scrub before logging."""
+    body = "report start \udcff\udce9 report end"
+
+    sched_delivery._log_undelivered_output(
+        {"id": "j-surrogate"}, body, ["platform 'telegram' not configured/enabled"])
+    hermes_logging.flush_log_queue()
+
+    written = (gateway_mode_logging / "agent.log").read_text()
+    assert "report start" in written and "report end" in written
+    assert "\udcff" not in written
+
+
+def test_surrogates_in_the_error_reason_are_scrubbed_too(gateway_mode_logging):
+    """The reason string is interpolated into the same record, so it needs the same treatment."""
+    sched_delivery._log_undelivered_output(
+        {"id": "j-surrogate-reason"}, "plain body", ["platform '\udcffbad' not configured/enabled"])
+    hermes_logging.flush_log_queue()
+
+    written = (gateway_mode_logging / "agent.log").read_text()
+    assert "plain body" in written
+    assert "not configured/enabled" in written
+
+
