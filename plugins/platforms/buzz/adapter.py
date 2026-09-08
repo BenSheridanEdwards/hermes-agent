@@ -771,9 +771,10 @@ class BuzzAdapter(BasePlatformAdapter):
         hosts = _split_csv(extra.get("attachment_hosts", []))
         origins = (_attachment_origin(h) for h in hosts if isinstance(h, str))
         self._attachment_origins = {o for o in origins if o is not None}
-        relay_origin = _attachment_origin(self.relay_url)
-        if relay_origin is not None:
-            self._attachment_origins.add(relay_origin)
+        # The relay is the only origin that ever receives our credentials (_attachment_request_headers).
+        self._relay_origin = _attachment_origin(self.relay_url)
+        if self._relay_origin is not None:
+            self._attachment_origins.add(self._relay_origin)
         self.cli_path = _configured_cli_path(extra)
         # Channels to watch: env csv > extra list/csv; empty = all joined channels
         raw_channels = _split_csv(_setting_or("BUZZ_CHANNELS", extra, "channels", []))
@@ -1857,15 +1858,23 @@ class BuzzAdapter(BasePlatformAdapter):
         """Return a fixed-width diagnostic for malformed or excess metadata."""
         return f"[{rejected if rejected <= 999 else '999+'} Buzz attachment(s) rejected as malformed or over limits.]"
 
-    def _attachment_request_headers(self, metadata: dict) -> Dict[str, str]:
+    def _attachment_request_headers(self, metadata: dict, url: str) -> Dict[str, str]:
         """Headers for a Blossom blob GET: identity encoding plus a signed kind-24242 ``get`` authorization.
 
         Relays that authenticate media reads answer an unauthenticated request with HTTP 401 and check that the
         signer is a community member, so every imeta attachment is fetched under the agent's own key. The
         owner-attestation tag rides along the same way it does on the WebSocket AUTH. A key that cannot sign
         leaves the request unauthenticated, which a relay without read authentication still serves.
+
+        Credentials go to the relay and nowhere else. ``attachment_hosts`` may list third-party origins, and a
+        sender picks the imeta ``url`` and ``sha256`` independently, so an unconditional header would hand a
+        listed CDN a fresh authorization for an attacker-chosen blob hash on our relay plus the owner
+        attestation. Those hosts get ``Accept-Encoding`` only, which is what this path sent before read auth
+        existed.
         """
         headers = {"Accept-Encoding": "identity"}
+        if self._relay_origin is None or _attachment_origin(url) != self._relay_origin:
+            return headers
         sha256_hex = str(metadata.get("sha256") or "")
         if self._private_key and _HEX64_RE.fullmatch(sha256_hex):
             try:
@@ -1892,7 +1901,7 @@ class BuzzAdapter(BasePlatformAdapter):
             timeout = httpx.Timeout(_ATTACHMENT_DOWNLOAD_TIMEOUT)
             async with (
                 asyncio.timeout(_ATTACHMENT_DOWNLOAD_TIMEOUT),
-                httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers=self._attachment_request_headers(metadata)) as client,
+                httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers=self._attachment_request_headers(metadata, url)) as client,
                 client.stream("GET", url) as response,
             ):
                 if response.status_code != 200:
