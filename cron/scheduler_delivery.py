@@ -1526,14 +1526,25 @@ def _deliver_standalone(
 _UNDELIVERED_OUTPUT_LOG_LIMIT = 4000
 
 
-def _log_undelivered_output(job: dict, content: str, errors: list) -> None:
+def _log_undelivered_output(
+    job: dict, content: str, errors: list, *, level: int = logging.WARNING,
+) -> None:
     """No target took the output (none resolved, or every resolved one refused): surface it in the
     log. A gateway running with no messaging platform (scheduled work only) still produces results,
     and without this line they would exist only in ``last_output``.
 
-    This is the ``cron.scheduler`` logger, so the line lands in ``logs/agent.log`` and (being a
-    WARNING) ``logs/errors.log``, plus the gateway's stderr; it is NOT in ``logs/gateway.log``,
-    which the component filter in ``hermes_logging`` restricts to ``gateway.*`` loggers."""
+    This is the ``cron.scheduler`` logger, so the line lands in ``logs/agent.log`` plus the
+    gateway's stderr; it is NOT in ``logs/gateway.log``, which the component filter in
+    ``hermes_logging`` restricts to ``gateway.*`` loggers.
+
+    ``level`` decides whether it ALSO lands in ``logs/errors.log``, which only carries WARNING and
+    above. A genuine delivery failure logs at WARNING and belongs there. A lane that is not a
+    failure does not: origin-less ``deliver: origin`` is the default for agent- and blueprint-created
+    jobs (``tools/blueprints.py``) and CLI/TUI sessions never capture an origin, so on a
+    home-channel-less gateway that lane fires on every run of a job that is recorded ok. At WARNING
+    a 4 KB report every few minutes would rotate the whole 2 MB error history away and bury real
+    errors under successful output, so that lane logs at INFO instead: still in ``agent.log`` and
+    still under ``hermes logs``, just not in the error log."""
     text = (content or "").strip()
     if not text:
         return
@@ -1541,9 +1552,11 @@ def _log_undelivered_output(job: dict, content: str, errors: list) -> None:
     if len(text) > _UNDELIVERED_OUTPUT_LOG_LIMIT:
         suffix = f" (truncated, {len(text)} chars total; full text in last_output)"
         text = text[:_UNDELIVERED_OUTPUT_LOG_LIMIT]
-    logger.warning(
+    logger.log(
+        level,
         "Job '%s': output not delivered to any target (%s); output follows%s:\n%s",
-        job.get("id", "?"), "; ".join(errors) or "no target accepted the send", suffix, text)
+        job.get("id", "?"),
+        "; ".join(errors) or "no target accepted the send", suffix, text)
 
 
 def _prepare_target_delivery(
@@ -1697,7 +1710,13 @@ def _deliver_result(
         # resolve to nothing at all: they never reach the per-target loop below, so the output has
         # to be logged here or it stays invisible. `local` passes reason=None and stays silent.
         if undelivered_reason:
-            _log_undelivered_output(job, content, [undelivered_reason])
+            # WARNING only when this really is a delivery failure (``outcome`` carries the error).
+            # The origin-less ``origin`` lane returns outcome=None and the run is recorded ok, so
+            # logging its body at WARNING would spool successful cron output into ``errors.log``
+            # on every run of the very install shape this lane exists for.
+            _log_undelivered_output(
+                job, content, [undelivered_reason],
+                level=logging.WARNING if outcome else logging.INFO)
         return outcome
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
