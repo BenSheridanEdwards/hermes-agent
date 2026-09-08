@@ -621,6 +621,120 @@ _MEDIA_KIND_PRIORITY = (("image", MessageType.PHOTO), ("audio", MessageType.AUDI
 _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT}
 
 
+# ── Voice notes ──────────────────────────────────────────────────────────────
+# Buzz renders an attachment whose imeta ``filename`` starts with ``voice-note-`` as a playable voice-note
+# card. Relays that advertise the ``buzz-audio`` extension in their NIP-11 document store metadata-free
+# ``audio/mpeg`` blobs, so a note goes up as a real MP3. Older relays only accept video, so the audio is
+# shipped inside Buzz's canonical MP4 envelope (AAC under a stub H.264 track) and unpacked again on the way
+# in. Both directions transcode with ffmpeg; without it outbound audio degrades to a plain file upload and
+# inbound envelopes stay video.
+_AUDIO_EXTENSION = "buzz-audio"
+_AUDIO_EXTENSION_TTL = 600.0  # seconds a NIP-11 probe result stays trusted
+_VOICE_NOTE_PREFIX = "voice-note-"
+_BLOSSOM_AUTH_TTL = 600  # seconds a kind-24242 authorization stays valid
+_FFMPEG_TIMEOUT = 120.0
+_FFMPEG_FALLBACK = "/opt/homebrew/bin/ffmpeg"  # Homebrew on macOS when the gateway runs with a stripped PATH
+# Strip every stream but audio plus all container metadata so the relay's validator sees bare frames.
+_FFMPEG_AUDIO_ONLY = ("-vn", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact")
+_FFMPEG_TAGLESS_MP3 = ("-id3v2_version", "0", "-write_id3v1", "0", "-f", "mp3")
+
+
+def _ffmpeg_path() -> Optional[str]:
+    """Absolute path of the ffmpeg binary, or None when it is not installed."""
+    ffmpeg = shutil.which("ffmpeg") or _FFMPEG_FALLBACK
+    return ffmpeg if Path(ffmpeg).is_file() else None
+
+
+def _voice_note_workdir() -> Path:
+    out_dir = Path(tempfile.gettempdir()) / "hermes-buzz-voice"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _voice_note_stamp() -> str:
+    return str(int(time.time() * 1000))
+
+
+def _run_ffmpeg(args: List[str], out: Path, what: str) -> bool:
+    """Run ffmpeg with *args* writing *out*; False (and a warning) when ffmpeg is missing, fails, or writes nothing."""
+    import subprocess
+    ffmpeg = _ffmpeg_path()
+    if ffmpeg is None:
+        logger.warning("Buzz audio: ffmpeg not installed, cannot %s", what)
+        return False
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin", *args, str(out)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Buzz audio: could not %s: %s", what, exc)
+        return False
+    if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+        logger.warning("Buzz audio: failed to %s: %s", what, proc.stderr.decode(errors="ignore")[-300:].strip())
+        return False
+    return True
+
+
+def _convert_audio_to_clean_mp3(src: Path, *, reencode: bool = False) -> Optional[Path]:
+    """Write *src* as a metadata-free MPEG audio stream, the form a ``buzz-audio`` relay accepts.
+
+    An MP3 source has its frames copied (tags stripped, no quality loss) unless *reencode* is set; anything
+    else goes through libmp3lame. Returns the new file, or None when the source is missing or ffmpeg fails.
+    """
+    if not src.is_file():
+        logger.warning("Buzz audio: voice source %s does not exist", src.name)
+        return None
+    out = _voice_note_workdir() / f"{_VOICE_NOTE_PREFIX}{_voice_note_stamp()}.mp3"
+    codec = ["-c:a", "copy"] if src.suffix.lower() == ".mp3" and not reencode else ["-c:a", "libmp3lame", "-b:a", "96k"]
+    args = ["-i", str(src), *_FFMPEG_AUDIO_ONLY, *codec, *_FFMPEG_TAGLESS_MP3]
+    return out if _run_ffmpeg(args, out, "convert voice audio to mp3") else None
+
+
+def _wrap_audio_in_voice_note_envelope(src: Path) -> Optional[Path]:
+    """Transcode *src* into Buzz's voice-note envelope: AAC under a 16x16 black H.264 track, fast-start, no metadata."""
+    if not src.is_file():
+        logger.warning("Buzz audio: voice source %s does not exist", src.name)
+        return None
+    out = _voice_note_workdir() / f"{_VOICE_NOTE_PREFIX}{_voice_note_stamp()}.mp4"
+    args = [
+        "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1", "-i", str(src),
+        "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
+        "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-metadata", "encoder=", "-f", "mp4",
+    ]
+    return out if _run_ffmpeg(args, out, "build voice-note envelope") else None
+
+
+def _extract_voice_note_audio(data: bytes) -> Optional[bytes]:
+    """Demux a Buzz voice-note MP4 envelope into MP3 bytes so the speech can reach STT."""
+    stamp = _voice_note_stamp()
+    src = _voice_note_workdir() / f"inbound-{stamp}.mp4"
+    out = src.with_suffix(".mp3")
+    try:
+        src.write_bytes(data)
+        args = ["-i", str(src), "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "libmp3lame", "-b:a", "96k", *_FFMPEG_TAGLESS_MP3]
+        return out.read_bytes() if _run_ffmpeg(args, out, "extract voice-note audio") else None
+    except OSError as exc:
+        logger.warning("Buzz audio: voice-note extraction failed: %s", exc)
+        return None
+    finally:
+        for path in (src, out):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _is_voice_note_envelope(filename: str, mime_type: str) -> bool:
+    """True for Buzz's own voice notes: an MP4 whose imeta filename carries the voice-note marker."""
+    return mime_type.lower() == "video/mp4" and filename.lower().startswith(_VOICE_NOTE_PREFIX)
+
+
+def _clean_transcript(text: str) -> str:
+    """Single-line-safe transcript for an imeta ``alt`` entry: printable characters, spaces and newlines only."""
+    return "".join(ch for ch in text.strip() if ch in " \n" or (not ch.isspace() and ch.isprintable()))[:4000]
+
+
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
 
@@ -684,6 +798,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._user_names: Dict[str, str] = {}
         self._member_cache: Dict[str, Tuple[float, List[str]]] = {}  # (monotonic, pubkeys)
         self._profile_name_cache: Dict[str, Tuple[float, str]] = {}
+        # (relay advertises buzz-audio, monotonic probe time); None until the first send_voice.
+        self._audio_extension_cache: Optional[Tuple[bool, float]] = None
         # inbound event_id -> thread root (None when top-level), so send() joins the user's thread instead of nesting.
         self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
 
@@ -1086,8 +1202,181 @@ class BuzzAdapter(BasePlatformAdapter):
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
-        """Upload a local audio file through Buzz's native ``--file`` path."""
-        return await self._send_file_attachment(chat_id, Path(audio_path), caption=caption, reply_to=reply_to, metadata=metadata)
+        """Deliver audio as a first-class Buzz voice note.
+
+        On a relay that advertises the ``buzz-audio`` extension the note is uploaded as a metadata-free MP3
+        through a direct Blossom PUT (the ``buzz`` CLI still refuses audio uploads) and published as a kind-9
+        event whose imeta carries the ``voice-note-<stamp>.mp3`` marker. Any other relay gets the same event
+        around Buzz's MP4 envelope uploaded through the CLI. When ffmpeg is missing or every voice path fails
+        the audio goes out as a plain ``--file`` attachment. ``metadata["transcript"]`` becomes the imeta
+        ``alt`` text, which Buzz shows as the note's transcript.
+        """
+        src = Path(audio_path).expanduser()
+        if _ffmpeg_path() is None or not src.is_file():
+            return await self._send_file_attachment(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
+        if await self._relay_supports_audio():
+            result = await self._send_voice_note_mp3(chat_id, src, caption=caption, reply_to=reply_to, metadata=metadata)
+            if result is not None:
+                return result
+        wrapped = await asyncio.to_thread(_wrap_audio_in_voice_note_envelope, src)
+        if wrapped is not None:
+            result = await self._send_voice_note_envelope(chat_id, wrapped, caption=caption, reply_to=reply_to, metadata=metadata)
+            if result is not None:
+                return result
+        return await self._send_file_attachment(chat_id, wrapped or src, caption=caption, reply_to=reply_to, metadata=metadata, probe=False)
+
+    async def _send_voice_note_mp3(
+        self, chat_id: str, src: Path, *, caption: Optional[str], reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        """Blossom-upload *src* as a clean MP3 and publish it; None when the caller should fall back.
+
+        A copied MP3 stream the relay's validator rejects (junk between frames) is worth one re-encode.
+        """
+        for reencode in (False, True):
+            mp3 = await asyncio.to_thread(_convert_audio_to_clean_mp3, src, reencode=reencode)
+            if mp3 is None:
+                return None
+            desc, error = await self._blossom_upload(mp3, "audio/mpeg")
+            if desc is not None:
+                result = await self._publish_voice_note(chat_id, desc, mp3.name, "audio/mpeg", caption=caption, reply_to=reply_to, metadata=metadata)
+                if result.success:
+                    return result
+                logger.warning("Buzz audio: voice note publish failed, falling back: %s", result.error)
+                return None
+            logger.warning("Buzz audio: mp3 upload failed (%s): %s", "re-encoded" if reencode else "copied", error)
+            copied_stream_rejected = src.suffix.lower() == ".mp3" and (error or "").startswith(("HTTP 422", "HTTP 415"))
+            if reencode or not copied_stream_rejected:
+                return None
+        return None
+
+    async def _send_voice_note_envelope(
+        self, chat_id: str, wrapped: Path, *, caption: Optional[str], reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        """CLI-upload the MP4 envelope *wrapped* and publish it as a voice note; None when the caller should fall back."""
+        try:
+            desc = await self._cli_json(["upload", "file", "--file", str(wrapped)], None)
+        except Exception as exc:  # noqa: BLE001 - any upload failure degrades to a plain attachment
+            logger.warning("Buzz audio: envelope upload raised, falling back: %s", exc)
+            return None
+        if not isinstance(desc, dict) or not desc.get("url"):
+            logger.warning("Buzz audio: envelope upload returned no descriptor, falling back")
+            return None
+        result = await self._publish_voice_note(chat_id, desc, wrapped.name, "video/mp4", caption=caption, reply_to=reply_to, metadata=metadata)
+        if result.success:
+            return result
+        logger.warning("Buzz audio: envelope publish failed, falling back: %s", result.error)
+        return None
+
+    async def _play_tts_file(self, event, text_content, tts_path, first, metadata, record_delivery):
+        """Auto-TTS delivery: the spoken text rides along as the voice note's transcript."""
+        merged = dict(metadata or {})
+        merged["transcript"] = text_content
+        record_delivery(await self.send_voice(chat_id=event.source.chat_id, audio_path=tts_path, metadata=merged))
+        return False  # the text reply is still sent as its own message
+
+    async def _relay_supports_audio(self) -> bool:
+        """True when the relay's NIP-11 document lists the ``buzz-audio`` extension (result cached for a while)."""
+        now = time.monotonic()
+        cached = self._audio_extension_cache
+        if cached is not None and now - cached[1] < _AUDIO_EXTENSION_TTL:
+            return cached[0]
+        supported = False
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+                response = await client.get(self._http_relay_url() + "/", headers={"Accept": "application/nostr+json"})
+                if response.status_code == 200:
+                    extensions = response.json().get("supported_extensions") or []
+                    supported = isinstance(extensions, list) and _AUDIO_EXTENSION in extensions
+        except Exception as exc:  # noqa: BLE001 - an unreachable or odd relay simply means "no audio"
+            logger.warning("Buzz audio: NIP-11 probe failed (%s): %s", type(exc).__name__, exc)
+        self._audio_extension_cache = (supported, now)
+        return supported
+
+    def _http_relay_url(self) -> str:
+        parsed = urlsplit(self.relay_url.strip())
+        scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+        return urlunsplit((scheme, parsed.netloc, (parsed.path or "").rstrip("/"), "", ""))
+
+    def _blossom_auth_header(self, sha256_hex: str) -> str:
+        """``Authorization`` value for a Blossom upload (BUD-02): a base64 kind-24242 event scoped to one blob and our relay."""
+        import base64
+        now = int(time.time())
+        tags: List[List[str]] = [["t", "upload"], ["x", sha256_hex], ["expiration", str(now + _BLOSSOM_AUTH_TTL)]]
+        if server := urlsplit(self.relay_url.strip()).netloc:
+            tags.append(["server", server])
+        event = _nostr_auth.build_signed_event(private_key=self._private_key, kind=24242, tags=tags, content="Upload file", created_at=now)
+        token = base64.urlsafe_b64encode(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()).decode().rstrip("=")
+        return f"Nostr {token}"
+
+    async def _blossom_upload(self, path: Path, mime: str) -> Tuple[Optional[dict], Optional[str]]:
+        """PUT *path* to the relay's Blossom upload endpoint. Returns (descriptor, None) or (None, error)."""
+        import httpx
+        data = path.read_bytes()
+        sha256_hex = hashlib.sha256(data).hexdigest()
+        headers = {"Authorization": self._blossom_auth_header(sha256_hex), "Content-Type": mime, "X-SHA-256": sha256_hex}
+        if self._auth_tag:
+            headers["x-auth-tag"] = self._auth_tag
+        base = self._http_relay_url()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+                for endpoint in ("/upload", "/media/upload"):
+                    response = await client.put(base + endpoint, content=data, headers=headers)
+                    if response.status_code in (404, 405):
+                        continue
+                    if 200 <= response.status_code < 300:
+                        desc = response.json()
+                        return (desc, None) if isinstance(desc, dict) and desc.get("url") else (None, "upload returned no descriptor")
+                    return None, f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception as exc:  # noqa: BLE001 - network and decode errors alike are reported to the caller
+            return None, f"{type(exc).__name__}: {exc}"
+        return None, "relay has no Blossom upload endpoint"
+
+    @staticmethod
+    def _voice_note_imeta(desc: dict, fname: str, default_mime: str, transcript: Optional[str] = None) -> List[str]:
+        """NIP-92 imeta tag marking blob *desc* as the voice note *fname*; *transcript* rides in ``alt``."""
+        imeta = ["imeta", f"url {desc['url']}", f"m {desc.get('type') or default_mime}"]
+        for key in ("sha256", "size", "dim"):
+            if desc.get(key):
+                imeta.append(f"{'x' if key == 'sha256' else key} {desc[key]}")
+        if desc.get("duration") is not None:
+            # The relay cross-checks this against the stored blob to 0.1 s; echo its own value verbatim.
+            imeta.append(f"duration {desc['duration']}")
+        imeta.append(f"filename {fname}")
+        if isinstance(transcript, str) and (clean := _clean_transcript(transcript)):
+            imeta.append(f"alt {clean}")
+        return imeta
+
+    async def _publish_voice_note(
+        self, chat_id: str, desc: dict, fname: str, default_mime: str, *, caption: Optional[str], reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]]) -> SendResult:
+        """Publish a kind-9 message whose imeta presents uploaded blob *desc* as the voice note *fname*."""
+        imeta = self._voice_note_imeta(desc, fname, default_mime, (metadata or {}).get("transcript"))
+        tags: List[List[str]] = [["h", str(chat_id)], imeta]
+        anchor = self._resolve_reply_anchor((metadata or {}).get("thread_id") or reply_to)
+        if anchor and self._reply_to_mode != "off":
+            tags.append(["e", str(anchor), "", "reply"])
+        body = (caption or "").strip()
+        content = f"{body}\n[{fname}]({desc['url']})" if body else f"[{fname}]({desc['url']})"
+        try:
+            event = _nostr_auth.build_signed_event(private_key=self._private_key, kind=_CHAT_KIND, tags=tags, content=content)
+            import websockets
+            async with websockets.connect(self._websocket_url(), max_size=_WS_MAX_MESSAGE_BYTES) as ws:
+                await self._authenticate_websocket(ws)
+                await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
+                while True:
+                    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=_WS_AUTH_TIMEOUT))
+                    if not isinstance(reply, list) or not reply:
+                        continue
+                    if reply[0] == "OK" and len(reply) >= 3 and reply[1] == event["id"]:
+                        if reply[2] is True:
+                            self._mark_seen(str(chat_id), event["id"])
+                            return SendResult(success=True, message_id=event["id"])
+                        return SendResult(success=False, error=f"relay rejected voice note: {reply[3] if len(reply) > 3 else ''}")
+                    if reply[0] in ("NOTICE", "CLOSED"):
+                        return SendResult(success=False, error=f"relay: {reply[-1]}")
+        except Exception as exc:  # noqa: BLE001 - reported as a failed send so the caller can fall back
+            return SendResult(success=False, error=f"{type(exc).__name__}: {exc}")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = str(chat_id)
@@ -1583,8 +1872,14 @@ class BuzzAdapter(BasePlatformAdapter):
             if bad:
                 logger.warning("Buzz: attachment %s does not match imeta", what)
                 return None
+        filename, mime_type = metadata["filename"], metadata["mime_type"]
+        if _is_voice_note_envelope(filename, mime_type):
+            # Speech, not video: unpack the AAC track so the note caches as audio and can reach STT.
+            extracted = await asyncio.to_thread(_extract_voice_note_audio, bytes(data))
+            if extracted is not None:
+                data, filename, mime_type = extracted, f"{Path(filename).stem}.mp3", "audio/mpeg"
         try:
-            return await cache_media_bytes_async(bytes(data), filename=metadata["filename"], mime_type=metadata["mime_type"])
+            return await cache_media_bytes_async(bytes(data), filename=filename, mime_type=mime_type)
         except (OSError, ValueError) as exc:
             logger.warning("Buzz: attachment cache write failed: %s", exc)
             return None

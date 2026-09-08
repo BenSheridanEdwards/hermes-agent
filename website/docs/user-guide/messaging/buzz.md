@@ -145,6 +145,30 @@ media on another public origin, add its exact `host` or `host:port` to
 must be listed explicitly. Protected media that requires authenticated
 retrieval through the Buzz CLI is not handled by this native public-URL path.
 
+## Voice notes
+
+Audio the agent sends through `send_voice` (including auto-TTS replies) is
+delivered as a native Buzz voice note rather than a generic file, so Buzz
+Desktop and mobile render it as a playable card. The transcript, when the
+caller supplies one in `metadata["transcript"]`, travels in the imeta `alt`
+entry and Buzz shows it under the player.
+
+How the audio is stored depends on the relay:
+
+- **Relays with the `buzz-audio` extension** (listed under
+  `supported_extensions` in the relay's NIP-11 document) accept bare
+  `audio/mpeg` blobs. The adapter converts the file to a metadata-free MP3 and
+  uploads it with a direct Blossom `PUT`, authorized by a signed kind-24242
+  event, because the `buzz` CLI does not accept audio uploads. The probe result
+  is cached for ten minutes.
+- **Any other relay** only stores video, so the audio is wrapped in Buzz's
+  voice-note envelope (AAC inside a tiny MP4 with a stub video track) and
+  uploaded through the CLI. Inbound envelopes are unpacked back to audio.
+
+Both paths need `ffmpeg` on the gateway host (`/opt/homebrew/bin/ffmpeg` is
+checked when it is not on `PATH`). Without it, or when every voice path fails,
+the audio is sent as a plain file attachment.
+
 ## Run the gateway
 
 ```bash
