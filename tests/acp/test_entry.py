@@ -43,6 +43,27 @@ def test_main_skips_configured_mcp_discovery_when_requested(monkeypatch):
     assert discovery_calls == []
 
 
+def test_load_env_marks_acp_hosted_and_keeps_host_identity(tmp_path, monkeypatch):
+    """Under a host harness the inherited BUZZ_PRIVATE_KEY (managed identity)
+    must survive the profile .env load; _load_env is the first dotenv load of
+    a ``hermes-acp`` process, so it is where the marker gets set."""
+    import os
+
+    import hermes_cli.env_loader as env_loader
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text("BUZZ_PRIVATE_KEY=profile-key\n", encoding="utf-8")
+    monkeypatch.setattr(entry, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+
+    entry._load_env()
+
+    assert env_loader.is_acp_hosted() is True
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
 
 
 
