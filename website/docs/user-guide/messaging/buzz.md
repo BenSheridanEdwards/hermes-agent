@@ -145,6 +145,12 @@ media on another public origin, add its exact `host` or `host:port` to
 must be listed explicitly. Protected media that requires authenticated
 retrieval through the Buzz CLI is not handled by this native public-URL path.
 
+Every download carries a signed kind-24242 `get` authorization for that
+blob's SHA-256 (Blossom BUD-01), plus the owner-attestation tag when one is
+configured. Relays that authenticate media reads answer unauthenticated
+requests with HTTP 401 and check that the signing key belongs to a community
+member, so attachments are always fetched under the agent's own key.
+
 ## Voice notes
 
 Audio the agent sends through `send_voice` (including auto-TTS replies) is
