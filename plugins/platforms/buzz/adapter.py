@@ -735,6 +735,30 @@ def _clean_transcript(text: str) -> str:
     return "".join(ch for ch in text.strip() if ch in " \n" or (not ch.isspace() and ch.isprintable()))[:4000]
 
 
+def _is_voice_note(filename: str, mime_type: str) -> bool:
+    """True for audio that Buzz Desktop, mobile, or this adapter recorded as a voice note (by its imeta filename)."""
+    return mime_type.lower().startswith("audio/") and filename.lower().startswith(_VOICE_NOTE_PREFIX)
+
+
+class _VoiceNoteMedia(CachedMedia):
+    """A cached voice note: speech the gateway should transcribe, unlike an ordinary audio attachment.
+
+    The media cache names files by content, so the ``voice-note-`` marker survives only as this type.
+    """
+
+    @classmethod
+    def of(cls, cached: CachedMedia) -> "_VoiceNoteMedia":
+        return cls(cached.path, cached.media_type, cached.kind, cached.display_name)
+
+
+def _content_digest(path: str) -> str:
+    """SHA-256 of the file at *path*; an unreadable file yields the path itself so it never matches another."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return path
+
+
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
 
@@ -1902,10 +1926,13 @@ class BuzzAdapter(BasePlatformAdapter):
             if extracted is not None:
                 data, filename, mime_type = extracted, f"{Path(filename).stem}.mp3", "audio/mpeg"
         try:
-            return await cache_media_bytes_async(bytes(data), filename=filename, mime_type=mime_type)
+            cached = await cache_media_bytes_async(bytes(data), filename=filename, mime_type=mime_type)
         except (OSError, ValueError) as exc:
             logger.warning("Buzz: attachment cache write failed: %s", exc)
             return None
+        if cached is not None and _is_voice_note(filename, mime_type):
+            return _VoiceNoteMedia.of(cached)
+        return cached
 
     async def _cache_inbound_attachments(self, metadata_items: List[dict]) -> List[CachedMedia]:
         return [a for m in metadata_items if (a := await self._download_attachment(m)) is not None]
@@ -1965,6 +1992,10 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
+            # Only MessageType.VOICE enters the gateway's STT pipeline; AUDIO is a file attachment that is never
+            # transcribed. Voice notes from Buzz Desktop, mobile, or our own MP3 / envelope uploads are speech.
+            if message_type == MessageType.AUDIO and all(isinstance(attachment, _VoiceNoteMedia) for attachment in attachments):
+                message_type = MessageType.VOICE
         await self._dispatch_message(
             text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey), message_id=event_id,
@@ -2201,10 +2232,20 @@ class BuzzAdapter(BasePlatformAdapter):
         # Same-relay URL refs are localized in addition to the caller's imeta attachments (both explicit-True gated).
         localized = await self._localize_inbound_media(text, message_id, user_id=user_id, chat_type=chat_type, chat_id=chat_id)
         text, localized_urls, localized_types, localized_type = localized
+        # The media cache names files by content, not by source, so one blob referenced both by imeta and by its
+        # URL in the text lands twice under different names. Keep the first copy only: a voice note that appeared
+        # twice would be transcribed twice, and a lone duplicate must not turn VOICE into a mixed DOCUMENT.
+        known_digests = {await asyncio.to_thread(_content_digest, path) for path in media_urls}
+        distinct_localized: List[str] = []
         for path, mime in zip(localized_urls, localized_types):
-            if path not in media_urls:
-                media_urls.append(path)
-                media_types.append(mime)
+            digest = await asyncio.to_thread(_content_digest, path)
+            if path in media_urls or digest in known_digests:
+                continue
+            media_urls.append(path)
+            media_types.append(mime)
+            known_digests.add(digest)
+            distinct_localized.append(path)
+        localized_urls = distinct_localized
         if message_type == MessageType.TEXT:
             message_type = localized_type
         elif localized_urls and localized_type not in (message_type, MessageType.TEXT):

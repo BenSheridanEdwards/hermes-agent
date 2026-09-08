@@ -3106,6 +3106,154 @@ class TestAttachmentReadAuthorization:
         assert await adapter._download_attachment(self._metadata(payload)) is None
 
 
+class TestVoiceNoteClassification:
+    """Voice notes dispatch as MessageType.VOICE (the only type the gateway transcribes); other audio stays AUDIO."""
+
+    MP3 = b"\xff\xfb\x90\x00voice note frames"
+
+    @staticmethod
+    def _audio_metadata(payload: bytes, filename: str) -> dict:
+        return {
+            "url": f"https://test.relay/media/{filename}",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "filename": filename,
+            "mime_type": "audio/mpeg",
+        }
+
+    def _adapter_with_attachments(self, attachments):
+        adapter = _make_adapter()
+        adapter._user_names[OTHER_PUBKEY] = "Other"
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._cache_inbound_attachments = AsyncMock(return_value=attachments)
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        return adapter, dispatched
+
+    @staticmethod
+    def _audio_event(count: int) -> dict:
+        event = _event("voice", content="@Chip listen")
+        for index in range(count):
+            event["tags"].append([
+                "imeta", f"url https://test.relay/media/{index}.mp3", "m audio/mpeg",
+                "x " + format(index + 1, "064x"), "size 1", f"filename voice-note-{index}.mp3",
+            ])
+        return event
+
+    @pytest.mark.asyncio
+    async def test_download_marks_voice_note_audio(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=self.MP3, headers={"content-length": str(len(self.MP3))}))
+        adapter = _make_adapter()
+
+        voice = await adapter._download_attachment(self._audio_metadata(self.MP3, "voice-note-1710000000.mp3"))
+        plain = await adapter._download_attachment(self._audio_metadata(self.MP3, "song.mp3"))
+
+        assert isinstance(voice, _buzz_mod._VoiceNoteMedia) and voice.kind == "audio"
+        assert isinstance(plain, CachedMedia) and not isinstance(plain, _buzz_mod._VoiceNoteMedia)
+
+    @pytest.mark.asyncio
+    async def test_voice_note_attachment_dispatches_as_voice(self):
+        cached = CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3")
+        adapter, dispatched = self._adapter_with_attachments([_buzz_mod._VoiceNoteMedia.of(cached)])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(1))
+
+        assert dispatched[-1]["message_type"] is MessageType.VOICE
+        assert dispatched[-1]["media_types"] == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
+    async def test_plain_audio_attachment_stays_audio(self):
+        adapter, dispatched = self._adapter_with_attachments([CachedMedia("/cache/audio/song.mp3", "audio/mpeg", "audio", "song.mp3")])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(1))
+
+        assert dispatched[-1]["message_type"] is MessageType.AUDIO
+
+    @pytest.mark.asyncio
+    async def test_voice_note_beside_plain_audio_stays_audio(self):
+        voice = _buzz_mod._VoiceNoteMedia.of(CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3"))
+        song = CachedMedia("/cache/audio/song.mp3", "audio/mpeg", "audio", "song.mp3")
+        adapter, dispatched = self._adapter_with_attachments([voice, song])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(2))
+
+        assert dispatched[-1]["message_type"] is MessageType.AUDIO
+
+    @pytest.mark.asyncio
+    async def test_voice_note_beside_document_uses_document(self):
+        voice = _buzz_mod._VoiceNoteMedia.of(CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3"))
+        report = CachedMedia("/cache/documents/report.pdf", "application/pdf", "document", "report.pdf")
+        adapter, dispatched = self._adapter_with_attachments([voice, report])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(2))
+
+        assert dispatched[-1]["message_type"] is MessageType.DOCUMENT
+
+    def _localizing_adapter(self, tmp_path, url_payload: bytes):
+        """Adapter whose ``buzz media get`` writes *url_payload*, plus the captured MessageEvents."""
+        adapter = _make_adapter()
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        async def cli(args, *, input_text=None):
+            assert args[:2] == ["media", "get"]
+            Path(args[args.index("-o") + 1]).write_bytes(url_payload)
+            return 0, "", ""
+
+        adapter.handle_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._run_cli = cli
+        adapter.send_reaction = AsyncMock(return_value=True)
+        return adapter, captured
+
+    @pytest.mark.asyncio
+    async def test_url_copy_of_the_same_voice_note_is_dropped_and_voice_is_kept(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        adapter, captured = self._localizing_adapter(tmp_path, self.MP3)
+        media_url = f"https://test.relay/media/{hashlib.sha256(self.MP3).hexdigest()}.mp3"
+
+        await adapter._dispatch_message(
+            text=f"[voice-note-1.mp3]({media_url})", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-dup", created_at=1004,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.VOICE
+        assert event.media_urls == [str(note)]
+        assert event.media_types == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_url_audio_beside_a_voice_note_uses_document(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        other = b"\xff\xfb\x90\x00a different recording"
+        adapter, captured = self._localizing_adapter(tmp_path, other)
+        media_url = f"https://test.relay/media/{hashlib.sha256(other).hexdigest()}.mp3"
+
+        await adapter._dispatch_message(
+            text=f"and this one {media_url}", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-plus-audio", created_at=1005,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.DOCUMENT
+        assert len(event.media_urls) == 2 and event.media_urls[0] == str(note)
+
+
 class TestThreadAnchoring:
     """A reply must JOIN the thread it was triggered from, not nest a new one.
 

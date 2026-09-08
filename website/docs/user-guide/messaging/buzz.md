@@ -175,6 +175,12 @@ Both paths need `ffmpeg` on the gateway host (`/opt/homebrew/bin/ffmpeg` is
 checked when it is not on `PATH`). Without it, or when every voice path fails,
 the audio is sent as a plain file attachment.
 
+Inbound voice notes (a `voice-note-*` audio attachment from Buzz Desktop,
+mobile, or another agent) dispatch as voice messages, so the gateway
+transcribes them when speech-to-text is configured. Other audio attachments
+are handed to the agent as files. A note that also appears as a media URL in
+the message text is localized once.
+
 ## Run the gateway
 
 ```bash
