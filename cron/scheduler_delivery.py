@@ -561,8 +561,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     """Resolve one concrete auto-delivery target for a cron job."""
     origin = _resolve_origin(job)
     # ``local``/``origin`` are lane keywords, not platform names, so match them the way ``all`` and
-    # ``bot-chat`` are already matched: case-insensitively, on the stripped token.
-    lane = (deliver_value or "").strip().lower()
+    # ``bot-chat`` are already matched: case-insensitively, on the stripped token. Callers may hand
+    # this a raw token (it is exported as ``_resolve_delivery_target``), so canonicalize here too.
+    lane = canonical_deliver_token(deliver_value)
     if lane == "local":
         return None
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
@@ -772,13 +773,24 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
 def _normalize_deliver_value(deliver) -> str:
     """Normalize ``deliver`` to its canonical comma-separated string; ``"local"`` when falsy.
     Lists/tuples (MCP clients, hand-edited jobs.json) are flattened — ``str(["telegram"])`` would
-    yield ``"['telegram']"`` and fail resolution silently."""
+    yield ``"['telegram']"`` and fail resolution silently.
+
+    Every token goes through ``canonical_deliver_token``, so a lane keyword has ONE spelling from
+    here on. Normalizing only where delivery resolves is not enough: the consumers that classify
+    the run compare this string exactly (``_classify_delivery_outcome`` and the unresolved-origin
+    check in ``cron/scheduler.py``, ``_manual_run_delivery_note`` in ``tools/cronjob_tools.py``),
+    so a lane they failed to recognize was recorded as ``delivered`` and reported to the user as
+    delivered while nothing had been sent.
+
+    A value with no usable token at all (whitespace only) is returned unchanged, so it still
+    surfaces as an unresolved target rather than being silently downgraded to ``local``."""
     if deliver is None or deliver == "":
         return "local"
     if isinstance(deliver, (list, tuple)):
-        parts = [str(p).strip() for p in deliver if str(p).strip()]
+        parts = [canonical_deliver_token(p) for p in deliver if str(p).strip()]
         return ",".join(parts) if parts else "local"
-    return str(deliver)
+    parts = [canonical_deliver_token(p) for p in str(deliver).split(",") if str(p).strip()]
+    return ",".join(parts) if parts else str(deliver)
 
 
 # Routing tokens resolve at fire time (a job outlives platform wiring). ``all`` = platforms with a
@@ -788,6 +800,23 @@ _ROUTING_TOKENS = frozenset({"all"})
 # Pseudo-platform: deliver output as a real inbound turn into a profile's "Bot Chat" (not a mirror).
 # ``bot-chat`` = own profile; ``bot-chat:<name>`` = named profile on THIS machine.
 BOT_CHAT_PLATFORM = "bot-chat"
+
+# Routing verbs, not platform names: a lane keyword means the same thing however it is typed.
+_LANE_KEYWORDS = frozenset({"local", "origin", "all", BOT_CHAT_PLATFORM})
+
+
+def canonical_deliver_token(token) -> str:
+    """Canonical form of ONE ``deliver`` token: stripped, and lowercased when it names a lane.
+
+    The single place a lane keyword is folded. ``platform:chat_id`` and ``bot-chat:<profile>``
+    keep their case: chat ids are opaque and profile names are normalized by the profile layer.
+    Every site that decides what a lane means routes through this — ``_normalize_deliver_value``
+    (so the stored/normalized value the whole scheduler reads is already canonical), the three
+    resolution sites in this module, and the run-classification consumers in ``cron/scheduler.py``
+    and ``tools/cronjob_tools.py``, which must not assume their caller normalized."""
+    raw = str(token or "").strip()
+    lowered = raw.lower()
+    return lowered if lowered in _LANE_KEYWORDS else raw
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
@@ -853,7 +882,10 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver.strip().lower() == "local":
+    # Canonical already, via the normalizer above; folded again so this layer does not depend on
+    # its input having been normalized, and so the local opt-out short-circuits before any token
+    # is resolved (test_target_resolution_does_not_assume_an_already_folded_lane).
+    if canonical_deliver_token(deliver) == "local":
         return []
 
     parts: List[str] = []
@@ -1695,8 +1727,9 @@ def _unresolved_delivery_outcome(
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     # Lane names are matched case- and whitespace-insensitively: `"Local"` or `" local "` is the
     # same opt-out a plain `local` is, and treating it as a platform name would resolve to nothing
-    # and (since this change logs unresolved lanes) dump the job body on every run.
-    lane = deliver_value.strip().lower()
+    # and (since this change logs unresolved lanes) dump the job body on every run. The value is
+    # canonical already; folded again so this site holds on its own.
+    lane = canonical_deliver_token(deliver_value)
     if lane == "local":
         return None, None
     if lane == "origin":

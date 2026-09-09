@@ -510,6 +510,11 @@ line, so recognised keys and tokens are masked; setting
 into the log files. Bytes that are not valid UTF-8 (a script writing latin-1,
 say) are replaced rather than dropped.
 
+Lane names (`local`, `origin`, `all`, `bot-chat`) are matched without regard to
+case or surrounding spaces, so `deliver: Local` is the same opt-out as
+`deliver: local` and is recorded the same way. A `platform:chat_id` target
+keeps its case.
+
 `deliver: local` never needs a target and stays silent, and a `bot-chat`
 target that was queued, claimed or left ambiguous by a live owner counts as
 delivered (the output may already have been consumed). The check is per job,
