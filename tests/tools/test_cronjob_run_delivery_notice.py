@@ -304,3 +304,41 @@ class TestRunnerSummaryWiring:
             "Delivery target: telegram (output was delivered there by the job itself)"
         ) in summary
         assert "delivery FAILED" not in summary
+
+    def test_the_summary_normalizes_through_the_module_that_defines_the_fold(self):
+        """Both sites in ``tools/cronjob_tools.py`` reach ``_normalize_deliver_value``
+        by the same module path, the one that DEFINES it.
+
+        ``_manual_run_delivery_note`` imports it from ``cron.scheduler_delivery`` and the
+        completion-summary site used to import the same object from ``cron.scheduler``,
+        which only re-exports it. Two names for one function in one file means a test that
+        stubs one leaves the other site unstubbed, so this pins the path rather than the
+        behaviour: patching the defining module has to reach the ``Delivery target:`` line.
+        Reverting that site to ``from cron.scheduler import _normalize_deliver_value``
+        makes this test fail while every behavioural test stays green, which is the whole
+        point."""
+        from tools.cronjob_tools import _try_dispatch_background_run
+
+        job = _job("job-dn-04", "telegram")
+        with _bound_session_key("agent:main:telegram:dm:83995"):
+            with (
+                patch(
+                    "tools.cronjob_tools.claim_job_for_fire",
+                    return_value=job,  # claimed snapshot (return_job=True API)
+                ),
+                patch("cron.scheduler.run_one_job", return_value=True),
+                patch(
+                    "cron.scheduler_delivery._normalize_deliver_value",
+                    return_value="stub-lane",
+                ),
+                patch(
+                    "tools.cronjob_tools.get_job",
+                    return_value={"last_status": "ok", "last_error": None},
+                ),
+            ):
+                res = _try_dispatch_background_run(job)
+                assert res.get("dispatched") is True, _dispatch_diag(res)
+                evt = _drain_completion_event(res["delegation_id"])
+        assert evt is not None, "completion event never reached the queue"
+        summary = evt.get("summary") or ""
+        assert "Delivery target: stub-lane" in summary
