@@ -493,11 +493,16 @@ target resolves because the gateway runs with no messaging platform enabled,
 or `deliver: origin` on a job that never captured an origin), the output is
 also written to the log (`output not delivered to any target`, capped at 4000
 characters) so the result stays visible. The line comes from the `cron`
-component, so it lands in `logs/agent.log` (and the gateway's stderr), not in
-`logs/gateway.log`. A genuine delivery failure logs it at `WARNING`, so it is
-in `logs/errors.log` too; the origin-less `deliver: origin` case is not a
-failure (the run is recorded `ok`) and logs at `INFO`, so successful runs do
-not fill the error log.
+component, so it lands in `logs/agent.log`, not in `logs/gateway.log`. A
+failed run or a failed delivery logs it at `WARNING`, so it is in
+`logs/errors.log` too, and on the gateway's stderr (`gateway.error.log` under
+launchd, the journal under systemd). A successful run whose lane simply has
+nowhere to go — origin-less `deliver: origin`, which is not a failure and is
+recorded `ok` — logs at `INFO`, so routine output does not fill the error log;
+that line reaches stderr only when the gateway runs with `-v`. Note that the
+`INFO` line follows the configured log level: with `logging.level: WARNING` in
+`config.yaml` the log files are written at `WARNING` and the successful-run
+body is not recorded at all.
 
 To read one of these lines, use plain `hermes logs` or `hermes logs --level
 INFO`. Do not use `hermes logs --component cron` for this: the component

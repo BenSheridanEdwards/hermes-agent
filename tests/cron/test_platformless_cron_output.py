@@ -409,12 +409,39 @@ def test_component_cron_filter_shows_the_header_but_drops_the_body(gateway_mode_
     assert cli_logs._matches_filters(body, min_level="INFO") is True
 
 
+def _failing_run_job(error):
+    def _fake(job, **_kw):
+        return (False, "raw output", "", error)
+    return _fake
+
+
 def _recorded_outcome(state):
     """The ``delivery_outcome`` handed to ``finish_execution``: what the executions ledger,
     ``hermes cron list`` and the agent-facing run summary all read back."""
     assert len(state["finished"]) == 1
     _args, kw = state["finished"][0]
     return kw.get("delivery_outcome")
+
+
+def test_failing_run_on_the_origin_lane_logs_the_body_at_warning(
+    platformless_env, monkeypatch, caplog
+):
+    """The level follows the RUN, not just the delivery. The origin-less ``origin`` lane is never
+    a delivery failure, so keying the level on the delivery outcome alone sent a failure summary
+    to INFO: a job failing every tick on a platform-less, home-channel-less gateway left
+    ``errors.log`` completely empty, which is the mirror image of the bug the INFO lane fixed."""
+    monkeypatch.setattr(s, "run_job", _failing_run_job("boom: the script exited 1"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-failorigin", "name": "failing", "deliver": "origin"},
+            adapters={}, loop=None,
+        )
+
+    records = _undelivered_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "boom: the script exited 1" in records[0].getMessage()
 
 
 @pytest.mark.parametrize("raw,expected", [
