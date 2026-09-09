@@ -9,13 +9,17 @@ CLI-created job with no captured origin).
 
 The line comes from the ``cron.scheduler`` logger, so it lands in ``agent.log`` and NOT in
 ``gateway.log`` (pinned by ``test_undelivered_output_lands_in_agent_log_not_gateway_log``). It
-reaches ``errors.log`` only when it is a real delivery failure: that lane logs at WARNING, while
-the origin-less ``origin`` lane, which is recorded as a successful run, logs at INFO so routine
-output does not rotate the error history away.
+reaches ``errors.log`` when the run or the delivery failed: those log at WARNING, while a
+SUCCESSFUL run on the origin-less ``origin`` lane logs at INFO so routine output does not rotate
+the error history away.
 
 ``local`` never wanted a target and stays silent (in any case or spacing); a ``bot-chat`` receipt
 the live owner may have consumed is not treated as undelivered, and the gate is per job, so a
 delivered co-target suppresses the body for a failed one.
+
+Lane keywords are folded once, in ``canonical_deliver_token``, because the consumers that
+classify the run compare the lane string: a lane they did not recognize was recorded as
+``delivered`` with nothing sent.
 """
 
 import logging
