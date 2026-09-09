@@ -1114,26 +1114,71 @@ def test_acp_hosted_beats_an_override_existing_secret_source(tmp_path, monkeypat
     assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
 
 
-def test_dotenv_key_scanner_ignores_multi_line_quoted_values(tmp_path):
-    """_env_keys_defined_in_dotenv is a line scanner feeding the scrub of
-    _PROFILE_MANAGED_ENV_KEYS absent from .env. A quoted value may span lines,
-    and a continuation line holding an `=` used to parse as its own assignment,
-    inventing key names the file never defined and hiding real ones that follow."""
-    from hermes_cli.env_loader import _env_keys_defined_in_dotenv
-
-    env_file = tmp_path / ".env"
-    env_file.write_text(
+@pytest.mark.parametrize("text,expected", [
+    pytest.param(
         "BUZZ_AUTH_TAG='kind=22242\n"
         "BUZZ_RELAY_URL=ws://inside-the-quoted-value\n"
         "end'\n"
         "HERMES_ACP_AUTH_METHOD=cursor_login\n"
         'BUZZ_PRIVATE_KEY="single-line"\n',
+        {"BUZZ_AUTH_TAG", "HERMES_ACP_AUTH_METHOD", "BUZZ_PRIVATE_KEY"},
+        id="multi-line-quoted-value",
+    ),
+    pytest.param(
+        'HERMES_ACP_AUTH_METHOD="oauth" # how we auth\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n"
+        "COPILOT_CLI_PATH=/usr/local/bin/copilot\n",
+        {"HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "COPILOT_CLI_PATH"},
+        id="inline-comment-after-quoted-value",
+    ),
+    pytest.param(
+        'export COPILOT_CLI_PATH="/usr/local/bin/copilot"  # installed by brew\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n",
+        {"COPILOT_CLI_PATH", "HERMES_ACP_AUTO_APPROVE"},
+        id="export-plus-inline-comment",
+    ),
+])
+def test_dotenv_key_scanner_ignores_multi_line_quoted_values(tmp_path, text, expected):
+    """_env_keys_defined_in_dotenv is a line scanner feeding the scrub of
+    _PROFILE_MANAGED_ENV_KEYS absent from .env. A quoted value may span lines,
+    and a continuation line holding an `=` used to parse as its own assignment,
+    inventing key names the file never defined and hiding real ones that follow.
+
+    The second and third rows are the other half of the same test: a value that
+    IS terminated but carries a trailing comment. `value` is lstripped and not
+    rstripped, so an `endswith(quote)` test reads `KEY="v" # note` as an open
+    quote and swallows every line after it. Those keys then look undefined to
+    _clear_known_keys_missing_from_dotenv, which deletes them from os.environ
+    on any ordinary run."""
+    from hermes_cli.env_loader import _env_keys_defined_in_dotenv
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(text, encoding="utf-8")
+
+    assert _env_keys_defined_in_dotenv(env_file) == expected
+
+
+def test_inline_comment_in_dotenv_does_not_scrub_the_keys_below_it(tmp_path, monkeypatch):
+    """End to end, off the ACP path: `hermes chat` against a .env written in a
+    very common style. python-dotenv parses all three assignments and sets them;
+    the scrub then used to delete the two it could not see, so the profile lost
+    its ACP auth method and its Copilot binary on every invocation."""
+    for key in ("HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "COPILOT_CLI_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text(
+        'HERMES_ACP_AUTH_METHOD="oauth" # how we auth\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n"
+        "COPILOT_CLI_PATH=/usr/local/bin/copilot\n",
         encoding="utf-8",
     )
 
-    assert _env_keys_defined_in_dotenv(env_file) == {
-        "BUZZ_AUTH_TAG", "HERMES_ACP_AUTH_METHOD", "BUZZ_PRIVATE_KEY",
-    }
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ.get("HERMES_ACP_AUTH_METHOD") == "oauth"
+    assert os.environ.get("HERMES_ACP_AUTO_APPROVE") == "1"
+    assert os.environ.get("COPILOT_CLI_PATH") == "/usr/local/bin/copilot"
 
 
 def test_acp_host_owned_set_is_identity_only():

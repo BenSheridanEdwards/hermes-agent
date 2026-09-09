@@ -226,7 +226,13 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
 
     Quoted values may span lines (``BUZZ_AUTH_TAG='{\\n  "ok": 1\\n}'``), and a continuation line holding an
     ``=`` used to parse as its own assignment, inventing key names that were never defined. Track the open
-    quote and skip the body."""
+    quote and skip the body.
+
+    A quote is open only when it is never CLOSED in the rest of the value, not when the value fails to END
+    with it: ``KEY="v" # note`` is a terminated value with an inline comment, the shape ``hermes setup``
+    writes, and testing ``endswith`` there swallowed every following line until the next quote character.
+    That deletes keys the file genuinely defines, via ``_clear_known_keys_missing_from_dotenv``, on every
+    ordinary run rather than only under an ACP host."""
     keys: set[str] = set()
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -251,7 +257,7 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
         keys.add(key)
         value = value.lstrip()
         quote = value[:1]
-        if quote in ("'", '"') and not (len(value) > 1 and value.endswith(quote)):
+        if quote in ("'", '"') and quote not in value[1:]:
             open_quote = quote
     return keys
 
