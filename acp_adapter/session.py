@@ -137,13 +137,28 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
 
+def _acp_default_toolsets() -> List[str]:
+    """Toolsets for an ACP session, editor posture unless the host says otherwise.
+
+    ``hermes-acp`` is the editor-integration posture: coding tools without
+    messaging, audio, or the clarify UI. A host that drives Hermes as a
+    conversational agent rather than an editor assistant needs those tools
+    back, so it sets ``HERMES_ACP_TOOLSETS`` (comma separated) to name the
+    posture it wants. Unset keeps the editor default.
+    """
+    raw = os.environ.get("HERMES_ACP_TOOLSETS", "").strip()
+    if not raw:
+        return ["hermes-acp"]
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def _expand_acp_enabled_toolsets(
     toolsets: List[str] | None = None,
     mcp_server_names: List[str] | None = None,
 ) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
     expanded: List[str] = []
-    for name in list(toolsets or ["hermes-acp"]):
+    for name in list(toolsets or _acp_default_toolsets()):
         if name and name not in expanded:
             expanded.append(name)
 
@@ -635,7 +650,7 @@ class SessionManager:
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
+                _acp_default_toolsets(),
                 mcp_server_names=configured_mcp_servers,
             ),
             "quiet_mode": True,
