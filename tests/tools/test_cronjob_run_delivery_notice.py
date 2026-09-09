@@ -137,6 +137,19 @@ class TestDeliveryNote:
             == expected
         )
 
+    def test_lane_keyword_is_folded_before_the_wording_is_chosen(self):
+        """``Local`` is the local lane, not a platform named "Local". This line is relayed to the
+        user by the calling agent, so a lane spelling this comparison missed announced that the
+        output "was delivered there by the job itself" for a job that delivered nothing."""
+        expected = " (output saved locally only)"
+        for lane in ("Local", " local ", "LOCAL", "\tlocal\n"):
+            assert _manual_run_delivery_note(lane, {}) == expected
+            # A stale error must not flip the wording for the local lane either.
+            assert (
+                _manual_run_delivery_note(lane, {"last_delivery_error": "telegram 400"})
+                == expected
+            )
+
     def test_remote_without_error_keeps_legacy_wording(self):
         expected = " (output was delivered there by the job itself)"
         assert _manual_run_delivery_note("telegram", {}) == expected

@@ -407,3 +407,150 @@ def test_component_cron_filter_shows_the_header_but_drops_the_body(gateway_mode_
     # Unfiltered and level-filtered reads keep both: lines without a level pass the level filter.
     assert cli_logs._matches_filters(body) is True
     assert cli_logs._matches_filters(body, min_level="INFO") is True
+
+
+def _recorded_outcome(state):
+    """The ``delivery_outcome`` handed to ``finish_execution``: what the executions ledger,
+    ``hermes cron list`` and the agent-facing run summary all read back."""
+    assert len(state["finished"]) == 1
+    _args, kw = state["finished"][0]
+    return kw.get("delivery_outcome")
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (" Local ", "local"),
+    ("ORIGIN", "origin"),
+    ("All", "all"),
+    ("BOT-CHAT", "bot-chat"),
+    (["Origin"], "origin"),
+    (" local , ALL ", "local,all"),
+    ("Telegram:ABC", "Telegram:ABC"),
+    ("bot-chat:Ops", "bot-chat:Ops"),
+    ("", "local"),
+    (None, "local"),
+    ("   ", "   "),
+])
+def test_normalize_deliver_value_canonicalizes_lane_keywords(raw, expected):
+    """The lane is folded once, at the value every consumer reads. Lane keywords lowercase and
+    lose their padding; a ``platform:chat_id`` or ``bot-chat:<profile>`` token keeps its case
+    (chat ids are opaque, profile names belong to the profile layer); a whitespace-only value is
+    left alone so it still surfaces as an unresolved target instead of a silent ``local``."""
+    assert sched_delivery._normalize_deliver_value(raw) == expected
+
+
+@pytest.mark.parametrize("deliver", ["Local", " local ", "LOCAL", "\tlocal\n", ["Local"]])
+def test_mis_cased_local_lane_is_recorded_suppressed_not_delivered(
+    platformless_env, monkeypatch, deliver
+):
+    """The lane fix has to reach the consumers that CLASSIFY the run, not just the ones that
+    resolve targets. Folding the lane only inside the delivery module made ``deliver: Local``
+    resolve to no target (correct, silent) while ``_classify_delivery_outcome`` still saw a
+    non-``local`` string and recorded the run ``delivered`` with nothing sent."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("recorded lane body"))
+
+    s.run_one_job(
+        {"id": "j-recorded", "name": "recorded", "deliver": deliver}, adapters={}, loop=None,
+    )
+
+    assert _recorded_outcome(platformless_env) == "suppressed"
+
+
+@pytest.mark.parametrize("deliver", ["Origin", " ORIGIN "])
+def test_mis_cased_origin_lane_is_recorded_not_configured(
+    platformless_env, monkeypatch, deliver
+):
+    """Same for the origin lane: an origin-less ``origin`` run is ``not_configured``. Compared
+    raw, ``Origin`` missed the unresolved-origin check and was recorded ``delivered``."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("origin recorded body"))
+
+    s.run_one_job(
+        {"id": "j-recorded-origin", "name": "recorded", "deliver": deliver},
+        adapters={}, loop=None,
+    )
+
+    assert _recorded_outcome(platformless_env) == "not_configured"
+
+
+def test_crash_failure_on_a_mis_cased_origin_lane_is_recorded_not_configured(
+    platformless_env, caplog,
+):
+    """The crash path classifies the lane on its own (a run that raised out of ``run_job`` never
+    reaches the normal finalizer), so it needs the same fold."""
+    with caplog.at_level(logging.INFO, logger="cron"):
+        delivery_error, outcome = s._deliver_crash_failure(
+            {"id": "j-crash", "name": "crash", "deliver": " ORIGIN "},
+            "the runner raised", adapters={}, loop=None,
+        )
+
+    assert delivery_error is None
+    assert outcome == "not_configured"
+
+
+def test_classify_delivery_outcome_folds_the_lane_keyword():
+    """The classifier does not trust its caller to have normalized: it is the last gate before a
+    run is written down as ``delivered``, and the note the agent relays to the user follows it."""
+    kw = dict(delivery_error=None, should_deliver=True, unresolved_origin=False,
+              incident_acked=False, success=True)
+    assert s._classify_delivery_outcome(normalized_deliver="local", **kw) == "suppressed"
+    assert s._classify_delivery_outcome(normalized_deliver="Local", **kw) == "suppressed"
+    assert s._classify_delivery_outcome(normalized_deliver=" local ", **kw) == "suppressed"
+    # A real target is still a delivery.
+    assert s._classify_delivery_outcome(normalized_deliver="telegram:123", **kw) == "delivered"
+
+
+def test_origin_token_is_resolved_case_and_whitespace_insensitively():
+    """The per-token resolver is also called directly (it is exported as
+    ``_resolve_delivery_target``), so it folds the lane itself: `` ORIGIN `` reaches the origin
+    it names instead of being parsed as a platform called "ORIGIN" and resolving to nothing."""
+    job = {"id": "j-origin-token", "origin": {"platform": "telegram", "chat_id": 42}}
+
+    target = sched_delivery._resolve_single_delivery_target(job, " ORIGIN ")
+
+    assert target is not None
+    assert target["platform"] == "telegram"
+    assert str(target["chat_id"]) == "42"
+    assert target["_resolved_from"] == "origin"
+
+
+def test_target_resolution_does_not_assume_an_already_folded_lane(monkeypatch):
+    """The ``local`` opt-out in ``_resolve_delivery_targets`` short-circuits before any token is
+    resolved, and it folds the lane itself rather than relying on ``_normalize_deliver_value``
+    having run. Pinned with the normalizer stubbed out, which is the only way to hand this layer
+    a raw lane now that the value is canonical at the source."""
+    monkeypatch.setattr(sched_delivery, "_normalize_deliver_value", lambda value: value)
+
+    def _must_not_resolve(*_a, **_kw):
+        raise AssertionError("the local lane must not reach target resolution")
+
+    monkeypatch.setattr(sched_delivery, "_resolve_single_delivery_target", _must_not_resolve)
+
+    assert sched_delivery._resolve_delivery_targets({"id": "j-raw", "deliver": " Local "}) == []
+
+
+def test_unresolved_outcome_does_not_assume_an_already_folded_lane(monkeypatch):
+    """Same contract one layer down, and the site that decides whether the body is logged at all:
+    a raw `` Local `` must read as the local lane (no error, nothing logged), not as a platform
+    named "Local" that resolves to nothing and dumps the job body on every run."""
+    monkeypatch.setattr(sched_delivery, "_normalize_deliver_value", lambda value: value)
+
+    outcome = sched_delivery._unresolved_delivery_outcome(
+        {"id": "j-raw-outcome", "deliver": " Local "}, False)
+
+    assert outcome == (None, None)
+
+
+def test_the_unresolved_reason_carries_the_folded_lane(platformless_env, monkeypatch, caplog):
+    """The reason string is written into ``last_delivery_error`` and into the log line, so it
+    shows the canonical lane rather than replaying the padding it was typed with."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("padded lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-padded", "name": "padded", "deliver": " all "}, adapters={}, loop=None,
+        )
+
+    reasons = [m for m in _messages(caplog) if "no delivery target resolved" in m]
+    assert reasons and all("deliver=all" in m for m in reasons)
+    assert not any("deliver= all" in m for m in reasons)
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] == "no delivery target resolved for deliver=all"
