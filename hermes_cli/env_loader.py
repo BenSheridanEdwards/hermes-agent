@@ -45,10 +45,305 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_CLI_PATH", "COPILOT_ACP_BASE_URL",
 })
 
+# ACP hosting (``hermes acp`` / ``hermes-acp`` under an editor or agent harness such as Buzz Desktop):
+# the host process owns the agent's identity and injects it as env (``HERMES_HOME=<profile>``,
+# ``BUZZ_PRIVATE_KEY=<managed key>``, ``BUZZ_AUTH_TAG``, ``BUZZ_RELAY_URL``). Every gateway-plugin profile
+# also carries its own ``BUZZ_PRIVATE_KEY`` in ``.env``, so the override=True load below used to replace
+# the managed key, the agent signed as the wrong identity and every relay send failed auth-tag
+# verification. While ACP-hosted these keys keep the value the host passed in.
+#
+# Deliberately a narrow, documented set rather than a blanket override=False: editor hosts (Zed, VS Code)
+# hand Hermes the user's login-shell env, so "host wins for everything" would let a stale
+# ``OPENAI_API_KEY`` export beat the ``.env`` written by ``hermes setup``, the exact thing override=True
+# exists to prevent. The managed-scope ``.env`` (admin lockdown) still beats the host. A blank host value
+# (empty, or whitespace only) counts as "not provided".
+#
+# ``HERMES_HOME`` is protected from ``.env`` ONLY. It is NOT "whatever the host passed": on the
+# ``hermes acp`` entrypoint ``main._apply_profile_override()`` runs before the marker and may already have
+# rewritten it from the sticky ``active_profile`` when the host pointed at the hermes root rather than at a
+# ``profiles/<name>`` dir. The snapshot pins whatever the profile router resolved, which is the value the
+# rest of the process is already using.
+#
+# ``BUZZ_*`` is additionally gated on ``BUZZ_MANAGED_AGENT`` (set only by Buzz Desktop's buzz-acp harness,
+# the same signal ``tools/environments/local_env_policy.py`` uses). Without it the ACP host is a plain
+# editor, where ``website/docs/user-guide/features/acp.md`` documents ``export BUZZ_PRIVATE_KEY=...`` in
+# the launching shell as the supported flow; reversing precedence there would break users who never had a
+# managed identity.
+_ACP_HOST_OWNED_ENV_KEYS: frozenset[str] = frozenset({"HERMES_HOME"})
+_ACP_HOST_OWNED_ENV_PREFIXES: tuple[str, ...] = ("BUZZ_",)
+# One Buzz identity, not three independent values: ``BUZZ_AUTH_TAG`` is a NIP-OA owner attestation bound to
+# the signing key and ``BUZZ_RELAY_URL`` is a tag in the same kind-22242 auth event that
+# ``BUZZ_PRIVATE_KEY`` signs (plugins/platforms/buzz/nostr_auth.py). Letting ``.env`` fill the members the
+# host left unset would pair the managed key with the profile's attestation and fail relay verification for
+# exactly the reason the unfixed override did. So the group is all-or-nothing: once the host claims the
+# identity, the profile may not complete the three names in ``_BUZZ_IDENTITY_ENV_KEYS`` from any of its four
+# supply routes: ``.env``, the project ``.env``, ``.op.env``, an external secret source.
+_BUZZ_IDENTITY_ENV_KEYS: frozenset[str] = frozenset({
+    "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL",
+})
+# What the restore DELETES when the host claims the identity: the identity, not the ``BUZZ_`` namespace.
+# The namespace is about thirty names and the rest of it is plugin configuration ``hermes setup`` writes
+# into the profile's own ``.env`` (``BUZZ_CLI_PATH``, ``BUZZ_CHANNELS``, ``BUZZ_HOME_CHANNEL``,
+# ``BUZZ_ALLOWED_USERS``, ``BUZZ_POLL_INTERVAL`` …). Dropping those leaves a managed agent that signs
+# correctly and cannot send: ``plugins/platforms/buzz/adapter.py`` fails ``_standalone_send`` on a missing
+# CLI path or target channel and watches nothing without channels. ``BUZZ_CREDENTIALS_FILE`` is the one
+# non-identity name in the set, because a credentials record is itself an identity source
+# (``adapter.py:_resolve_credentials_data``).
+_BUZZ_IDENTITY_DROP_KEYS: frozenset[str] = _BUZZ_IDENTITY_ENV_KEYS | {"BUZZ_CREDENTIALS_FILE"}
+# What COUNTS as the host claiming that identity. Only the signing credentials: ``BUZZ_RELAY_URL`` is a
+# non-secret endpoint that a custom harness or an ambient shell export can carry on its own, and treating
+# it as a claim would delete a working profile identity and replace it with nothing (see
+# ``_host_owns_buzz_identity``). It stays a member of the group, so a claiming host still owns it.
+_BUZZ_IDENTITY_TRIGGER_KEYS: frozenset[str] = frozenset({"BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG"})
+_ACP_HOSTED = False  # set once per process by mark_acp_hosted(); never cleared outside tests
+# Host-owned values captured ONCE, by mark_acp_hosted(), before any dotenv load. Deliberately not
+# re-read from os.environ per load: load_hermes_dotenv() runs on background threads in an ACP process
+# (acp_adapter.entry starts background MCP discovery, ACP registers session MCP servers via
+# asyncio.to_thread), and a per-load snapshot taken inside another thread's load window would capture the
+# profile's value and then re-assert THAT forever. An immutable snapshot cannot latch.
+_ACP_HOST_ENV: dict[str, str] = {}
+# Serializes the dotenv load + host-env restore window while ACP-hosted so a concurrent LOADER cannot
+# observe the .env value between the override load and the restore, and two loads cannot interleave their
+# override/delete passes. It buys nothing for non-loading readers, which take no lock and read os.environ
+# directly; that window is closed instead by restoring after each profile source, not by this.
+_ACP_ENV_LOCK = threading.RLock()
+_ACP_RESTORE_LOGGED = False  # once-per-process guard, like _WARNED_KEYS / _SCOPED_SKIP_LOGGED
+_ACP_KEYLESS_CLAIM_LOGGED = False  # ditto, for the tag-without-key warning
+_ACP_OVERLAY_KEYLESS_CLAIM_LOGGED = False  # ditto, for the same warning about the managed overlay
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def mark_acp_hosted(enabled: bool = True) -> None:
+    """Flag this process as ACP-hosted and snapshot the host-owned env (``_ACP_HOST_OWNED_ENV_KEYS`` /
+    ``_ACP_HOST_OWNED_ENV_PREFIXES``) so every later :func:`load_hermes_dotenv` keeps it over the profile's
+    ``.env``. ``HERMES_HOME`` is protected from ``.env`` only, not from the profile router that already ran.
+
+    Called by ``acp_adapter.entry`` before its first load and by ``hermes_cli.main`` when the subcommand is
+    ``acp`` (its import-time load runs before the subcommand dispatches). Process-wide on purpose:
+    ``run_agent`` and lazy MCP loads call :func:`load_hermes_dotenv` again later in the same process and
+    would otherwise re-clobber the host's values.
+
+    ``HERMES_ACP_HOST_ENV=0`` (also ``false``/``no``/``off``) is an operator kill switch that restores the
+    pre-fix precedence without a downgrade.
+
+    Arming is IDEMPOTENT. ``hermes acp`` marks twice (here at import scope, then again inside
+    ``acp_adapter.entry._load_env()``) and by the second call a dotenv load has already run. Re-snapshotting
+    then would capture whatever ``os.environ`` holds at that point and pin it as host-owned, which on any
+    argv shape the import-time gate misses means pinning the PROFILE's key forever. Keeping the first
+    snapshot removes that latch class outright, independently of what the gate gets right."""
+    global _ACP_HOSTED, _ACP_HOST_ENV
+    if enabled and os.environ.get("HERMES_ACP_HOST_ENV", "").strip().lower() in _OFF_VALUES:
+        logger.debug("acp: HERMES_ACP_HOST_ENV opt-out set, profile .env keeps its usual precedence")
+        enabled = False
+    if enabled and _ACP_HOSTED:
+        return  # already armed: the first snapshot is the only pre-load one there is
+    _ACP_HOSTED = bool(enabled)
+    _ACP_HOST_ENV = _snapshot_acp_host_env() if _ACP_HOSTED else {}
+    if _ACP_HOSTED and _env_provides("BUZZ_PRIVATE_KEY") and not os.environ.get("BUZZ_MANAGED_AGENT"):
+        # The whole BUZZ_ protection hangs on this marker being present AT SNAPSHOT TIME
+        # (_is_acp_host_owned_env_key). A managed harness that forgets it reverts to the pre-fix
+        # precedence -- safely, the profile then supplies both halves and nothing is mismatched, but
+        # silently, and naming it here is what would have identified the original Studio failure in one
+        # line instead of four review rounds.
+        logger.debug(
+            "acp: the host passed BUZZ_PRIVATE_KEY without BUZZ_MANAGED_AGENT, so no BUZZ_ name is "
+            "host-owned in this process and the profile .env keeps its usual precedence over all of them"
+        )
+
+
+def is_acp_hosted() -> bool:
+    """True once :func:`mark_acp_hosted` ran in this process."""
+    return _ACP_HOSTED
+
+
+def acp_host_owns_buzz_identity() -> bool:
+    """THE rule, asked as one question: an ACP host in this process supplied a signing member of the Buzz
+    identity group, so it owns the whole group and no other principal may complete it.
+
+    Every enforcement point in the codebase derives from this predicate rather than re-deriving its own
+    version of "is the host in charge here": the env restore (:func:`_restore_acp_host_env`), the managed
+    overlay (:func:`_settle_buzz_identity_after_managed_env`), the Buzz plugin's unscoped disk fallback and
+    its credentials-record fallback (``plugins/platforms/buzz/adapter.py``). Four rounds of review found the
+    same mismatch through four different routes because each route carried its own condition; one predicate
+    is what stops the fifth."""
+    return _ACP_HOSTED and _host_owns_buzz_identity()
+
+
+def acp_host_owns_buzz_identity_key(name: str) -> bool:
+    """:func:`acp_host_owns_buzz_identity` narrowed to one name: ``name`` is in the claimed group, so the
+    restore has already deleted the profile's value for it from ``os.environ``.
+
+    For consumers that can reach the profile's values by some route other than ``os.environ``. The Buzz
+    plugin's unscoped fallback is one: ``build_profile_secret_scope`` re-reads ``<home>/.env`` off disk, so
+    without this it hands back the very names the restore dropped and pairs the host's managed key with the
+    profile owner's attestation again. An env-level rule cannot see a file read, so the rule has to be
+    askable."""
+    return name in _BUZZ_IDENTITY_DROP_KEYS and acp_host_owns_buzz_identity()
+
+
+def _is_acp_host_owned_env_key(name: str) -> bool:
+    """``name`` is host-owned in THIS process: ``HERMES_HOME`` always, ``BUZZ_*`` only for a Buzz-managed
+    agent (see ``BUZZ_MANAGED_AGENT`` in the module comment above)."""
+    if name in _ACP_HOST_OWNED_ENV_KEYS:
+        return True
+    return name.startswith(_ACP_HOST_OWNED_ENV_PREFIXES) and bool(os.environ.get("BUZZ_MANAGED_AGENT"))
+
+
+def _env_provides(name: str) -> bool:
+    """THE definition of "``name`` was supplied" for the whole ACP identity rule: present in
+    ``os.environ`` AND non-blank.
+
+    One function because two of them disagreed and that disagreement was a hole. :func:`_snapshot_acp_host_env`
+    read "provided" as non-blank and :func:`_buzz_env_names` read it as ``in os.environ``, so a host exporting
+    a blank ``BUZZ_AUTH_TAG`` beside a real ``BUZZ_PRIVATE_KEY`` was simultaneously not the owner of that name
+    (kept out of the snapshot) and the reason the drop rule spared it (counted into the pre-load baseline).
+    The profile's tag then survived the load beside the managed key: the exact mismatch this whole path
+    exists to prevent, reached without a credentials file, a vault or a ``.op.env``.
+
+    Blank, not merely empty: ``"   "`` and a trailing ``"\\n"`` are the classic artifact of a harness that
+    reads a value out of a file and exports it unconditionally, and both are truthy."""
+    return bool(os.environ.get(name, "").strip())
+
+
+def _snapshot_acp_host_env() -> dict[str, str]:
+    """Host-owned keys currently in ``os.environ`` with a non-blank value (empty means "not provided").
+
+    Blank, not just empty: ``"   "`` and a trailing ``"\\n"`` are the classic artifact of a harness that
+    reads a key out of a file, and both are truthy. Treating one as provided would pin an unusable key AND
+    claim the whole Buzz group with it, deleting the profile's working identity for a value that cannot
+    sign. ``_sanitize_credential_value`` does not catch it: whitespace is ASCII. The test is
+    :func:`_env_provides`, shared with :func:`_buzz_env_names` so the two cannot drift apart again.
+
+    Values are ASCII-sanitized here, not on restore: ``BUZZ_PRIVATE_KEY`` ends in ``_KEY`` and so falls
+    under ``_sanitize_loaded_credentials``, and re-installing the raw host value afterwards would undo that
+    sweep and ship a header-invalid key. Sanitizing at capture also means the warning names the host's
+    value, before ``_WARNED_KEYS`` can be spent on the profile's."""
+    if not _ACP_HOSTED:
+        return {}
+    return {
+        k: _sanitize_credential_value(k, os.environ[k])
+        for k in list(os.environ)
+        if _env_provides(k) and _is_acp_host_owned_env_key(k)
+    }
+
+
+def _host_owns_buzz_identity() -> bool:
+    """The host claimed the Buzz identity, i.e. supplied a SIGNING member of the group
+    (``_BUZZ_IDENTITY_TRIGGER_KEYS``).
+
+    ``BUZZ_RELAY_URL`` is a member of the group but not a trigger for it: it is a non-secret endpoint, and
+    a harness whose env carries only a relay URL (a custom managed-agent definition, or an ambient
+    ``export BUZZ_RELAY_URL`` in the shell that launched Desktop) has claimed no identity. Triggering on it
+    would delete the profile's key AND tag and leave nothing behind, turning a wrong-identity risk into a
+    total outage."""
+    return any(key in _ACP_HOST_ENV for key in _BUZZ_IDENTITY_TRIGGER_KEYS)
+
+
+def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
+    """Drop every ``_BUZZ_IDENTITY_DROP_KEYS`` name that APPEARED DURING the load and that the host did
+    not pass (a split identity fails relay auth), and THEN re-assert the snapshot. In that order: the
+    restore is a sequence of ``os.environ`` writes with no lock over the readers, so its intermediate
+    states are as observable as its result. See the comment on the two loops below.
+
+    The drop is the identity group, NOT the ``BUZZ_`` prefix. The prefix is what the host OWNS, so a
+    managed harness passing ``BUZZ_CHANNELS`` still beats the profile's; but deleting the prefix took the
+    profile's Buzz plugin configuration with the identity and left an agent that signs correctly and
+    cannot send. See ``_BUZZ_IDENTITY_DROP_KEYS``.
+
+    "Appeared during the load", not "assigned by the loaded ``.env`` files": the loaded-path list covers
+    only the user and project ``.env``, while ``.op.env`` and every external secret source inject straight
+    into ``os.environ`` from the same profile. A host passing only the private key while the profile's
+    ``.op.env`` or vault mapping supplies ``BUZZ_AUTH_TAG`` produces exactly the split identity this whole
+    path exists to prevent. ``buzz_before_load`` is the pre-load baseline, taken by
+    :func:`load_hermes_dotenv` before anything in the load runs, and diffing against it covers all four
+    supply routes in one rule while keeping the runtime carve-out: a ``BUZZ_RELAY_URL`` set before the
+    load is not the profile completing an identity, so it survives.
+
+    Logs key names, never values, once per process."""
+    global _ACP_RESTORE_LOGGED
+    snapshot = _ACP_HOST_ENV
+    if not snapshot:
+        return
+
+    # DROP FIRST, RE-ASSERT SECOND, and that order is load bearing rather than cosmetic. The two loops
+    # touch disjoint names (``dropped`` excludes everything in ``snapshot`` by construction), so the end
+    # state is identical either way and only the INTERMEDIATE state differs. Re-asserting first published
+    # the host's managed key beside the profile owner's attestation for the length of a dict scan: the
+    # exact pairing this module exists to refuse, visible to every non-loading reader, which take no lock
+    # and read ``os.environ`` directly. That is reachable by the real consumer and not only by
+    # instrumentation, because ``load_hermes_dotenv`` runs on background threads in an ACP process (see
+    # ``_ACP_HOST_ENV`` above) while the main thread resolves the identity pair for a Buzz send.
+    # Dropping first makes the intermediate state the profile's key with no attestation, or its mirror,
+    # which an owner-gated relay REFUSES rather than accepts. Pinned by
+    # test_acp_restore_never_shows_a_reader_a_split_identity.
+    dropped: list[str] = []
+    if _host_owns_buzz_identity():
+        dropped = sorted(
+            k for k in os.environ
+            if k in _BUZZ_IDENTITY_DROP_KEYS
+            and k not in snapshot
+            and k not in buzz_before_load
+        )
+        for key in dropped:
+            del os.environ[key]
+
+    replaced = [k for k, v in snapshot.items() if os.environ.get(k) != v]
+    for key in replaced:
+        os.environ[key] = snapshot[key]
+    if _host_owns_buzz_identity():
+        _warn_if_host_claim_has_no_key()
+
+    if (replaced or dropped) and not _ACP_RESTORE_LOGGED:
+        _ACP_RESTORE_LOGGED = True
+        logger.debug("acp: host-owned env kept over profile .env for %s%s",
+                     ", ".join(sorted(replaced)) or "(none)",
+                     f"; dropped profile-supplied Buzz keys {', '.join(dropped)}" if dropped else "")
+
+
+def _warn_if_host_claim_has_no_key() -> None:
+    """A host that supplies ``BUZZ_AUTH_TAG`` and no ``BUZZ_PRIVATE_KEY`` claims the identity and cannot
+    sign it. Failing closed is right, an attestation belongs to one key; failing SILENTLY is not. The
+    profile's key has just been deleted, and the only thing the operator sees downstream is Buzz's generic
+    "must be configured" error with nothing pointing at the cause. Once per process, names only."""
+    global _ACP_KEYLESS_CLAIM_LOGGED
+    if _ACP_KEYLESS_CLAIM_LOGGED or "BUZZ_PRIVATE_KEY" in _ACP_HOST_ENV:
+        return
+    _ACP_KEYLESS_CLAIM_LOGGED = True
+    logger.warning(
+        "acp: the ACP host claimed the Buzz identity with BUZZ_AUTH_TAG but supplied no "
+        "BUZZ_PRIVATE_KEY, so the profile's key was dropped and not replaced. Buzz sends will fail "
+        "until the host passes the signing key that owns that attestation, or you unset BUZZ_AUTH_TAG "
+        "on the host (HERMES_ACP_HOST_ENV=0 restores the profile .env precedence entirely)."
+    )
+
+
+def _buzz_env_names() -> frozenset[str]:
+    """Identity-group names the environment PROVIDES before the load; the baseline
+    :func:`_restore_acp_host_env` diffs against. Scoped to ``_BUZZ_IDENTITY_DROP_KEYS`` because those are the
+    only names the restore can delete, so those are the only names a baseline has to protect.
+
+    "Provides" is :func:`_env_provides`, the same test :func:`_snapshot_acp_host_env` applies, and they have
+    to agree: a name in the baseline is one the drop rule will spare, and a name in the snapshot is one the
+    host owns. Reading a blank value as present here while the snapshot read it as absent meant a host
+    exporting ``BUZZ_AUTH_TAG=""`` beside a real managed key both disclaimed that name and shielded the
+    profile's replacement for it, so the ``override=True`` load handed the managed key the profile owner's
+    attestation."""
+    return frozenset(k for k in _BUZZ_IDENTITY_DROP_KEYS if _env_provides(k))
+
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     """KEY names assigned in a dotenv file (including empty ``KEY=``). A fast line scanner (works in early
-    bootstrap without python-dotenv); decode errors fall back to latin-1 like ``_load_dotenv_with_fallback``."""
+    bootstrap without python-dotenv); decode errors fall back to latin-1 like ``_load_dotenv_with_fallback``.
+
+    Quoted values may span lines (``BUZZ_AUTH_TAG='{\\n  "ok": 1\\n}'``), and a continuation line holding an
+    ``=`` used to parse as its own assignment, inventing key names that were never defined. Track the open
+    quote and skip the body.
+
+    A quote is open only when it is never CLOSED in the rest of the value, not when the value fails to END
+    with it: ``KEY="v" # note`` is a terminated value with an inline comment, the shape ``hermes setup``
+    writes, and testing ``endswith`` there swallowed every following line until the next quote character.
+    That deletes keys the file genuinely defines, via ``_clear_known_keys_missing_from_dotenv``, on every
+    ordinary run rather than only under an ACP host."""
     keys: set[str] = set()
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -57,13 +352,24 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
             text = path.read_text(encoding="latin-1", errors="replace")
         except Exception:
             return keys
-    for line in text.splitlines():
-        line = line.strip()
+    open_quote = ""
+    for raw_line in text.splitlines():
+        if open_quote:  # inside a multi-line quoted value: not assignments, whatever they contain
+            if open_quote in raw_line:
+                open_quote = ""
+            continue
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key = line.removeprefix("export ").split("=", 1)[0].strip()
-        if key:
-            keys.add(key)
+        key, _, value = line.removeprefix("export ").partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        keys.add(key)
+        value = value.lstrip()
+        quote = value[:1]
+        if quote in ("'", '"') and quote not in value[1:]:
+            open_quote = quote
     return keys
 
 
@@ -199,29 +505,36 @@ def _sanitize_loaded_credentials() -> None:
     provider-side "invalid API key" errors (see #6843).
     """
     for key, value in list(os.environ.items()):
-        if not any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES):
-            continue
-        if value.isascii():
-            continue
-        cleaned = value.encode("ascii", errors="ignore").decode("ascii")
-        os.environ[key] = cleaned
-        if key in _WARNED_KEYS:
-            continue
-        _WARNED_KEYS.add(key)
-        stripped = len(value) - len(cleaned)
-        detail = _format_offending_chars(value) or "non-printable"
-        print(f"  Warning: {key} contained {stripped} non-ASCII character"
-              f"{'s' if stripped != 1 else ''} ({detail}) — stripped so the "
-              f"key can be sent as an HTTP header.", file=sys.stderr)
-        print(
-            "  This usually means the key was copy-pasted from a PDF, "
-            "rich-text editor, or web page that substituted lookalike\n"
-            "  Unicode glyphs for ASCII letters. If authentication fails "
-            "(e.g. \"API key not valid\"), re-copy the key from the\n"
-            "  provider's dashboard and run `hermes setup` (or edit the "
-            ".env file in a plain-text editor).",
-            file=sys.stderr,
-        )
+        cleaned = _sanitize_credential_value(key, value)
+        if cleaned != value:
+            os.environ[key] = cleaned
+
+
+def _sanitize_credential_value(key: str, value: str) -> str:
+    """ASCII-clean ONE credential value (warning once per key); any other name or an already-ASCII value is
+    returned untouched. Shared by :func:`_sanitize_loaded_credentials` and the ACP host-env snapshot, which
+    must clean the value it will later re-assert rather than re-installing the raw one."""
+    if not any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES) or value.isascii():
+        return value
+    cleaned = value.encode("ascii", errors="ignore").decode("ascii")
+    if key in _WARNED_KEYS:
+        return cleaned
+    _WARNED_KEYS.add(key)
+    stripped = len(value) - len(cleaned)
+    detail = _format_offending_chars(value) or "non-printable"
+    print(f"  Warning: {key} contained {stripped} non-ASCII character"
+          f"{'s' if stripped != 1 else ''} ({detail}) — stripped so the "
+          f"key can be sent as an HTTP header.", file=sys.stderr)
+    print(
+        "  This usually means the key was copy-pasted from a PDF, "
+        "rich-text editor, or web page that substituted lookalike\n"
+        "  Unicode glyphs for ASCII letters. If authentication fails "
+        "(e.g. \"API key not valid\"), re-copy the key from the\n"
+        "  provider's dashboard and run `hermes setup` (or edit the "
+        ".env file in a plain-text editor).",
+        file=sys.stderr,
+    )
+    return cleaned
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
@@ -315,7 +628,34 @@ def load_hermes_dotenv(
     load_external_secrets: bool = True,
 ) -> list[Path]:
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
-    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
+    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not).
+
+    Exception: once :func:`mark_acp_hosted` ran, host-owned keys (``HERMES_HOME``, and ``BUZZ_*`` for a
+    Buzz-managed agent) keep the value captured by the marker, and no profile source (``.env``, the project
+    ``.env``, ``.op.env``, an external secret source) may complete a Buzz identity the host part-supplied.
+    Under that marker the whole load is serialized: an ACP process loads dotenv from background threads
+    (MCP discovery, session server registration) and an unserialized loader would otherwise be visible to
+    sibling LOADERS between the override load and the restore. Non-loading readers are covered by restoring
+    the host identity as soon as the user ``.env`` has been read, not by the lock."""
+    if not _ACP_HOSTED:
+        return _load_hermes_dotenv(
+            hermes_home=hermes_home, project_env=project_env,
+            load_external_secrets=load_external_secrets,
+        )
+    with _ACP_ENV_LOCK:
+        return _load_hermes_dotenv(
+            hermes_home=hermes_home, project_env=project_env,
+            load_external_secrets=load_external_secrets,
+        )
+
+
+def _load_hermes_dotenv(
+    *,
+    hermes_home: str | os.PathLike | None = None,
+    project_env: str | os.PathLike | None = None,
+    load_external_secrets: bool = True,
+) -> list[Path]:
+    """Body of :func:`load_hermes_dotenv`; call that instead (it owns the ACP serialization)."""
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
     # Multiplex gateway: while a routed profile-home override is active, copying that profile's .env
@@ -340,6 +680,10 @@ def load_hermes_dotenv(
     loaded: list[Path] = []
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
+    # Baseline for the all-or-nothing Buzz group: names present BEFORE anything in this load ran. Taken
+    # here, not inside the restore, because by then the profile's names are indistinguishable from the
+    # host's. See _restore_acp_host_env.
+    buzz_before_load = _buzz_env_names() if _ACP_HOSTED else frozenset()
 
     if user_env.exists():  # normalize formatting / strip NULs before parsing
         _sanitize_env_file_if_needed(user_env)
@@ -350,6 +694,18 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
+    # Restore IMMEDIATELY, not only at the end of the load. The lock below serializes loaders, but every
+    # consumer of the identity reads os.environ directly and takes no lock: the Buzz plugin signing a
+    # kind-22242 event, _sanitize_subprocess_env building a terminal child's env, hermes_subprocess_env.
+    # Between this override=True load and the tail restore sit the project .env, the config re-parse and
+    # a possible Bitwarden/1Password network round trip, and a reader landing in that window would see
+    # the profile's key. Closing the window at its source costs one dict pass.
+    #
+    # OUTSIDE the `if user_env.exists()` block on purpose: a bare profile home with no .env is a supported
+    # shape (#66930 / #67027 semantics, see _clear_known_keys_missing_from_dotenv), and main.py always
+    # passes project_env=PROJECT_ROOT/".env", which then loads with override=not loaded, i.e. True. Gating
+    # this call on the user .env left that case with no early restore at all.
+    _restore_acp_host_env(buzz_before_load)
 
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
     # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
@@ -361,6 +717,13 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    # Second restore, before the vault round trip. .op.env and the project .env are two more profile
+    # sources that can put an identity member into os.environ, and _apply_external_secret_sources below is
+    # the long call in this function: a Bitwarden or 1Password fetch is a network round trip, and that is
+    # the widest window a lock-free reader can land in. Same helper, idempotent, no-op when the host
+    # supplied nothing.
+    _restore_acp_host_env(buzz_before_load)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
     # import optional secret-manager libs (Bitwarden → cryptography → _rust.pyd) into the process replacing
@@ -377,6 +740,14 @@ def load_hermes_dotenv(
     # managed env still load in both cases; only external source resolution is unnecessary for the updater.
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
         _apply_external_secret_sources(home_path)
+
+    # Host-owned keys win over user/project .env while ACP-hosted (see _ACP_HOST_OWNED_ENV_KEYS). Placed
+    # AFTER the external secret sources (a profile mapping BUZZ_PRIVATE_KEY from a vault with
+    # ``override_existing: true`` would otherwise clobber the host identity right after the restore,
+    # agent/secret_sources/registry.py) and BEFORE the managed overlay, so an admin-managed .env keeps
+    # its documented top-of-stack precedence. The belt to the braces above: this is the call that sees the
+    # project .env, .op.env and the external secret sources.
+    _restore_acp_host_env(buzz_before_load)
     _apply_managed_env()
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
@@ -409,7 +780,11 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
 
 def _apply_managed_env() -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
-    from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
+    from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup.
+
+    The admin overlay outranks the ACP host, and that stays true, but when it claims the Buzz identity it
+    claims the whole group: see :func:`_settle_buzz_identity_after_managed_env`. This is the last writer of
+    ``BUZZ_*`` in the load, so it is the last place the all-or-nothing rule has to hold."""
     try:
         from hermes_cli import managed_scope
 
@@ -422,7 +797,72 @@ def _apply_managed_env() -> None:
     if not managed_env.exists():
         return
     _sanitize_env_file_if_needed(managed_env)
+    managed_names = _env_keys_defined_in_dotenv(managed_env) if acp_host_owns_buzz_identity() else set()
+    # Settle BEFORE the load as well as after. The overlay claims the group by NAME, and the names it
+    # claims are known from the file scan before a single value is read, so the members it does not
+    # define can go first and the mixed state never exists. Settling only afterwards left the host's key
+    # beside the admin's attestation for a whole dotenv read and parse, which is a far wider window than
+    # the one inside _restore_acp_host_env and reachable by the same non-loading readers.
+    # The second call is not redundant: _env_keys_defined_in_dotenv is a line scanner, and any name it
+    # under-reports is a name the load itself would re-introduce after the pre-clear.
+    _settle_buzz_identity_after_managed_env(managed_names)
     _load_dotenv_with_fallback(managed_env, override=True)
+    _settle_buzz_identity_after_managed_env(managed_names)
+    _warn_if_managed_overlay_claim_has_no_key(managed_names, managed_env)
+
+
+def _settle_buzz_identity_after_managed_env(managed_names: set[str]) -> None:
+    """Apply the all-or-nothing identity rule to the managed overlay, the one writer of ``BUZZ_*`` that runs
+    AFTER the final :func:`_restore_acp_host_env`.
+
+    ``/etc/hermes/.env`` beats the host by design (admin lockdown, root-owned, documented top of stack) and
+    that precedence is unchanged. What changes is the granularity. The overlay used to win one NAME at a
+    time, so a managed file carrying only ``BUZZ_AUTH_TAG`` left the host's managed key signing the admin's
+    attestation: the same split identity this module refuses from the profile, reached by the one writer
+    positioned after every restore. The admin is a third principal, and the rule does not care which two
+    principals are mixed.
+
+    An overlay that defines a SIGNING member (``_BUZZ_IDENTITY_TRIGGER_KEYS``) has claimed the identity, so
+    it owns the group and the members it did not define are removed. An overlay that defines none has
+    claimed nothing, and keeps its ordinary per-name precedence: ``BUZZ_RELAY_URL`` alone is an org relay
+    pointed at the host's own key, which is exactly the admin lockdown this overlay is for, and
+    ``_host_owns_buzz_identity`` refuses to read a bare relay URL as a claim for the same reason everywhere
+    else.
+
+    Gated on :func:`acp_host_owns_buzz_identity` via the caller: with no host claim there is only one
+    principal supplying the identity and the overlay is ordinary admin precedence over the profile owner's
+    own files, which a single-profile machine legitimately uses to centralize the attestation."""
+    if not managed_names & _BUZZ_IDENTITY_TRIGGER_KEYS:
+        return
+    for key in sorted(_BUZZ_IDENTITY_DROP_KEYS - managed_names):
+        os.environ.pop(key, None)
+
+
+def _warn_if_managed_overlay_claim_has_no_key(managed_names: set[str], managed_env: Path) -> None:
+    """The overlay claimed the identity with an attestation and left nothing that can sign it.
+
+    :func:`_warn_if_host_claim_has_no_key` cannot cover this and must not try: it returns early when the
+    HOST supplied ``BUZZ_PRIVATE_KEY``, which is precisely the case here, so the one situation where an
+    operator most needs the line (the host DID pass a key and the overlay's claim removed it) was the one
+    that produced silence. Downstream all they see is Buzz's generic "no private key (set
+    BUZZ_PRIVATE_KEY or a credentials file)" for an agent whose host passed one.
+
+    Failing closed is still right, an attestation belongs to one key. Only the silence was wrong. Own
+    flag, own text, own claimant: the admin overlay is a different principal from the host and the fix is
+    a different file. Once per process, names and paths only, never values."""
+    global _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED
+    if _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED:
+        return
+    if not managed_names & _BUZZ_IDENTITY_TRIGGER_KEYS or _env_provides("BUZZ_PRIVATE_KEY"):
+        return
+    _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED = True
+    logger.warning(
+        "acp: the managed overlay %s claimed the Buzz identity with BUZZ_AUTH_TAG but defines no "
+        "BUZZ_PRIVATE_KEY, so the ACP host's key was dropped and not replaced. Buzz sends will fail "
+        "until that file also carries the signing key that owns its attestation, or drops "
+        "BUZZ_AUTH_TAG and lets the host's identity stand.",
+        managed_env,
+    )
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

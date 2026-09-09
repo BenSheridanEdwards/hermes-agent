@@ -8,6 +8,8 @@ description: "Complete reference of all environment variables used by Hermes Age
 
 Hermes reads environment variables from the process environment and, for user-managed secrets, from `~/.hermes/.env`. Keep API keys, bot tokens, OAuth secrets, and other credentials in `.env`; prefer `config.yaml` for non-secret behaviour settings when a config key exists. Some variables below are process-only overrides or internal bridge variables and should not be committed to `.env` just because they are documented here.
 
+`.env` overrides values inherited from the launching shell, so a stale export cannot beat the file `hermes setup` wrote. The one exception is [ACP mode](/user-guide/features/acp#precedence-under-an-acp-host), where the host process owns the agent's identity: `HERMES_HOME` and, for a Buzz-managed agent, the `BUZZ_*` group are kept over `.env`.
+
 ## LLM Providers
 
 | Variable | Description |
@@ -724,6 +726,9 @@ Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other
 | `BUZZ_POLL_INTERVAL` | Seconds between inbound poll sweeps (default: `4`) |
 | `BUZZ_AUTH_TAG` | Optional NIP-OA owner-attestation auth tag JSON for NIP-42 WebSocket auth |
 | `BUZZ_CLI_PATH` | Path to the buzz CLI binary (default: `buzz` on PATH, then `~/bin/buzz`) |
+| `BUZZ_MANAGED_AGENT` | Set to a non-empty value (the Desktop app instance id) by Buzz Desktop's `buzz-acp` harness on the Hermes subprocess it spawns. Not user configuration. Marks the agent identity as host-managed, which passes `BUZZ_*` through to terminal children and, under ACP, makes the injected `BUZZ_*` credentials win over `.env` as one group ([details](/user-guide/features/acp#precedence-under-an-acp-host)) |
+
+`BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG` and `BUZZ_RELAY_URL` are one credential: the auth tag is an attestation bound to the private key, and the relay URL travels in the same signed auth event. Supply all three from the same place, or the relay rejects the agent's auth.
 
 ### Microsoft Teams (adapter)
 

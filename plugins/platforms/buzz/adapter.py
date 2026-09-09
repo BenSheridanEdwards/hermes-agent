@@ -144,9 +144,32 @@ def _get_scoped_secret(name, default=None):
         # (#59739) and the Matrix recovery key. A *scoped* miss still returns the default (no cross-profile
         # borrow).
         val = os.getenv(name)
-    if val is None and _current_secret_scope() is None:
+    if val is None and _current_secret_scope() is None and not _acp_host_owns_identity_name(name):
         val = _unscoped_profile_secrets().get(name)
     return val if val is not None else default
+
+
+def _acp_host_owns_buzz_identity() -> bool:
+    """THE rule, asked once: an ACP host claimed the Buzz identity, so it owns the whole group and no other
+    supplier may complete it. Every guard in this module derives from this rather than inventing its own
+    condition. See ``hermes_cli.env_loader.acp_host_owns_buzz_identity``."""
+    from hermes_cli.env_loader import acp_host_owns_buzz_identity
+
+    return acp_host_owns_buzz_identity()
+
+
+def _acp_host_owns_identity_name(name: str) -> bool:
+    """Whether the unscoped fallback below must NOT answer for ``name``.
+
+    ``_unscoped_profile_secrets`` builds its mapping with ``build_profile_secret_scope``, which reads
+    ``<home>/.env`` off disk. Under an ACP host that claimed the Buzz identity, the loader has deliberately
+    deleted the profile's copies of those names from ``os.environ``; reading them back off the same profile's
+    ``.env`` here would undo that in the one place the environment rule cannot see, and hand
+    ``build_auth_event`` the host's managed key with the profile owner's attestation. Only the identity
+    names are affected: the rest of the profile's Buzz configuration still resolves through this fallback."""
+    from hermes_cli.env_loader import acp_host_owns_buzz_identity_key
+
+    return acp_host_owns_buzz_identity_key(name)
 
 
 _UNSCOPED_PROFILE_SECRETS: Optional[Dict[str, str]] = None
@@ -421,7 +444,53 @@ def _reply_to_mode(config, extra: dict) -> str:
 
 
 def _configured_relay(extra: dict) -> str:
+    """The relay this identity authenticates to.
+
+    ``BUZZ_RELAY_URL`` is a member of the claimed identity group, not a free-standing setting: it is
+    signed into the kind-22242 AUTH event alongside the key and the attestation. So under a host claim the
+    profile's ``config.yaml`` may not supply it either, and the environment (which the restore governs) is
+    the only source. Without this gate the rule "every member the host did not supply resolves to nothing,
+    by every route" was false for one member, and a fleet agent that can edit its own ``config.yaml``
+    could choose which relay its managed identity authenticates to. ``_apply_yaml_config`` closes the same
+    route on the other side, where the bridge writes ``config.yaml`` values back into ``os.environ``."""
+    claimed = _claimed_relay(extra)
+    if claimed is not None:
+        return claimed
     return (_scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url") or extra.get("relay_url", "")).strip()
+
+
+def _claimed_relay(extra: Optional[dict]) -> Optional[str]:
+    """The relay under a host claim: the environment's value, or nothing. ``None`` when unclaimed.
+
+    Asked by the configuration GATES as well as by the connecting reads, so ``validate_config`` cannot
+    report an agent as configured from a ``relay_url`` that ``_configured_relay`` will refuse to use. A
+    gate that answers "connected" while every send fails is its own bug report."""
+    if not _acp_host_owns_identity_name("BUZZ_RELAY_URL"):
+        return None
+    configured = (os.getenv("BUZZ_RELAY_URL") or "").strip()
+    if not configured:
+        _warn_claimed_relay_is_host_only(extra)
+    return configured
+
+
+_ACP_RELAY_CLAIM_LOGGED = False
+
+
+def _warn_claimed_relay_is_host_only(extra: Optional[dict]) -> None:
+    """Say why a configured relay stopped being used, once per process.
+
+    Failing closed silently is the complaint this whole path keeps earning: the operator would otherwise
+    see only ``connect()``'s generic "relay URL must be configured" for a profile whose ``config.yaml``
+    plainly sets one. Only fires when a relay IS configured and the claim is what suppressed it."""
+    global _ACP_RELAY_CLAIM_LOGGED
+    if _ACP_RELAY_CLAIM_LOGGED or not str((extra or {}).get("relay_url") or "").strip():
+        return
+    _ACP_RELAY_CLAIM_LOGGED = True
+    logger.warning(
+        "Buzz: the ACP host claimed this agent's identity, so BUZZ_RELAY_URL is host-owned and the "
+        "relay_url in the profile's config.yaml is ignored: the relay is signed into the same auth "
+        "event as the key and the attestation. Pass BUZZ_RELAY_URL from the host."
+    )
 
 
 def _configured_home_channel(extra: dict) -> str:
@@ -452,6 +521,10 @@ def _resolve_cli_path(configured: str = "") -> str:
 
 
 def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
+    """Credential records to try, in order. No ACP gate here on purpose: ``_resolve_identity`` decides
+    whether the record may supply the identity at all, so both the configured path and the default-directory
+    glob below are already unreachable for a claimed group. The multiplex gate stays because it is about a
+    different question (whose profile the ambient directory belongs to)."""
     configured = _configured_credentials_file(extra)
     if configured:
         return [Path(configured).expanduser()]
@@ -487,22 +560,84 @@ def _resolve_credentials_data(extra: Optional[dict] = None) -> dict:
     return {}
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: scoped secret first, then credentials JSON. NEVER log it."""
+def _resolve_identity(extra: Optional[dict] = None) -> Tuple[str, Any]:
+    """Resolve the signing key and the owner attestation TOGETHER, as a pair, from ONE supplier.
+
+    They are one credential, not two settings. A NIP-OA tag is an attestation bound to a single signing key,
+    and ``build_auth_event`` (nostr_auth.py) appends whatever tag it is handed to the kind-22242 event it
+    signs with no consistency check, so a key from one supplier beside a tag from another is an agent that
+    signs as itself and presents someone else's ownership. An owner-gated relay rejects that, and a relay
+    that does not reject it is worse. Resolving the two independently, each with its own fallback chain, is
+    what produced that pairing through four different routes across four review rounds; this function is the
+    single place the pairing is decided.
+
+    Suppliers, in order:
+
+    1. The ACP host, when it claimed the identity. It owns the whole group, so the pair is exactly what the
+       scoped/env layer holds and the credentials record is not consulted for EITHER half. Both directions
+       matter and each was a separate blocker: the record's tag beside the host's managed key, and (the
+       mirror, for a host that passes only ``BUZZ_AUTH_TAG``) the record's key beside the host's attestation.
+       A tag-only host now resolves to no key at all, which is the fail-closed outcome
+       ``_warn_if_host_claim_has_no_key`` already promises the operator.
+    2. The scoped/env layer, when it holds the key. The record did not supply the key, so it may not supply
+       the tag. This also closes the ``config.yaml`` route, which no environment rule can reach:
+       ``_configured_credentials_file`` reads ``extra["credentials_file"]`` from the profile's own config.
+    3. The credentials record. The profile owner's own ``buzz login`` output. An ambient ``BUZZ_AUTH_TAG``
+       beside it is the same principal (the documented NIP-OA membership flow in
+       ``website/docs/user-guide/messaging/buzz.md``), so it still rides along with the record's key.
+
+    Returns the tag RAW and unvalidated; :func:`_serialize_auth_tag` owns parsing, and
+    :func:`_resolve_identity_pair` is what consumers call. NEVER log the key."""
     key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
-    return key or _credentials_key(_resolve_credentials_data(extra))
+    tag: Any = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
+    if _acp_host_owns_buzz_identity() or key:
+        return key, tag
+    data = _resolve_credentials_data(extra)
+    return _credentials_key(data), (tag or data.get("auth_tag", ""))
 
 
-def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
-    """Resolve and validate the optional NIP-OA owner-attestation tag."""
-    raw: Any = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
-    if not raw:
-        if str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip() and not _configured_credentials_file(extra):
-            return ""
-        if "auth_tag" not in (data := _resolve_credentials_data(extra)):
-            return ""
-        raw = data["auth_tag"]
+def _serialize_auth_tag(raw: Any) -> str:
+    """Parse and compactly re-serialize a raw attestation.
+
+    A blank tag is "not provided" (the same test :func:`hermes_cli.env_loader._env_provides` applies to the
+    host's values); anything else must parse as a four-string NIP-OA tag or this raises."""
+    if isinstance(raw, str) and not raw.strip():
+        return ""
     return json.dumps(_nostr_auth.parse_auth_tag(raw, "Buzz auth tag"), separators=(",", ":"))
+
+
+def _resolve_identity_pair(extra: Optional[dict] = None) -> Tuple[str, str]:
+    """THE way a consumer obtains the signing key or the attestation: both at once, from one
+    :func:`_resolve_identity` call, or neither.
+
+    There is deliberately no ``_resolve_private_key`` / ``_resolve_auth_tag`` pair any more. Those existed,
+    each resolving one half through :func:`_resolve_identity`, and every call site immediately unpaired
+    them again::
+
+        self._private_key = _resolve_private_key(self._extra)   # one resolution
+        self._auth_tag = _resolve_auth_tag(self._extra)         # a second, later, independent one
+
+    which re-reads ``os.environ`` through :func:`_get_scoped_secret` twice at two different moments, so
+    what reaches ``build_auth_event`` is two resolutions rather than one pair. That is the same shape that
+    produced a mismatched identity through four different routes across four review rounds, and while the
+    env restore is now atomic (``hermes_cli.env_loader._restore_acp_host_env``) the widest instance never
+    depended on that window at all: ``_authenticate_websocket`` used a key captured at ``connect()`` and a
+    tag resolved fresh at AUTH challenge time, arbitrarily far apart.
+
+    Making the pair the only obtainable thing removes the class rather than one window of it. Gates that
+    only need to know whether an identity exists ask :func:`_identity_key_present`, which answers a bool
+    and hands out no half to use. NEVER log the key."""
+    key, raw = _resolve_identity(extra)
+    return key, _serialize_auth_tag(raw)
+
+
+def _identity_key_present(extra: Optional[dict] = None) -> bool:
+    """Whether an identity resolves to something that can sign: a configuration GATE, not a resolution.
+
+    ``check_requirements``, ``validate_config``, ``_env_enablement`` and the setup wizard ask "is Buzz
+    configured", never "give me the key", so they get a bool. That is why they are not a hole in the
+    pairing rule of :func:`_resolve_identity_pair`: a boolean cannot be paired with anything."""
+    return bool(_resolve_identity(extra)[0])
 
 
 async def _exec_buzz(
@@ -900,8 +1035,7 @@ class BuzzAdapter(BasePlatformAdapter):
         Raises ``ValueError`` on a malformed owner-auth configuration, exactly as ``connect()`` does.
         """
         if not self._private_key:
-            self._private_key = _resolve_private_key(self._extra)
-            self._auth_tag = _resolve_auth_tag(self._extra)
+            self._private_key, self._auth_tag = _resolve_identity_pair(self._extra)
 
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
         self._ensure_credentials()
@@ -930,8 +1064,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "cli_missing", "buzz CLI binary not found", "Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)"
             )
         try:
-            self._private_key = _resolve_private_key(self._extra)
-            self._auth_tag = _resolve_auth_tag(self._extra)
+            self._private_key, self._auth_tag = _resolve_identity_pair(self._extra)
         except ValueError as exc:
             return self._connect_failed("config_invalid", str(exc), "Buzz: invalid owner-auth configuration — %s", exc)
         if not self._private_key:
@@ -1583,15 +1716,26 @@ class BuzzAdapter(BasePlatformAdapter):
         # secret scope (#98738): inside a scoped multiplex profile a missing tag fails closed to "" instead
         # of attaching the default profile's tag from os.environ, while single-profile and unscoped
         # default-profile reads keep the legacy env behavior. connect() populates ``self._auth_tag`` via
-        # ``_resolve_auth_tag`` (scope-aware read + credentials-file fallback, #79514); resolve lazily here
+        # ``_resolve_identity_pair`` (scope-aware read + credentials-file fallback, #79514); resolve lazily here
         # as well so a re-auth on a bare adapter stays scope-correct.
-        auth_tag = getattr(self, "_auth_tag", "") or ""
+        private_key, auth_tag = self._private_key, getattr(self, "_auth_tag", "") or ""
         if not auth_tag:
+            # BOTH halves, from ONE resolution, and the key it returns replaces the captured one. This was
+            # the widest unpairing in the module: the key was captured at connect() and the attestation
+            # resolved fresh at AUTH challenge time, arbitrarily far apart, so a supplier that changed in
+            # between (a sibling env load, a re-auth on a bare adapter) signed with one principal's key and
+            # presented another's attestation. A resolution that yields NO key supplies no attestation
+            # either as far as this event is concerned: pairing its tag with the captured key is exactly
+            # the mismatch, so that case keeps the captured key and sends no tag at all, which an
+            # owner-gated relay refuses rather than mis-attributes.
             try:
-                auth_tag = _resolve_auth_tag(getattr(self, "_extra", None))
+                resolved_key, resolved_tag = _resolve_identity_pair(getattr(self, "_extra", None))
             except ValueError:
-                auth_tag = ""
-        event = _nostr_auth.build_auth_event(private_key=self._private_key, challenge=str(message[1]), relay_url=self._websocket_url(), auth_tag_json=auth_tag)
+                resolved_key, resolved_tag = "", ""
+            if resolved_key:
+                self._private_key = private_key = resolved_key
+                self._auth_tag = auth_tag = resolved_tag
+        event = _nostr_auth.build_auth_event(private_key=private_key, challenge=str(message[1]), relay_url=self._websocket_url(), auth_tag_json=auth_tag)
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
             response = json.loads(await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT))
@@ -2428,9 +2572,11 @@ def check_requirements() -> bool:
         # Consult the profile's own config.yaml (via the scoped home override) and its secret scope instead;
         # an unconfigured profile fails closed. See #98738.
         extra = _profile_buzz_extra()
-        return bool(str(extra.get("relay_url") or "").strip() and _resolve_private_key(extra))
+        claimed = _claimed_relay(extra)
+        relay = claimed if claimed is not None else str(extra.get("relay_url") or "")
+        return bool(relay.strip()) and _identity_key_present(extra)
     # The gate runs before per-profile scopes install; the relay can be externally managed too.
-    return bool((_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip()) and bool(_resolve_private_key())
+    return bool((_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip()) and _identity_key_present()
 
 
 def validate_config(config) -> bool:
@@ -2443,7 +2589,8 @@ def validate_config(config) -> bool:
         relay = relay if relay is not None else extra.get("relay_url", "")
     else:
         relay = _get_scoped_secret("BUZZ_RELAY_URL", "") or extra.get("relay_url", "")
-    return bool(relay and _resolve_private_key(extra))
+    claimed = _claimed_relay(extra)
+    return bool(relay if claimed is None else claimed) and _identity_key_present(extra)
 
 
 def is_connected(config) -> bool:
@@ -2483,6 +2630,13 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         missing = {"str": not val, "csv": val is None}.get(kind, src not in extra)
         if missing or (kind != "thread" and skip_env_bridge) or os.getenv(env):
             continue
+        # This bridge writes config.yaml straight back into os.environ, and it runs on every gateway
+        # config load, i.e. AFTER every restore. A name in a claimed identity group would be re-supplied
+        # by the profile into the exact hole the rule just made, where no environment rule can see it.
+        # Asked by name rather than by a hard-coded BUZZ_RELAY_URL so a future group member is covered
+        # the day it joins the group.
+        if _acp_host_owns_identity_name(env):
+            continue
         if kind == "csv" and isinstance(val, (list, tuple)):
             val = ",".join(str(v) for v in val)
         os.environ[env] = str(val).lower() if kind in ("flag", "thread") else str(val)
@@ -2498,7 +2652,7 @@ def _env_enablement() -> Optional[dict]:
     # configuration, not this profile's — env enablement must not fabricate a Buzz platform for a profile
     # that did not configure one.
     relay = os.getenv("BUZZ_RELAY_URL", "").strip()
-    if not relay or not _resolve_private_key():
+    if not relay or not _identity_key_present():
         return None
     seed: dict = {"relay_url": relay}
     if channels := os.getenv("BUZZ_CHANNELS", "").strip():
@@ -2524,9 +2678,8 @@ async def _standalone_send(
     """One-shot send without a live adapter (out-of-process ``deliver=buzz`` cron)."""
     extra = getattr(pconfig, "extra", {}) or {}
     relay = _configured_relay(extra)
-    private_key = _resolve_private_key(extra)
     try:
-        auth_tag = _resolve_auth_tag(extra)
+        private_key, auth_tag = _resolve_identity_pair(extra)
     except ValueError as exc:
         return {"error": f"Buzz standalone send: {exc}"}
     cli_path = _configured_cli_path(extra)
@@ -2589,7 +2742,7 @@ def interactive_setup() -> None:
     key = prompt("Nostr private key (nsec or hex; leave blank to keep current)", password=True)
     if key:
         save_env_value("BUZZ_PRIVATE_KEY", key.strip())
-    elif not _resolve_private_key():
+    elif not _identity_key_present():
         print_warning("No private key configured — set BUZZ_PRIVATE_KEY before starting the gateway")
     channels = ask("Channel UUIDs to watch (comma-separated, empty = all joined channels)", "BUZZ_CHANNELS")
     if channels:

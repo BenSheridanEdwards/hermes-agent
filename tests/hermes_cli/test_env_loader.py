@@ -1,7 +1,11 @@
 import codecs
 import importlib
+import json
 import os
 import sys
+from pathlib import Path
+
+import pytest
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -620,3 +624,1128 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
     # The other profile's .env value stands; the process config was not applied.
     assert os.getenv("TERMINAL_ENV") == "docker"
+
+
+# ---------------------------------------------------------------------------
+# ACP-hosted precedence: host-owned env beats the profile .env
+#
+# Under Buzz Desktop's buzz-acp harness the host owns the agent identity and
+# passes it in as env: HERMES_HOME=<profile>, BUZZ_PRIVATE_KEY=<managed key>,
+# BUZZ_AUTH_TAG, BUZZ_RELAY_URL, plus BUZZ_MANAGED_AGENT as the harness marker.
+# A profile whose .env carries its own BUZZ_PRIVATE_KEY used to override the
+# managed key on the override=True load, so the agent signed as the wrong
+# identity and every relay send failed BUZZ_AUTH_TAG verification.
+#
+# mark_acp_hosted() snapshots the host-owned set once, before any load, and
+# every later load restores it. The Buzz credential group is all-or-nothing:
+# BUZZ_AUTH_TAG is an attestation bound to BUZZ_PRIVATE_KEY, so a .env that
+# completes a part-supplied host identity splits it across two owners and fails
+# relay verification for exactly the reason the unfixed override did.
+#
+# Non-ACP entrypoints, and plain editor hosts with no BUZZ_MANAGED_AGENT, keep
+# the documented ".env overrides stale shell exports" rule unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _seed_buzz_profile(tmp_path, env_text):
+    home = tmp_path / "profile"
+    home.mkdir()
+    if env_text is not None:
+        (home / ".env").write_text(env_text, encoding="utf-8")
+    return home
+
+
+_BUZZ_PROFILE_ENV = (
+    "BUZZ_PRIVATE_KEY=profile-key\n"
+    "BUZZ_RELAY_URL=ws://profile.example\n"
+    "HERMES_HOME=/profile/says/elsewhere\n"
+    "OPENAI_API_KEY=sk-from-profile\n"
+)
+
+
+def _clear_buzz_env(monkeypatch):
+    for key in ("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL", "BUZZ_API_TOKEN",
+                "BUZZ_MANAGED_AGENT", "OPENAI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _mark_acp_hosted(monkeypatch, env_loader):
+    """Set the marker the way an ACP entrypoint does, with the process-wide globals it writes restored
+    on teardown: monkeypatch.setattr records the pre-test value, so a snapshot taken here cannot leak
+    into another test even though the real globals are deliberately never cleared in production."""
+    monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+    monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+    monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+    monkeypatch.setattr(env_loader, "_ACP_KEYLESS_CLAIM_LOGGED", False)
+    monkeypatch.setattr(env_loader, "_ACP_OVERLAY_KEYLESS_CLAIM_LOGGED", False)
+    env_loader.mark_acp_hosted()
+
+
+def test_acp_hosted_keeps_host_owned_env_over_profile_env(tmp_path, monkeypatch):
+    """Managed ACP host: BUZZ_* and HERMES_HOME passed in by the host survive the
+    profile .env load, and non host-owned keys keep the documented
+    .env-overrides-shell rule. The host supplied part of the Buzz identity, so
+    the profile's BUZZ_RELAY_URL is dropped rather than used to complete it."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_AUTH_TAG", "tag-from-host")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-shell")
+
+    monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+    assert env_loader.is_acp_hosted() is False
+    _mark_acp_hosted(monkeypatch, env_loader)
+    assert env_loader.is_acp_hosted() is True
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [home / ".env"]
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert os.environ["BUZZ_AUTH_TAG"] == "tag-from-host"
+    assert os.environ["HERMES_HOME"] == str(home)
+    # The host owns this identity; .env must not supply the relay leg of it.
+    assert "BUZZ_RELAY_URL" not in os.environ
+    # Not host-owned: .env still beats the stale shell export.
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
+
+
+def test_acp_hosted_profile_env_cannot_complete_a_split_buzz_identity(tmp_path, monkeypatch):
+    """BUZZ_AUTH_TAG is a NIP-OA attestation bound to the signing key, so a host
+    that passes only BUZZ_PRIVATE_KEY must not end up signing with the managed
+    key while presenting the profile's tag: the identity group the .env
+    introduced is dropped, not gap-filled.
+
+    BUZZ_CREDENTIALS_FILE is in that group even though it is not one of the
+    three identity names: a credentials record carries both a key and an
+    auth_tag, so a profile-supplied path is another way to complete the
+    identity (plugins/platforms/buzz/adapter.py:_resolve_credentials_data)."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(
+        tmp_path,
+        "BUZZ_PRIVATE_KEY=profile-key\n"
+        "BUZZ_AUTH_TAG=profile-tag\n"
+        "BUZZ_RELAY_URL=ws://profile.example\n"
+        "BUZZ_CREDENTIALS_FILE=/profile/creds.json\n",
+    )
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+    assert "BUZZ_RELAY_URL" not in os.environ
+    assert "BUZZ_CREDENTIALS_FILE" not in os.environ
+
+
+def test_acp_hosted_keeps_the_profiles_buzz_plugin_configuration(tmp_path, monkeypatch):
+    """The drop is the identity, not the BUZZ_ namespace.
+
+    `hermes setup` writes the plugin's configuration into the profile's own
+    .env (adapter.py save_env_value: BUZZ_CHANNELS, BUZZ_HOME_CHANNEL,
+    BUZZ_ALLOWED_USERS, plus BUZZ_CLI_PATH and BUZZ_POLL_INTERVAL). Deleting
+    those alongside the identity leaves a managed agent that signs correctly
+    and cannot send: _standalone_send fails on a missing CLI path or target
+    channel, and the seed reaches "Buzz: no channels to watch". That is an
+    outage on the exact path this whole mechanism exists to serve, so the
+    non-identity half of the namespace must survive the restore untouched."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(
+        tmp_path,
+        "BUZZ_PRIVATE_KEY=profile-key\n"
+        "BUZZ_AUTH_TAG=profile-tag\n"
+        "BUZZ_RELAY_URL=ws://profile.example\n"
+        "BUZZ_CLI_PATH=/opt/buzz/bin/buzz\n"
+        "BUZZ_CHANNELS=chan-a,chan-b\n"
+        "BUZZ_HOME_CHANNEL=chan-a\n"
+        "BUZZ_ALLOWED_USERS=npub1owner\n"
+        "BUZZ_POLL_INTERVAL=15\n",
+    )
+    _clear_buzz_env(monkeypatch)
+    for key in ("BUZZ_CLI_PATH", "BUZZ_CHANNELS", "BUZZ_HOME_CHANNEL",
+                "BUZZ_ALLOWED_USERS", "BUZZ_POLL_INTERVAL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_RELAY_URL", "ws://host.relay")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    # The identity is the host's, whole.
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://host.relay"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+    # The profile's plugin configuration is still there to send with.
+    assert os.environ["BUZZ_CLI_PATH"] == "/opt/buzz/bin/buzz"
+    assert os.environ["BUZZ_CHANNELS"] == "chan-a,chan-b"
+    assert os.environ["BUZZ_HOME_CHANNEL"] == "chan-a"
+    assert os.environ["BUZZ_ALLOWED_USERS"] == "npub1owner"
+    assert os.environ["BUZZ_POLL_INTERVAL"] == "15"
+
+
+@pytest.mark.parametrize("host_env", [
+    {},                                          # host claimed nothing at all
+    {"BUZZ_RELAY_URL": "ws://host.example"},     # relay only: an endpoint, not a signing claim
+])
+def test_acp_hosted_profile_buzz_env_intact_when_host_supplies_no_identity(
+    tmp_path, monkeypatch, host_env
+):
+    """All-or-nothing cuts both ways: a managed host that has not claimed the
+    identity leaves the profile .env supplying all of it exactly as before.
+
+    BUZZ_RELAY_URL is a member of the group but not a trigger for it: it is a
+    non-secret endpoint that a custom harness definition or an ambient shell
+    export can carry alone, and treating it as a claim would delete the
+    profile's key AND tag and leave the agent with nothing to sign with, a
+    total outage rather than a wrong identity."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    for key, value in host_env.items():
+        monkeypatch.setenv(key, value)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    # A relay the host did pass is still host-owned; it just did not claim the group.
+    assert os.environ["BUZZ_RELAY_URL"] == host_env.get(
+        "BUZZ_RELAY_URL", "ws://profile.example"
+    )
+
+
+def test_acp_hosted_tag_without_a_key_warns_instead_of_failing_silently(
+    tmp_path, monkeypatch, caplog
+):
+    """BUZZ_AUTH_TAG is a trigger, so a host that supplies only the attestation
+    claims the group and deletes the profile's key without replacing it. Failing
+    closed is right, an attestation belongs to one key. Failing silently is not:
+    the agent has no key at all, and the only thing downstream is Buzz's generic
+    "must be configured" error with nothing pointing at the cause.
+
+    Asymmetric with the relay case on purpose, where a non-trigger member leaves
+    the profile identity whole; here the outage is total, so it gets a warning
+    that names the cause and the two ways out."""
+    import logging
+
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_AUTH_TAG", "host-tag")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    with caplog.at_level(logging.WARNING, logger=env_loader.__name__):
+        load_hermes_dotenv(hermes_home=home)
+
+    assert "BUZZ_PRIVATE_KEY" not in os.environ  # failed closed, as intended
+    assert os.environ["BUZZ_AUTH_TAG"] == "host-tag"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("BUZZ_PRIVATE_KEY" in m and "HERMES_ACP_HOST_ENV=0" in m for m in warnings), warnings
+    # Names only, never the values it just handled.
+    assert not any("host-tag" in m or "profile-key" in m for m in warnings), warnings
+
+
+def test_acp_hosted_only_drops_buzz_keys_the_dotenv_defined(tmp_path, monkeypatch):
+    """An identity member set at runtime after the marker is not the profile
+    completing an identity, so the restore leaves it alone: only names that
+    APPEARED DURING the load are dropped.
+
+    The runtime key here is an identity member on purpose. A non-identity
+    BUZZ_ name would survive the narrowed drop set on its own and pin nothing
+    about the pre-load baseline."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, "BUZZ_AUTH_TAG=profile-tag\n")
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    _mark_acp_hosted(monkeypatch, env_loader)
+    monkeypatch.setenv("BUZZ_RELAY_URL", "ws://set-at-runtime")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://set-at-runtime"
+
+
+def test_plain_editor_acp_host_keeps_dotenv_precedence_for_buzz(tmp_path, monkeypatch):
+    """Without BUZZ_MANAGED_AGENT the ACP host is a plain editor (Zed, VS Code),
+    where the docs tell operators to export BUZZ_PRIVATE_KEY in the launching
+    shell. Reversing precedence there would break users who never had a managed
+    identity, so only HERMES_HOME is protected."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "shell-export-key")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://profile.example"
+    assert os.environ["HERMES_HOME"] == str(home)
+
+
+def test_acp_host_snapshot_cannot_latch_a_clobbered_value(tmp_path, monkeypatch):
+    """The thread race in miniature: another thread's in-flight load left the
+    profile value in os.environ. A snapshot re-read per load would capture THAT
+    and re-assert it forever; the snapshot is taken once, by the marker, so the
+    next load restores the host value.
+
+    Also covers the repeat-load case run_agent / lazy MCP loads hit: the marker
+    is process-wide, so a later load cannot re-clobber either."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "profile-key")  # other thread, mid-load
+    load_hermes_dotenv(hermes_home=home)
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+    load_hermes_dotenv(hermes_home=home, project_env=tmp_path / "missing.env")
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
+def test_marking_acp_hosted_twice_keeps_the_pre_load_snapshot(tmp_path, monkeypatch):
+    """`hermes acp` marks TWICE: once at main's import scope, then again inside
+    acp_adapter.entry._load_env(). By the second call a dotenv load has already
+    run, so re-snapshotting would capture whatever is in os.environ then and pin
+    it as host-owned. On any argv shape the import-time gate misses, that is the
+    PROFILE's key pinned for the life of the process, silently. Arming is
+    idempotent, so the latch class is gone independently of the gate."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "profile-key")  # an unmarked load already ran
+    env_loader.mark_acp_hosted()  # entry._load_env()'s second call
+
+    assert env_loader._ACP_HOST_ENV["BUZZ_PRIVATE_KEY"] == "managed-key"
+    load_hermes_dotenv(hermes_home=home)
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
+def test_marking_acp_hosted_twice_keeps_an_empty_pre_load_snapshot(tmp_path, monkeypatch):
+    """The empty snapshot is the case the guard is actually about, and the only
+    one that separates `if enabled and _ACP_HOSTED` from the narrower
+    `_ACP_HOSTED and _ACP_HOST_ENV`.
+
+    A host that passed nothing has an empty first snapshot, so a guard that
+    also required a non-empty snapshot would fall through on the second mark,
+    re-read os.environ after the load has run and pin the PROFILE's values as
+    host-owned. That is the worst instance of the latch, not an exempt one:
+    the test above cannot see it, because its first snapshot is non-empty and
+    both guards short-circuit identically there."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.delenv("HERMES_HOME", raising=False)  # host claimed nothing at all
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    assert env_loader._ACP_HOST_ENV == {}
+    load_hermes_dotenv(hermes_home=home)  # the .env assigns HERMES_HOME and BUZZ_PRIVATE_KEY
+    env_loader.mark_acp_hosted()  # entry._load_env()'s second call
+
+    assert env_loader._ACP_HOST_ENV == {}
+    assert os.environ["HERMES_HOME"] == "/profile/says/elsewhere"
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+
+
+def test_acp_env_lock_keeps_a_sibling_loader_out_of_the_load_window(tmp_path, monkeypatch):
+    """An ACP process loads dotenv from background threads (entry starts
+    background MCP discovery, sessions register MCP servers via asyncio.to_thread).
+
+    What the lock actually buys is that a sibling LOADER cannot run its own
+    override/delete passes inside another load's window, so pin that rather than
+    the settled value the immutable snapshot already guarantees on its own: the
+    sibling started mid-window must still be blocked when the window ends."""
+    import threading
+
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    finished = threading.Event()
+    observed: list = []  # [None] once armed, then the sibling's finished-state at window close
+    errors: list[BaseException] = []
+
+    def sibling():
+        try:
+            load_hermes_dotenv(hermes_home=home)
+        except BaseException as exc:  # noqa: BLE001 (surfaced as a test failure below)
+            errors.append(exc)
+        finished.set()
+
+    thread = threading.Thread(target=sibling)
+
+    def during_the_window(_home):
+        """Stands in for the external secret fetch, inside the outer load's window.
+        Runs its body once: the sibling's own load reaches this hook too."""
+        if observed:
+            return
+        observed.append(None)
+        thread.start()
+        finished.wait(timeout=1.0)
+        observed[0] = finished.is_set()
+
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", during_the_window)
+
+    load_hermes_dotenv(hermes_home=home)
+    thread.join(timeout=30)
+
+    assert errors == []
+    assert observed == [False], "a sibling loader ran inside the load window"
+    assert not thread.is_alive()
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
+def test_acp_hosted_non_dotenv_profile_sources_cannot_complete_the_identity(tmp_path, monkeypatch):
+    """The user and project .env are not the profile's only supply routes.
+    `.op.env` is loaded straight into os.environ and never appears in `loaded`,
+    and an external secret source injects without touching a dotenv file at all.
+    A host passing only BUZZ_PRIVATE_KEY while either of those supplies
+    BUZZ_AUTH_TAG produces the same split identity, and fails relay
+    verification for exactly the reason the unfixed override did."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, "OPENAI_API_KEY=sk-from-profile\n")
+    (home / ".op.env").write_text("BUZZ_AUTH_TAG=opdotenv-tag\n", encoding="utf-8")
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda _home: os.environ.__setitem__("BUZZ_RELAY_URL", "ws://vault.example"),
+    )
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+    assert "BUZZ_RELAY_URL" not in os.environ
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
+
+
+def test_acp_host_key_is_ascii_sanitized_before_it_is_restored(tmp_path, monkeypatch):
+    """BUZZ_PRIVATE_KEY ends in _KEY, so _sanitize_loaded_credentials strips
+    non-ASCII from it. Re-installing the raw host value on restore would undo
+    that sweep (and _WARNED_KEYS would suppress the second warning), shipping a
+    key that cannot be sent as an HTTP header."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setattr(env_loader, "_WARNED_KEYS", set())
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1ab​cd")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "nsec1abcd"
+    assert os.environ["BUZZ_PRIVATE_KEY"].isascii()
+
+
+def test_acp_host_env_opt_out_restores_dotenv_precedence(tmp_path, monkeypatch):
+    """HERMES_ACP_HOST_ENV=0 is the operator kill switch: an install that hits a
+    bad interaction can get the old precedence back without a downgrade."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("HERMES_ACP_HOST_ENV", "0")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    assert env_loader.is_acp_hosted() is False
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+
+
+def test_non_acp_profile_env_still_overrides_inherited_buzz_key(tmp_path, monkeypatch):
+    """Gateway / CLI / cron are unchanged: the profile .env overrides an
+    inherited BUZZ_PRIVATE_KEY exactly as before."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+    monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
+
+
+@pytest.mark.parametrize("host_value", ["", "   ", "\n", "\t "])
+def test_acp_hosted_blank_host_value_is_filled_from_profile_env(tmp_path, monkeypatch, host_value):
+    """A host that passes a blank BUZZ_PRIVATE_KEY has not provided a key; the
+    profile .env may fill it. Blank, not merely empty: "   " and a trailing "\\n"
+    are what a harness that read the key out of a file passes, both are truthy,
+    and _sanitize_credential_value cannot help because whitespace is ASCII.
+    Counting one as provided would pin a key that cannot sign AND claim the
+    whole group with it, deleting the profile's working identity."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", host_value)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://profile.example"
+
+
+_BUZZ_PROFILE_ENV_WITH_TAG = (
+    "BUZZ_PRIVATE_KEY=profile-key\n"
+    'BUZZ_AUTH_TAG=["auth","owner-npub","profile-sig","1"]\n'
+    "BUZZ_RELAY_URL=ws://profile.example\n"
+    "OPENAI_API_KEY=sk-from-profile\n"
+)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
+@pytest.mark.parametrize(
+    "supplied, blanked",
+    [("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG"), ("BUZZ_AUTH_TAG", "BUZZ_PRIVATE_KEY")],
+)
+def test_acp_hosted_blank_host_member_is_not_completed_by_the_profile(
+    tmp_path, monkeypatch, blank, supplied, blanked
+):
+    """A BLANK host value for one identity member, beside a real value for the
+    other, used to hand the profile's value to the blanked one.
+
+    _snapshot_acp_host_env reads "provided" as non-blank, so the blank name is
+    NOT host-owned. _buzz_env_names used to read it as `in os.environ`, so the
+    blank name WAS in the pre-load baseline, and the drop rule spares baseline
+    names. The name the host disclaimed was therefore the one name the profile
+    was allowed to fill, and the override=True load filled it: the managed key
+    signing the profile owner's attestation, or the profile owner's key beside
+    the host's attestation. No credentials file, no vault, no .op.env needed,
+    and a harness that reads its values out of files and exports them
+    unconditionally produces the empty and trailing-newline shapes as a matter
+    of course.
+
+    Both directions, because the group has two signing members and either one
+    can be the blank. _env_provides is now the single test both functions apply.
+    """
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV_WITH_TAG)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv(supplied, "from-host")
+    monkeypatch.setenv(blanked, blank)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ[supplied] == "from-host"
+    # The host claimed the group with `supplied`; it disclaimed `blanked` by
+    # leaving it blank, so `blanked` resolves to nothing rather than to the
+    # profile owner's value. Fail closed, do not sign as a second identity.
+    assert blanked not in os.environ
+    assert "BUZZ_RELAY_URL" not in os.environ
+    # ...and the rest of the profile's Buzz configuration is still untouched.
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
+
+
+def test_acp_hosted_managed_env_claiming_the_identity_owns_the_whole_group(tmp_path, monkeypatch):
+    """The managed overlay is the one writer of BUZZ_* that runs after the last
+    restore, so it could complete the host's identity one name at a time: an
+    /etc/hermes/.env carrying only BUZZ_AUTH_TAG left the host's managed key
+    signing the admin's attestation.
+
+    The overlay still outranks the host. It now does so as a group: defining a
+    signing member claims the identity, and the members it did not define are
+    removed rather than inherited from the host.
+
+    test_acp_hosted_managed_env_still_beats_host is the other half of this pair:
+    an overlay that defines only BUZZ_RELAY_URL has claimed nothing (a bare
+    relay URL is never a claim, here or anywhere else in this module) and keeps
+    its ordinary per-name precedence over the host."""
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(
+        'BUZZ_AUTH_TAG=["auth","admin-npub","admin-sig","1"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_RELAY_URL", "ws://host.example")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert os.environ["BUZZ_AUTH_TAG"] == '["auth","admin-npub","admin-sig","1"]'
+    assert "BUZZ_PRIVATE_KEY" not in os.environ  # not the host's, to go with the admin's tag
+    assert "BUZZ_RELAY_URL" not in os.environ
+
+
+def test_managed_env_tag_over_a_profile_key_is_untouched_without_a_host_claim(tmp_path, monkeypatch):
+    """The overlay group rule is gated on an ACP host claim, and this pins the
+    gate rather than the rule.
+
+    With no host in the picture there is one principal: the machine's admin and
+    the profile owner are the same party as far as the identity goes, and
+    centralizing the attestation in /etc/hermes/.env over a key in the profile's
+    own .env is a legitimate single-profile lockdown. Applying the group rule
+    here would delete that profile's working key."""
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(
+        'BUZZ_AUTH_TAG=["auth","admin-npub","admin-sig","1"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    assert os.environ["BUZZ_AUTH_TAG"] == '["auth","admin-npub","admin-sig","1"]'
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://profile.example"
+
+
+def test_acp_hosted_profile_without_env_keeps_host_env(tmp_path, monkeypatch):
+    """Bare profile (no .env): nothing to restore, host env untouched."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, None)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_AUTH_TAG", "tag-from-host")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    assert load_hermes_dotenv(hermes_home=home) == []
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert os.environ["BUZZ_AUTH_TAG"] == "tag-from-host"
+    assert "BUZZ_RELAY_URL" not in os.environ
+
+
+def test_acp_hosted_known_key_cleanup_is_unchanged(tmp_path, monkeypatch):
+    """The startup scrub of _PROFILE_MANAGED_ENV_KEYS absent from .env is not
+    part of the host-owned set and behaves exactly as in non-ACP mode."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("HERMES_ACP_AUTH_METHOD", "cursor_login")
+    monkeypatch.setenv("COPILOT_CLI_PATH", "/usr/bin/sneaky")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert "HERMES_ACP_AUTH_METHOD" not in os.environ
+    assert "COPILOT_CLI_PATH" not in os.environ
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
+def test_acp_hosted_managed_env_still_beats_host(tmp_path, monkeypatch):
+    """The admin-managed .env keeps its top-of-stack precedence: host-owned
+    keys are restored before the managed overlay, not after."""
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text("BUZZ_RELAY_URL=ws://org.example\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_RELAY_URL", "ws://host.example")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://org.example"
+
+
+def test_acp_hosted_beats_an_override_existing_secret_source(tmp_path, monkeypatch):
+    """A profile mapping BUZZ_PRIVATE_KEY from a vault with override_existing:
+    true writes over a pre-existing env value, so the restore has to run after
+    external secret sources, not only after the dotenv loads.
+
+    The same hook is the reader probe for the other end of the window. Nothing
+    outside the loader takes the ACP lock: the Buzz plugin signing a kind-22242
+    event, _sanitize_subprocess_env and hermes_subprocess_env all read
+    os.environ directly. A restore that only ran at the tail would leave the
+    profile's key visible across the project .env load and this vault round
+    trip, so the host value has to be back in place by the time this runs."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    seen_mid_window: list = []
+
+    def vault_fetch(_home):
+        seen_mid_window.append(os.environ.get("BUZZ_PRIVATE_KEY"))
+        os.environ["BUZZ_PRIVATE_KEY"] = "vault-key"
+
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", vault_fetch)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert seen_mid_window == ["managed-key"]
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+
+
+@pytest.mark.parametrize("shape", ["op-env-supplies-the-tag", "no-user-env-only-a-project-env"])
+def test_acp_hosted_reader_window_is_closed_for_every_profile_source(tmp_path, monkeypatch, shape):
+    """The early restore has to cover the sources that load AFTER the user .env,
+    and it has to run when there is no user .env at all.
+
+    Gated on `if user_env.exists()` and placed above them, it closed the window
+    for one source out of four. A reader landing mid-window then saw either the
+    managed key paired with the profile's attestation (the .op.env row, the
+    exact mismatch this path exists to prevent) or the whole profile identity
+    (the bare-home row, where main.py still passes project_env=PROJECT_ROOT
+    and it loads with override=not loaded, i.e. True).
+
+    Probed at the widest point of the window: _apply_external_secret_sources is
+    a Bitwarden/1Password network round trip, and nothing outside the loader
+    takes the ACP lock."""
+    import hermes_cli.env_loader as env_loader
+
+    project_env = tmp_path / "project.env"
+    if shape == "op-env-supplies-the-tag":
+        home = _seed_buzz_profile(tmp_path, "OPENAI_API_KEY=sk-from-profile\n")
+        (home / ".op.env").write_text("BUZZ_AUTH_TAG=opdotenv-tag\n", encoding="utf-8")
+        project_env.write_text("OPENAI_API_KEY=sk-from-project\n", encoding="utf-8")
+    else:
+        home = _seed_buzz_profile(tmp_path, None)  # bare profile home, no .env
+        project_env.write_text(
+            "BUZZ_PRIVATE_KEY=profile-key\nBUZZ_AUTH_TAG=profile-tag\n", encoding="utf-8"
+        )
+
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    seen_mid_window: list = []
+
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda _home: seen_mid_window.append(
+            (os.environ.get("BUZZ_PRIVATE_KEY"), os.environ.get("BUZZ_AUTH_TAG"))
+        ),
+    )
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert seen_mid_window == [("managed-key", None)]
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# The restore is a SEQUENCE of os.environ writes, and non-loading readers take
+# no lock, so its intermediate states are as observable as its result. The
+# tests below park the loader inside one window each and ask the real Buzz
+# consumer, on the main thread, what identity it would send with right then.
+# ---------------------------------------------------------------------------
+
+_HOST_KEY = "managed-key"
+_HOST_TAG = '["auth","host-npub","host-sig","1"]'
+_PROFILE_KEY = "profile-key"
+_PROFILE_TAG = '["auth","owner-npub","profile-sig","1"]'
+_ADMIN_TAG = '["auth","admin-npub","admin-sig","1"]'
+
+_PRINCIPALS = {
+    _HOST_KEY: "host", _HOST_TAG: "host",
+    _PROFILE_KEY: "profile", _PROFILE_TAG: "profile",
+    _ADMIN_TAG: "admin",
+}
+
+
+def _assert_one_principal(pair, where):
+    """A (key, tag) pair must never name two different principals: that is the whole failure."""
+    key_owner, tag_owner = _PRINCIPALS.get(pair[0]), _PRINCIPALS.get(pair[1])
+    assert not (key_owner and tag_owner and key_owner != tag_owner), (
+        f"{where}: signs with {key_owner}'s key while presenting {tag_owner}'s attestation ({pair!r})"
+    )
+
+
+def _ask_the_real_consumer():
+    """What the agent's send_message tool would sign and present, resolved through the plugin."""
+    from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+    return load_plugin_adapter("buzz")._resolve_identity_pair()
+
+
+def _park_the_loader(home, install_park, **load_kwargs):
+    """Run load_hermes_dotenv on a background thread, park it where ``install_park`` says, and ask the
+    real consumer from the main thread while it is parked.
+
+    A background thread running the load while the main thread sends is not a contrived arrangement:
+    acp_adapter.entry starts background MCP discovery and ACP registers session MCP servers via
+    asyncio.to_thread, both of which reach load_hermes_dotenv. The module comment on _ACP_HOST_ENV says
+    so, and the lock it takes covers other LOADERS, never readers."""
+    import threading
+
+    parked, release = threading.Event(), threading.Event()
+    loader = {"ident": None}
+
+    def park():
+        if threading.get_ident() != loader["ident"] or parked.is_set():
+            return  # never park the consumer's own thread: it asks the same predicate
+        parked.set()
+        release.wait(10)
+
+    install_park(park)
+    failures: list = []
+
+    def run_load():
+        loader["ident"] = threading.get_ident()
+        try:
+            load_hermes_dotenv(hermes_home=home, **load_kwargs)
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread below
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_load)
+    thread.start()
+    try:
+        assert parked.wait(10), "the loader never reached the park point"
+        observed = _ask_the_real_consumer()
+    finally:
+        release.set()
+        thread.join(10)
+    assert not failures, failures
+    return observed, _ask_the_real_consumer()
+
+
+@pytest.mark.parametrize("host_shape", ["key-only-host", "tag-only-host"])
+def test_acp_restore_never_shows_a_reader_a_split_identity(tmp_path, monkeypatch, host_shape):
+    """_restore_acp_host_env drops the profile's members BEFORE it re-asserts the host snapshot, and
+    that order is the fix rather than a preference.
+
+    Re-asserting first published the host's managed key beside the profile owner's attestation for the
+    length of a dict scan. It is the exact pairing the PR is named after, reached with no credentials
+    file, no vault, no .op.env and no config route, and it is observable by the real consumer: the
+    _resolve_identity_pair call behind the agent's send_message tool, running on the main thread while a
+    sibling thread loads. The mirror case is the tag-only host, where the profile's key met the host's
+    attestation the same way.
+
+    The two loops touch disjoint names, so the end state is identical either way and ONLY the window
+    differs; swap them back and this test is the thing that notices."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(
+        tmp_path,
+        f"BUZZ_PRIVATE_KEY={_PROFILE_KEY}\n"
+        f"BUZZ_AUTH_TAG={_PROFILE_TAG}\n"
+        "BUZZ_RELAY_URL=ws://profile.example\n",
+    )
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    if host_shape == "key-only-host":
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    else:
+        monkeypatch.setenv("BUZZ_AUTH_TAG", _HOST_TAG)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    seen: list = []
+    real = env_loader._host_owns_buzz_identity
+
+    def install(park):
+        def hooked():
+            # The first question the restore asks about the claim. In the fixed order it is asked
+            # before anything has been written; reversed, it is asked with the split already published.
+            seen.append((os.environ.get("BUZZ_PRIVATE_KEY"), os.environ.get("BUZZ_AUTH_TAG")))
+            park()
+            return real()
+
+        monkeypatch.setattr(env_loader, "_host_owns_buzz_identity", hooked)
+
+    observed, final = _park_the_loader(home, install)
+
+    _assert_one_principal(observed, "a reader parked inside the restore")
+    for pair in seen:
+        _assert_one_principal(pair, "the restore's own view of os.environ")
+    if host_shape == "key-only-host":
+        assert final == (_HOST_KEY, "")
+    else:
+        assert final == ("", json.dumps(json.loads(_HOST_TAG), separators=(",", ":")))
+
+
+def test_managed_overlay_never_shows_a_reader_a_split_identity(tmp_path, monkeypatch):
+    """The same shape, wider: _apply_managed_env used to load the overlay and settle the group only
+    afterwards, so the gap was a whole dotenv read and parse rather than a dict scan, and it held the
+    host's key beside the admin's attestation.
+
+    The overlay claims the group by NAME, and the names are known from the file scan before a single
+    value is read, so the members it does not define are removed first and the mixed state never
+    exists. Parked at the moment the overlay's load returns, which is the widest point of that gap."""
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_env = managed / ".env"
+    managed_env.write_text(f"BUZZ_AUTH_TAG={_ADMIN_TAG}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    real_load = env_loader._load_dotenv_with_fallback
+
+    def install(park):
+        def hooked(path, *args, **kwargs):
+            result = real_load(path, *args, **kwargs)
+            if Path(path) == managed_env:
+                park()
+            return result
+
+        monkeypatch.setattr(env_loader, "_load_dotenv_with_fallback", hooked)
+
+    try:
+        observed, final = _park_the_loader(home, install)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    _assert_one_principal(observed, "a reader parked between the overlay load and the settle")
+    assert final == ("", json.dumps(json.loads(_ADMIN_TAG), separators=(",", ":")))
+
+
+def test_managed_overlay_claim_without_a_key_warns_instead_of_failing_silently(
+    tmp_path, monkeypatch, caplog
+):
+    """An overlay that claims the identity with an attestation and defines no key fails closed, which
+    is right, and used to do it in total silence, which is not.
+
+    _warn_if_host_claim_has_no_key cannot cover this and must not try: it returns early when the HOST
+    supplied BUZZ_PRIVATE_KEY, and that is exactly the case here. So the one situation where the
+    operator most needs a line, the host DID pass a key and something else removed it, was the one that
+    produced none at all. The claimant is a different principal and a different file, so it gets its
+    own warning naming that file."""
+    import logging
+
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(f"BUZZ_AUTH_TAG={_ADMIN_TAG}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger=env_loader.__name__):
+            load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert "BUZZ_PRIVATE_KEY" not in os.environ  # failed closed, as intended
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(managed / ".env") in m and "BUZZ_PRIVATE_KEY" in m for m in warnings), warnings
+    # Names and paths only, never the values it just handled.
+    assert not any(_HOST_KEY in m or "admin-sig" in m for m in warnings), warnings
+
+
+def test_acp_host_key_without_the_managed_marker_says_so(tmp_path, monkeypatch, caplog):
+    """The whole BUZZ_ protection hangs on BUZZ_MANAGED_AGENT being present at snapshot time, and a
+    managed harness that omits it reverts to the pre-fix precedence: safely, since the profile then
+    supplies both halves and nothing is mismatched, but silently. One debug line names it, which is
+    what would have identified the original Studio failure in one line rather than four rounds."""
+    import logging
+
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)  # no BUZZ_MANAGED_AGENT beside it
+
+    with caplog.at_level(logging.DEBUG, logger=env_loader.__name__):
+        _mark_acp_hosted(monkeypatch, env_loader)
+        load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == _PROFILE_KEY  # pre-fix precedence, as documented
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("BUZZ_MANAGED_AGENT" in m and "BUZZ_PRIVATE_KEY" in m for m in messages), messages
+    assert not any(_HOST_KEY in m for m in messages), messages
+
+
+@pytest.mark.parametrize("text,expected", [
+    pytest.param(
+        "BUZZ_AUTH_TAG='kind=22242\n"
+        "BUZZ_RELAY_URL=ws://inside-the-quoted-value\n"
+        "end'\n"
+        "HERMES_ACP_AUTH_METHOD=cursor_login\n"
+        'BUZZ_PRIVATE_KEY="single-line"\n',
+        {"BUZZ_AUTH_TAG", "HERMES_ACP_AUTH_METHOD", "BUZZ_PRIVATE_KEY"},
+        id="multi-line-quoted-value",
+    ),
+    pytest.param(
+        'HERMES_ACP_AUTH_METHOD="oauth" # how we auth\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n"
+        "COPILOT_CLI_PATH=/usr/local/bin/copilot\n",
+        {"HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "COPILOT_CLI_PATH"},
+        id="inline-comment-after-quoted-value",
+    ),
+    pytest.param(
+        'export COPILOT_CLI_PATH="/usr/local/bin/copilot"  # installed by brew\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n",
+        {"COPILOT_CLI_PATH", "HERMES_ACP_AUTO_APPROVE"},
+        id="export-plus-inline-comment",
+    ),
+])
+def test_dotenv_key_scanner_ignores_multi_line_quoted_values(tmp_path, text, expected):
+    """_env_keys_defined_in_dotenv is a line scanner feeding the scrub of
+    _PROFILE_MANAGED_ENV_KEYS absent from .env. A quoted value may span lines,
+    and a continuation line holding an `=` used to parse as its own assignment,
+    inventing key names the file never defined and hiding real ones that follow.
+
+    The second and third rows are the other half of the same test: a value that
+    IS terminated but carries a trailing comment. `value` is lstripped and not
+    rstripped, so an `endswith(quote)` test reads `KEY="v" # note` as an open
+    quote and swallows every line after it. Those keys then look undefined to
+    _clear_known_keys_missing_from_dotenv, which deletes them from os.environ
+    on any ordinary run."""
+    from hermes_cli.env_loader import _env_keys_defined_in_dotenv
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(text, encoding="utf-8")
+
+    assert _env_keys_defined_in_dotenv(env_file) == expected
+
+
+def test_inline_comment_in_dotenv_does_not_scrub_the_keys_below_it(tmp_path, monkeypatch):
+    """End to end, off the ACP path: `hermes chat` against a .env written in a
+    very common style. python-dotenv parses all three assignments and sets them;
+    the scrub then used to delete the two it could not see, so the profile lost
+    its ACP auth method and its Copilot binary on every invocation."""
+    # setenv-then-delenv, not a bare delenv: MonkeyPatch.delitem records nothing for a key that is
+    # already absent, so the teardown would restore nothing and the load below would leave
+    # COPILOT_CLI_PATH=/usr/local/bin/copilot in the real os.environ for the rest of the process.
+    # test_external_process_provider_seam.py then fails on a copilot binary that does not exist.
+    # scripts/run_tests.sh hides it by isolating per file; `pytest tests/hermes_cli/` does not.
+    for key in ("HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "COPILOT_CLI_PATH"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text(
+        'HERMES_ACP_AUTH_METHOD="oauth" # how we auth\n'
+        "HERMES_ACP_AUTO_APPROVE=1\n"
+        "COPILOT_CLI_PATH=/usr/local/bin/copilot\n",
+        encoding="utf-8",
+    )
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ.get("HERMES_ACP_AUTH_METHOD") == "oauth"
+    assert os.environ.get("HERMES_ACP_AUTO_APPROVE") == "1"
+    assert os.environ.get("COPILOT_CLI_PATH") == "/usr/local/bin/copilot"
+
+
+def test_acp_host_owned_set_is_identity_only():
+    """Lock the invariant: the host-owned set is the agent identity the host
+    passes in (HERMES_HOME, BUZZ_*), never provider credentials. Widening it
+    would let a stale shell export beat the .env written by `hermes setup`
+    for every editor-hosted ACP user. The Buzz group is the atomic part of it:
+    key, attestation and relay travel together in one signed auth event, and
+    only the two signing members COUNT as the host claiming that identity."""
+    from hermes_cli.env_loader import (
+        _ACP_HOST_OWNED_ENV_KEYS,
+        _ACP_HOST_OWNED_ENV_PREFIXES,
+        _BUZZ_IDENTITY_DROP_KEYS,
+        _BUZZ_IDENTITY_ENV_KEYS,
+        _BUZZ_IDENTITY_TRIGGER_KEYS,
+    )
+
+    assert _ACP_HOST_OWNED_ENV_KEYS == frozenset({"HERMES_HOME"})
+    assert _ACP_HOST_OWNED_ENV_PREFIXES == ("BUZZ_",)
+    assert _BUZZ_IDENTITY_ENV_KEYS == frozenset({
+        "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL",
+    })
+    assert _BUZZ_IDENTITY_TRIGGER_KEYS == frozenset({"BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG"})
+    assert _BUZZ_IDENTITY_TRIGGER_KEYS < _BUZZ_IDENTITY_ENV_KEYS
+    # The host OWNS the BUZZ_ prefix, but the restore may only DELETE the identity plus the one
+    # non-identity name that is itself an identity source. Everything else under the prefix is the
+    # profile's plugin configuration, and deleting it is an outage, not a safety measure.
+    assert _BUZZ_IDENTITY_DROP_KEYS == _BUZZ_IDENTITY_ENV_KEYS | {"BUZZ_CREDENTIALS_FILE"}
+    for configuration_key in ("BUZZ_CLI_PATH", "BUZZ_CHANNELS", "BUZZ_HOME_CHANNEL",
+                              "BUZZ_ALLOWED_USERS", "BUZZ_ALLOW_ALL_USERS", "BUZZ_POLL_INTERVAL"):
+        assert configuration_key not in _BUZZ_IDENTITY_DROP_KEYS

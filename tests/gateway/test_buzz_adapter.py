@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import os
 import hashlib
 import json
 import tempfile
@@ -26,8 +27,19 @@ hex_to_npub = _buzz_mod.hex_to_npub
 npub_to_hex = _buzz_mod.npub_to_hex
 _normalize_user_ref = _buzz_mod._normalize_user_ref
 _cli_error_message = _buzz_mod._cli_error_message
-_resolve_private_key = _buzz_mod._resolve_private_key
-_resolve_auth_tag = _buzz_mod._resolve_auth_tag
+# The adapter exposes ONE identity resolver, ``_resolve_identity_pair`` -> (key, tag), because every
+# consumer that split it into two independent resolutions produced a mismatched identity (PR #30, S3).
+# These aliases take the halves apart for assertions, which is the one place halves belong.
+_resolve_identity_pair = _buzz_mod._resolve_identity_pair
+
+
+def _resolve_private_key(extra=None):
+    return _buzz_mod._resolve_identity_pair(extra)[0]
+
+
+def _resolve_auth_tag(extra=None):
+    return _buzz_mod._resolve_identity_pair(extra)[1]
+
 _event_reply_parent_id = _buzz_mod._event_reply_parent_id
 check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
@@ -262,7 +274,7 @@ class TestMultiplexProfileScope:
         multiplex_scope()
         # Scope has no key: the profile is unconfigured and must fail closed
         # to "" rather than resolving the default profile's credentials.
-        assert _buzz_mod._resolve_private_key({}) == ""
+        assert _buzz_mod._resolve_identity_pair({})[0] == ""
 
     def test_default_profile_unscoped_keeps_env_precedence(
         self, monkeypatch, default_profile_env
@@ -373,7 +385,7 @@ class TestMultiplexProfileScope:
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
         monkeypatch.setattr(
-            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+            _buzz_mod, "_resolve_identity_pair", lambda extra=None: ("nsec1profile", "")
         )
         result = asyncio.run(
             _standalone_send(
@@ -440,11 +452,17 @@ class TestMultiplexProfileScope:
         self, multiplex_scope
     ):
         """Positive control: a tag present in the profile's own secret scope
-        IS attached to the NIP-42 auth event."""
+        IS attached to the NIP-42 auth event.
+
+        The scope supplies BOTH halves because that is what a real profile
+        scope holds and because the lazy resolution here is now a PAIR: the
+        AUTH event is signed and attested by one supplier or neither. The
+        key-less variant of this scope is its own test,
+        test_ws_auth_tag_without_a_key_is_not_paired_with_the_captured_key."""
         import asyncio as _asyncio
 
         profile_tag = json.dumps(["auth", "p" * 64, "", "q" * 128])
-        multiplex_scope({"BUZZ_AUTH_TAG": profile_tag})
+        multiplex_scope({"BUZZ_AUTH_TAG": profile_tag, "BUZZ_PRIVATE_KEY": "00" * 31 + "03"})
         adapter = BuzzAdapter.__new__(BuzzAdapter)
         adapter._private_key = "00" * 31 + "03"
         adapter._websocket_url = lambda: "wss://relay.example"
@@ -467,14 +485,19 @@ class TestMultiplexProfileScope:
         assert tags == [json.loads(profile_tag)]
 
     def test_ws_auth_tag_unscoped_default_profile_keeps_env(
-        self, default_profile_env
+        self, default_profile_env, monkeypatch
     ):
         """The default profile constructs unscoped even under multiplex, so
-        its env-provided auth tag still applies (legacy behavior kept)."""
+        its env-provided auth tag still applies (legacy behavior kept).
+
+        The env key is overridden with a signable one for the same reason as
+        the scoped test above: the lazy resolution returns the pair, and the
+        pair's key is what signs the event it attests."""
         import asyncio as _asyncio
 
         from agent.secret_scope import set_multiplex_active
 
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "00" * 31 + "03")
         set_multiplex_active(True)
         try:
             adapter = BuzzAdapter.__new__(BuzzAdapter)
@@ -552,7 +575,7 @@ class TestMultiplexProfileScope:
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
         monkeypatch.setattr(
-            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+            _buzz_mod, "_resolve_identity_pair", lambda extra=None: ("nsec1profile", "")
         )
         result = asyncio.run(
             _standalone_send(
@@ -587,7 +610,7 @@ class TestMultiplexProfileScope:
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
         monkeypatch.setattr(
-            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+            _buzz_mod, "_resolve_identity_pair", lambda extra=None: ("nsec1profile", "")
         )
         result = asyncio.run(
             _standalone_send(
@@ -3193,8 +3216,7 @@ class TestVoiceNoteDelivery:
     @pytest.mark.asyncio
     async def test_blossom_upload_reports_a_signing_failure_instead_of_raising(self, monkeypatch, tmp_path):
         """send_voice runs inside the gateway's TTS hook, which has no ``except``: a raise drops the text reply."""
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
-        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_identity_pair", lambda extra=None: ("", ""))
         blob = tmp_path / "voice-note-1.mp3"
         blob.write_bytes(b"x")
         adapter = _make_adapter()
@@ -3206,8 +3228,7 @@ class TestVoiceNoteDelivery:
 
     @pytest.mark.asyncio
     async def test_send_voice_returns_a_result_when_the_key_cannot_sign(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
-        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_identity_pair", lambda extra=None: ("", ""))
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         _fake_ffmpeg(monkeypatch)
         src = tmp_path / "reply.mp3"
@@ -3231,8 +3252,9 @@ class TestVoiceNoteDelivery:
         """A send that reaches an adapter whose connect() never ran still signs, the way _run_cli does."""
         import httpx
 
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: TEST_PRIVATE_KEY)
-        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: '["auth","lazy"]')
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_identity_pair", lambda extra=None: (TEST_PRIVATE_KEY, '["auth","lazy"]')
+        )
         payload = b"mp3 frames"
         blob = tmp_path / "voice-note-1.mp3"
         blob.write_bytes(payload)
@@ -4289,7 +4311,7 @@ class TestBuzzAdapterLifecycle:
         )
         adapter = _make_adapter()
         adapter.cli_path = "/fake/buzz"
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        monkeypatch.setattr(_buzz_mod, "_resolve_identity_pair", lambda extra=None: ("nsec1test", ""))
         cli = _ScriptedCli()
         cli.script(
             "users", "get",
@@ -4320,6 +4342,165 @@ class TestCredentialResolution:
         creds = tmp_path / "agent_credentials.json"
         creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}), encoding="utf-8")
         monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        assert json.loads(_resolve_auth_tag()) == tag
+
+    @pytest.mark.parametrize("route", ["env-var", "config-yaml-extra"])
+    def test_credentials_file_tag_is_not_paired_with_an_env_key(self, monkeypatch, tmp_path, route):
+        """A NIP-OA tag attests ONE key, and build_auth_event signs whatever pair
+        it is handed without checking them against each other. So when the key
+        comes from the environment, the credentials record did not supply it and
+        may not supply the tag either.
+
+        The config.yaml route is the one no env rule can reach: an ACP host that
+        injects a managed BUZZ_PRIVATE_KEY, and whose env the loader has already
+        reduced to exactly that key, still used to pick up the tag through the
+        profile's own `extra["credentials_file"]` and sign the managed key with
+        the profile owner's attestation."""
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1fromenv")
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        extra = None
+        if route == "env-var":
+            monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        else:
+            monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+            extra = {"credentials_file": str(creds)}
+
+        assert _resolve_private_key(extra) == "nsec1fromenv"  # the env key is what signs
+        assert _resolve_auth_tag(extra) == ""                 # so the file's tag must not ride along
+
+        # Control: with no env key the record supplies BOTH, and the pair is consistent.
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        assert _resolve_private_key(extra) == "nsec1fromfile"
+        assert json.loads(_resolve_auth_tag(extra)) == tag
+
+    def test_acp_managed_key_never_pairs_with_the_profile_env_attestation(
+        self, monkeypatch, tmp_path
+    ):
+        """The unscoped fallback reads the profile's .env off DISK.
+
+        `_unscoped_profile_secrets` builds its mapping with
+        `build_profile_secret_scope`, which loads `<home>/.env` directly, so a
+        name missing from os.environ is answered from the file anyway. Under a
+        managed ACP host that is precisely the set of names the env loader just
+        deleted, and handing them back pairs the host's managed key with the
+        profile owner's attestation again: the same mismatch as the config.yaml
+        route, through a door no environment rule can see.
+
+        The second half is the control. Off the ACP path the fallback is a
+        feature and still answers, so this pins the guard and not the fallback."""
+        import hermes_cli.env_loader as env_loader
+
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        home = tmp_path / "profile"
+        home.mkdir()
+        (home / ".env").write_text(
+            "BUZZ_PRIVATE_KEY=profile-key\n"
+            f"BUZZ_AUTH_TAG={json.dumps(tag)}\n"
+            "BUZZ_RELAY_URL=ws://profile.example\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", None)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+        env_loader.mark_acp_hosted()
+
+        assert _resolve_private_key() == "managed-key"
+        assert _resolve_auth_tag() == ""
+
+        # Control: not ACP-hosted, so the profile's own .env is exactly what the
+        # fallback is for, and the pair it returns is internally consistent.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        assert _resolve_private_key() == "profile-key"
+        assert json.loads(_resolve_auth_tag()) == tag
+
+    @pytest.mark.parametrize("route", ["env-var", "config-yaml-extra", "default-dir-glob"])
+    def test_acp_tag_only_host_never_signs_with_the_profile_credentials_record(
+        self, monkeypatch, tmp_path, route
+    ):
+        """The mirror of test_credentials_file_tag_is_not_paired_with_an_env_key.
+
+        A managed host that supplies BUZZ_AUTH_TAG and no BUZZ_PRIVATE_KEY has
+        claimed the identity and cannot sign it, and the loader's warning says
+        so: "the profile's key was dropped and not replaced. Buzz sends will
+        fail". The first half was true and the second was not. Key resolution
+        fell through to the profile owner's credentials record, reachable by
+        three routes no environment rule touches, so the agent signed with the
+        profile owner's key and presented the host's attestation.
+
+        Both halves are asserted here because the pairing is the failure, not
+        either value on its own, and the not-hosted control at the end pins the
+        guard rather than the fallback: off the ACP path the record is exactly
+        what the fallback is for and it still answers."""
+        import hermes_cli.env_loader as env_loader
+
+        host_tag = ["auth", "a" * 64, "", "d" * 128]
+        record_tag = ["auth", "b" * 64, "", "c" * 128]
+        creds_dir = tmp_path / "creds"
+        creds_dir.mkdir()
+        creds = creds_dir / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "profile-owner-key-from-record", "auth_tag": record_tag}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(host_tag))
+        extra = None
+        if route == "env-var":
+            monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        elif route == "config-yaml-extra":
+            extra = {"credentials_file": str(creds)}
+        else:
+            monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", creds_dir)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+        env_loader.mark_acp_hosted()
+
+        assert _resolve_private_key(extra) == ""              # nothing signs, so nothing is mis-signed
+        assert json.loads(_resolve_auth_tag(extra)) == host_tag  # the host's, and the host's alone
+
+        # Control: not ACP-hosted, so the record is the profile owner's own
+        # `buzz login` output and supplies BOTH halves consistently.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        assert _resolve_private_key(extra) == "profile-owner-key-from-record"
+        assert json.loads(_resolve_auth_tag(extra)) == record_tag
+
+    def test_ambient_auth_tag_still_rides_with_the_profiles_own_record(self, monkeypatch, tmp_path):
+        """The documented NIP-OA membership flow, which the host rule must not
+        break: `buzz login` writes a record with a key and no attestation, and
+        the user sets BUZZ_AUTH_TAG in their own .env
+        (website/docs/user-guide/messaging/buzz.md). One principal supplies both
+        halves, so this is not a mismatch and _resolve_identity still pairs them.
+
+        This is why the tag-only refusal is gated on an ACP host claim rather
+        than applied to every supplier: the rule is about two PRINCIPALS, not
+        two files."""
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile"}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(tag))
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+
+        assert _resolve_private_key() == "nsec1fromfile"
         assert json.loads(_resolve_auth_tag()) == tag
 
     def test_invalid_owner_auth_tag_fails_closed(self, monkeypatch, tmp_path):
@@ -4373,6 +4554,173 @@ class TestCredentialResolution:
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
+
+
+class TestClaimedIdentityIsResolvedAsOnePair:
+    """S3: the pair is the only thing a consumer can obtain, and S1: the relay is in the group."""
+
+    @staticmethod
+    def _alternating_identity(monkeypatch):
+        """Two DIFFERENT suppliers, one per call. A consumer that resolves once sees one of them; a
+        consumer that unpairs the halves back into two resolutions sees both, which is the bug."""
+        pairs = [("key-A", ["auth", "a" * 64, "", "d" * 128]),
+                 ("key-B", ["auth", "b" * 64, "", "c" * 128])]
+        calls = []
+
+        def fake(extra=None):
+            calls.append(extra)
+            return pairs[min(len(calls) - 1, 1)]
+
+        monkeypatch.setattr(_buzz_mod, "_resolve_identity", fake)
+        return pairs, calls
+
+    def test_the_module_offers_no_way_to_resolve_one_half(self):
+        """There is deliberately no _resolve_private_key / _resolve_auth_tag any more.
+
+        Both existed, both went through _resolve_identity, and every consumer immediately unpaired them
+        into two independent resolutions at two different times: the exact shape that produced a
+        mismatched identity through four routes across four review rounds. Gates that only need to know
+        whether Buzz is configured ask _identity_key_present, which returns a bool and hands out no half
+        to pair with anything."""
+        assert not hasattr(_buzz_mod, "_resolve_private_key")
+        assert not hasattr(_buzz_mod, "_resolve_auth_tag")
+        assert callable(_buzz_mod._resolve_identity_pair)
+        assert _buzz_mod._identity_key_present({}) in (True, False)
+
+    def test_ensure_credentials_takes_both_halves_from_one_resolution(self, monkeypatch):
+        pairs, calls = self._alternating_identity(monkeypatch)
+        adapter = BuzzAdapter.__new__(BuzzAdapter)
+        adapter._private_key = ""
+        adapter._auth_tag = ""
+        adapter._extra = {}
+
+        adapter._ensure_credentials()
+
+        assert len(calls) == 1
+        assert adapter._private_key == pairs[0][0]
+        assert json.loads(adapter._auth_tag) == pairs[0][1]
+
+    def test_standalone_send_takes_both_halves_from_one_resolution(self, monkeypatch, tmp_path):
+        """_standalone_send is the out-of-process path behind the agent's own message sending."""
+        from gateway.config import PlatformConfig
+
+        pairs, calls = self._alternating_identity(monkeypatch)
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        cli.chmod(0o755)
+        signed = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=None):
+            signed["key"], signed["tag"] = private_key, auth_tag
+            return 0, '{"accepted": true, "event_id": "e1"}', ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        asyncio.run(_standalone_send(
+            PlatformConfig(enabled=True, extra={"relay_url": "ws://r.example", "cli_path": str(cli)}),
+            CHANNEL, "hi",
+        ))
+
+        assert len(calls) == 1
+        assert signed["key"] == pairs[0][0]
+        assert json.loads(signed["tag"]) == pairs[0][1]
+
+    def test_ws_auth_tag_without_a_key_is_not_paired_with_the_captured_key(self, multiplex_scope):
+        """The widest unpairing in the module: the key was captured at connect() and the attestation
+        resolved fresh at AUTH challenge time, arbitrarily far apart.
+
+        A supplier that answers with an attestation and no key has supplied no identity for this event,
+        so its tag must not ride on the captured key. The event still goes out signed, and an
+        owner-gated relay refuses an unattested member rather than accepting a mis-attributed one."""
+        profile_tag = json.dumps(["auth", "p" * 64, "", "q" * 128])
+        multiplex_scope({"BUZZ_AUTH_TAG": profile_tag})  # a tag, and no key beside it
+        adapter = BuzzAdapter.__new__(BuzzAdapter)
+        adapter._private_key = "00" * 31 + "03"
+        adapter._websocket_url = lambda: "wss://relay.example"
+
+        class _FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def recv(self):
+                if self.sent:
+                    return json.dumps(["OK", self.sent[0][1]["id"], True, "ok"])
+                return json.dumps(["AUTH", "challenge-1"])
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        ws = _FakeWS()
+        asyncio.run(adapter._authenticate_websocket(ws))
+
+        assert [t for t in ws.sent[0][1]["tags"] if t and t[0] == "auth"] == []
+
+    def test_acp_claimed_relay_is_not_resupplied_by_the_profile_config(self, monkeypatch, caplog):
+        """S1, the fourteenth route. BUZZ_RELAY_URL is a member of the claimed group, not a free
+        setting: it is signed into the same kind-22242 event as the key and the attestation.
+
+        The profile's own config.yaml re-supplied it after the restore deleted it, which does not
+        mismatch an attestation but does falsify the stated rule, and lets a fleet agent that can edit
+        its own config.yaml choose which relay its managed identity authenticates to. The control is the
+        same call with no claim, where extra is exactly what it is for."""
+        import logging
+
+        import hermes_cli.env_loader as env_loader
+
+        monkeypatch.setattr(_buzz_mod, "_ACP_RELAY_CLAIM_LOGGED", False)
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        env_loader.mark_acp_hosted()
+        extra = {"relay_url": "ws://profile-chosen.example"}
+
+        with caplog.at_level(logging.WARNING, logger=_buzz_mod.logger.name):
+            assert _buzz_mod._configured_relay(extra) == ""
+        assert any("BUZZ_RELAY_URL" in r.getMessage() for r in caplog.records), caplog.records
+        # The GATES ask the same question, so status cannot report an agent as connected on a relay
+        # the connecting read will refuse: "configured" and "usable" have to be the same answer.
+        from gateway.config import PlatformConfig
+
+        assert validate_config(PlatformConfig(enabled=True, extra=extra)) is False
+        assert _buzz_mod.is_connected(PlatformConfig(enabled=True, extra=extra)) is False
+
+        # Control: no claim, so the profile's own config.yaml is exactly what this reads.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        assert _buzz_mod._configured_relay(extra) == "ws://profile-chosen.example"
+        assert validate_config(PlatformConfig(enabled=True, extra=extra)) is True
+
+    def test_acp_claimed_relay_is_not_resupplied_by_the_yaml_bridge(self, monkeypatch):
+        """The same route through the other door. _apply_yaml_config writes config.yaml values straight
+        back into os.environ, it runs from the gateway config load AFTER every restore, and it asked no
+        rule: it wrote the profile's relay into the exact hole the group rule had just made."""
+        import hermes_cli.env_loader as env_loader
+
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.delenv("BUZZ_CLI_PATH", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        env_loader.mark_acp_hosted()
+        cfg = {"extra": {"relay_url": "ws://profile-chosen.example", "cli_path": "/profile/bin/buzz"}}
+
+        _buzz_mod._apply_yaml_config({}, cfg)
+
+        assert "BUZZ_RELAY_URL" not in os.environ
+        # The bridge is not disabled, only the claimed group is: BUZZ_CLI_PATH is the profile's
+        # plugin configuration, which the drop set has never included.
+        assert os.environ["BUZZ_CLI_PATH"] == "/profile/bin/buzz"
+
+        # Control: no claim, and the relay bridges as it always has.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        _buzz_mod._apply_yaml_config({}, cfg)
+        assert os.environ["BUZZ_RELAY_URL"] == "ws://profile-chosen.example"
 
 
 # ── Env enablement / registration / standalone send ──────────────────────

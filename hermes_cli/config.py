@@ -2666,7 +2666,14 @@ def save_env_value_secure(key: str, value: str) -> Dict[str, Any]:
 def reload_env() -> int:
     """Re-read ~/.hermes/.env into os.environ; returns count of vars changed.
     Removes deleted vars only when known to Hermes (OPTIONAL_ENV_VARS and _EXTRA_ENV_KEYS) so
-    unrelated environment is never clobbered."""
+    unrelated environment is never clobbered.
+
+    NOT ACP-aware: this writes the whole profile .env back over os.environ unconditionally and asks
+    ``hermes_cli.env_loader.acp_host_owns_buzz_identity`` nothing, so it would re-supply the Buzz identity
+    members the ACP restore just dropped. Its callers are the REPL (``cli_loops_mixin._cmd_reload``) and
+    the ``reload.env`` RPC in ``tui_gateway/methods_tools.py``; ``acp_adapter/session.py`` goes straight to
+    ``run_agent.AIAgent`` and never reaches here. Ask that predicate before wiring this into the ACP
+    path."""
     env_vars = load_env()
     count = 0
     for key, value in env_vars.items():

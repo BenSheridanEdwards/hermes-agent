@@ -571,7 +571,59 @@ if sys.platform == "win32":
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import load_hermes_dotenv, mark_acp_hosted
+
+# ``hermes acp`` runs under an ACP host that owns the agent identity it passed in as env (HERMES_HOME,
+# BUZZ_*). This import-time load runs before cmd_acp dispatches, so the marker has to be set here or the
+# profile's .env would already have replaced the host's values (acp_adapter.entry sets it for hermes-acp).
+def _argv_selects_acp(argv: list[str] | None = None) -> bool:
+    """True when the ``acp`` subcommand is the one argparse will dispatch.
+
+    NOT ``sys.argv[1:2] == ["acp"]``, and NOT "the first token that does not start with ``-``". Zero-arg
+    top-level options (``--yolo``, ``--safe-mode``, ``--dev``, ``--tui``) are legal before the subcommand,
+    AND eleven top-level options take a VALUE whose value is itself a non-flag token landing in the
+    subcommand slot. A first-non-flag scan therefore misses ``hermes -m gpt-5 acp`` (marker unset, the
+    profile ``.env`` replaces the host's managed identity) and, worse, fires on ``hermes --resume acp`` and
+    ``hermes --continue acp``, arming the ACP host-env exception for a plain chat session.
+
+    The value-flag sets are DERIVED from the live parser via ``_parser.top_level_value_flag_sets()``, the
+    same source ``_first_positional_argv()`` uses, and never hand-written here: AGENTS.md forbids the
+    hand-rolled copy and ``#93530`` is the last time one drifted (``hermes --reasoning high chat`` read
+    ``high`` as the subcommand). ``--profile``/``-p`` is absent from the parser because
+    ``_apply_profile_override()`` above already consumed and stripped it from ``sys.argv``.
+    """
+    tokens = sys.argv[1:] if argv is None else argv
+    if "acp" not in tokens:
+        # Fast reject. It saves an lru_cache lookup and the import below, NOT the parser build:
+        # ``_apply_profile_override()`` above calls ``_scan_profile_flag``, which already called
+        # ``top_level_value_flag_sets()`` at import scope on every invocation, so by the time the gate
+        # runs the parser exists and this call would be a cache hit.
+        return False
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    required_value_flags, optional_value_flags = top_level_value_flag_sets()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":  # everything after is positional
+            return tokens[i + 1:i + 2] == ["acp"]
+        if not tok.startswith("-"):
+            return tok == "acp"
+        if "=" in tok:  # ``--model=gpt-5`` is a single token and consumes nothing
+            i += 1
+            continue
+        has_value = i + 1 < len(tokens)
+        if tok in required_value_flags and has_value:
+            i += 2
+        elif tok in optional_value_flags and has_value and not tokens[i + 1].startswith("-"):
+            i += 2  # ``--continue`` is nargs="?": it swallows a following non-flag token
+        else:
+            i += 1
+    return False
+
+
+if _argv_selects_acp():
+    mark_acp_hosted()
 
 # ``update`` must not import optional secret-manager libs before ``uv``
 # replaces the environment: on Windows Bitwarden's cryptography import maps

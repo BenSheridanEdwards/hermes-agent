@@ -43,6 +43,40 @@ def test_main_skips_configured_mcp_discovery_when_requested(monkeypatch):
     assert discovery_calls == []
 
 
+def test_load_env_marks_acp_hosted_and_keeps_host_identity(tmp_path, monkeypatch):
+    """Under Buzz Desktop's managed-agent harness the inherited BUZZ_PRIVATE_KEY
+    must survive the profile .env load, and the profile must not supply the
+    BUZZ_AUTH_TAG that goes with it: the attestation is bound to the signing key,
+    so a split identity fails relay verification. _load_env is the first dotenv
+    load of a ``hermes-acp`` process, so it is where the marker gets set."""
+    import os
+
+    import hermes_cli.env_loader as env_loader
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text(
+        "BUZZ_PRIVATE_KEY=profile-key\nBUZZ_AUTH_TAG=profile-tag\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(entry, "get_hermes_home", lambda: home)
+    # The real _load_env reaches _apply_managed_env(); keep a developer's own managed dir and ambient
+    # Buzz env out of the assertions.
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    for key in ("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL", "BUZZ_MANAGED_AGENT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+    monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+    monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+
+    entry._load_env()
+
+    assert env_loader.is_acp_hosted() is True
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
+    assert "BUZZ_AUTH_TAG" not in os.environ
+
+
 
 
 
