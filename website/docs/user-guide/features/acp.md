@@ -386,6 +386,14 @@ that signs with one identity and presents another fails relay verification. That
 covers every route the profile has into the environment (`.env`, the project
 `.env`, `.op.env` and external secret sources), not just the `.env` file.
 
+Two of the profile's routes never touch the environment at all, and the Buzz
+plugin closes those at the point of use rather than in the loader: an owner
+attestation is only ever read from the same credential that supplied the
+signing key, so a `credentials_file` set in the profile's `config.yaml` cannot
+lend its `auth_tag` to a host-supplied key; and the plugin's fallback read of
+the profile's `.env` (used when a value is absent from the environment) skips
+the identity names while a host owns them.
+
 The rest of the `BUZZ_*` namespace is **plugin configuration, not identity**, and
 is left alone. `BUZZ_CHANNELS`, `BUZZ_HOME_CHANNEL`, `BUZZ_ALLOWED_USERS`,
 `BUZZ_CLI_PATH` and `BUZZ_POLL_INTERVAL` are written into the profile's `.env` by
