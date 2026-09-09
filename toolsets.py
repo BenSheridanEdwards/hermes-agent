@@ -179,7 +179,10 @@ TOOLSETS = {
 
     # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
     # there is deliberately no agent-callable send_message tool. hermes-acp is the
-    # coding posture minus the interactive clarify UI.
+    # coding posture minus the interactive clarify UI. Voice-note replies come from
+    # the separate ``tts`` toolset, which ACP sessions add on top by default
+    # (``acp_adapter.session.default_acp_toolsets``, opt out with ``acp.tts: false``),
+    # so this list is what every non-ACP consumer of it has always been.
     "hermes-acp": _ts(
         "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
         "messaging, audio, or clarify UI",

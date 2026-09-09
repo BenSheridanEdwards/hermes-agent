@@ -25,7 +25,7 @@ from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -33,6 +33,67 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+# ---- Voice clip transcription (shared by the gateway inbound path and the ACP adapter) ----
+# One implementation of "clip -> transcript note": configured STT, local fallback, the
+# neutral failure marker, and the empty-transcript sentinel. Callers prepend the returned
+# note to the user text; see ``GatewayInboundMixin._enrich_message_with_transcription`` and
+# ``acp_adapter.voice``.
+
+_EMPTY_TRANSCRIPT_NOTE = (
+    "[The user sent a voice message but it came through "
+    "empty or inaudible — speech-to-text returned no "
+    "words. Do not guess at the content; ask the user "
+    "to resend or type it out.]"
+)
+
+
+def untranscribed_audio_note(path: str) -> str:
+    """One minimal neutral marker for every STT failure. Never mention "no STT provider" or setup
+    steps; persisted in history they make the model keep volunteering STT-setup advice."""
+    from tools.credential_files import to_agent_visible_cache_path
+    agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+    return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
+
+
+def voice_message_attached_note(path: str, duration_str: Optional[str] = None) -> str:
+    """Marker for a voice clip that is attached but deliberately not transcribed (STT disabled).
+
+    Rendered through ``to_agent_visible_cache_path`` like the failure note above: the note exists
+    so the agent can open the clip, and on a docker or ssh terminal backend the host path is not
+    the path it sees. A local backend, and any path outside the Hermes cache, is unchanged."""
+    from tools.credential_files import to_agent_visible_cache_path
+    suffix = f" (duration: {duration_str})" if duration_str else ""
+    agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+    return f"[The user sent a voice message: {agent_path}{suffix}]"
+
+
+async def transcribe_clip(
+    path: str, transcribe_audio, transcribe_audio_local_fallback, *, source: str = "gateway",
+    failure_note: Callable[[str], str] = untranscribed_audio_note,
+) -> Tuple[Optional[str], str]:
+    """``(transcript_or_None, note)`` for one clip via configured STT with local fallback.
+    ``source`` is the caller-surface label forwarded to the ``pre_transcription`` hook;
+    ``failure_note`` renders the marker when every backend failed."""
+    result = await asyncio.to_thread(transcribe_audio, path, None, source)
+    if not result.get("success"):
+        fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+        if fallback.get("success"):
+            logger.info("Configured STT failed for %s; recovered with local STT", path)
+            result = fallback
+    if not result["success"]:
+        logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
+        return None, failure_note(path)
+    transcript = result["transcript"]
+    # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
+    # empty quotes make the agent reply to nothing and can loop, so emit a sentinel note.
+    # See #41603.
+    if not (transcript or "").strip():
+        return None, _EMPTY_TRANSCRIPT_NOTE
+    # Plain quoted line: a "The user sent a voice message..." wrapper read as a meta-instruction
+    # and made the LLM comment on voice mode instead.
+    return transcript, f'"{transcript}"'
 
 
 class GatewayInboundMixin:
@@ -1919,37 +1980,14 @@ class GatewayInboundMixin:
 
     @staticmethod
     def _untranscribed_audio_note(path: str) -> str:
-        """One minimal neutral marker for every STT failure. Never mention "no STT provider" or setup
-        steps — persisted in history they make the model keep volunteering STT-setup advice."""
-        from tools.credential_files import to_agent_visible_cache_path
-        agent_path = to_agent_visible_cache_path(os.path.abspath(path))
-        return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
+        """See module-level :func:`untranscribed_audio_note` (kept as a method for patchers)."""
+        return untranscribed_audio_note(path)
 
     async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
-        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
-        if not result.get("success"):
-            fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
-            if fallback.get("success"):
-                logger.info("Configured STT failed for %s; recovered with local STT", path)
-                result = fallback
-        if not result["success"]:
-            logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
-            return None, self._untranscribed_audio_note(path)
-        transcript = result["transcript"]
-        # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
-        # empty quotes make the agent reply to nothing and can loop, so emit a sentinel note.
-        # See #41603.
-        if not (transcript or "").strip():
-            return None, (
-                "[The user sent a voice message but it came through "
-                "empty or inaudible — speech-to-text returned no "
-                "words. Do not guess at the content; ask the user "
-                "to resend or type it out.]"
-            )
-        # Plain quoted line: a "The user sent a voice message..." wrapper read as a meta-instruction
-        # and made the LLM comment on voice mode instead.
-        return transcript, f'"{transcript}"'
+        """``(transcript_or_None, note)`` for one clip; see module-level :func:`transcribe_clip`."""
+        return await transcribe_clip(
+            path, transcribe_audio, transcribe_audio_local_fallback, source="gateway",
+            failure_note=self._untranscribed_audio_note)
 
     async def _enrich_message_with_transcription(
         self, user_text: str, audio_paths: List[str]
@@ -1962,10 +2000,8 @@ class GatewayInboundMixin:
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
-                abs_path = os.path.abspath(path)
-                duration_str = await _probe_audio_duration(abs_path)
-                suffix = f" (duration: {duration_str})" if duration_str else ""
-                notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
+                notes.append(voice_message_attached_note(
+                    path, await _probe_audio_duration(os.path.abspath(path))))
             return (self._prepend_media_prefix("\n\n".join(notes), user_text) if notes else user_text), []
 
         try:
