@@ -444,7 +444,53 @@ def _reply_to_mode(config, extra: dict) -> str:
 
 
 def _configured_relay(extra: dict) -> str:
+    """The relay this identity authenticates to.
+
+    ``BUZZ_RELAY_URL`` is a member of the claimed identity group, not a free-standing setting: it is
+    signed into the kind-22242 AUTH event alongside the key and the attestation. So under a host claim the
+    profile's ``config.yaml`` may not supply it either, and the environment (which the restore governs) is
+    the only source. Without this gate the rule "every member the host did not supply resolves to nothing,
+    by every route" was false for one member, and a fleet agent that can edit its own ``config.yaml``
+    could choose which relay its managed identity authenticates to. ``_apply_yaml_config`` closes the same
+    route on the other side, where the bridge writes ``config.yaml`` values back into ``os.environ``."""
+    claimed = _claimed_relay(extra)
+    if claimed is not None:
+        return claimed
     return (_scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url") or extra.get("relay_url", "")).strip()
+
+
+def _claimed_relay(extra: Optional[dict]) -> Optional[str]:
+    """The relay under a host claim: the environment's value, or nothing. ``None`` when unclaimed.
+
+    Asked by the configuration GATES as well as by the connecting reads, so ``validate_config`` cannot
+    report an agent as configured from a ``relay_url`` that ``_configured_relay`` will refuse to use. A
+    gate that answers "connected" while every send fails is its own bug report."""
+    if not _acp_host_owns_identity_name("BUZZ_RELAY_URL"):
+        return None
+    configured = (os.getenv("BUZZ_RELAY_URL") or "").strip()
+    if not configured:
+        _warn_claimed_relay_is_host_only(extra)
+    return configured
+
+
+_ACP_RELAY_CLAIM_LOGGED = False
+
+
+def _warn_claimed_relay_is_host_only(extra: Optional[dict]) -> None:
+    """Say why a configured relay stopped being used, once per process.
+
+    Failing closed silently is the complaint this whole path keeps earning: the operator would otherwise
+    see only ``connect()``'s generic "relay URL must be configured" for a profile whose ``config.yaml``
+    plainly sets one. Only fires when a relay IS configured and the claim is what suppressed it."""
+    global _ACP_RELAY_CLAIM_LOGGED
+    if _ACP_RELAY_CLAIM_LOGGED or not str((extra or {}).get("relay_url") or "").strip():
+        return
+    _ACP_RELAY_CLAIM_LOGGED = True
+    logger.warning(
+        "Buzz: the ACP host claimed this agent's identity, so BUZZ_RELAY_URL is host-owned and the "
+        "relay_url in the profile's config.yaml is ignored: the relay is signed into the same auth "
+        "event as the key and the attestation. Pass BUZZ_RELAY_URL from the host."
+    )
 
 
 def _configured_home_channel(extra: dict) -> str:
@@ -2526,7 +2572,9 @@ def check_requirements() -> bool:
         # Consult the profile's own config.yaml (via the scoped home override) and its secret scope instead;
         # an unconfigured profile fails closed. See #98738.
         extra = _profile_buzz_extra()
-        return bool(str(extra.get("relay_url") or "").strip()) and _identity_key_present(extra)
+        claimed = _claimed_relay(extra)
+        relay = claimed if claimed is not None else str(extra.get("relay_url") or "")
+        return bool(relay.strip()) and _identity_key_present(extra)
     # The gate runs before per-profile scopes install; the relay can be externally managed too.
     return bool((_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip()) and _identity_key_present()
 
@@ -2541,7 +2589,8 @@ def validate_config(config) -> bool:
         relay = relay if relay is not None else extra.get("relay_url", "")
     else:
         relay = _get_scoped_secret("BUZZ_RELAY_URL", "") or extra.get("relay_url", "")
-    return bool(relay) and _identity_key_present(extra)
+    claimed = _claimed_relay(extra)
+    return bool(relay if claimed is None else claimed) and _identity_key_present(extra)
 
 
 def is_connected(config) -> bool:
@@ -2580,6 +2629,13 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         val = extra.get(src)
         missing = {"str": not val, "csv": val is None}.get(kind, src not in extra)
         if missing or (kind != "thread" and skip_env_bridge) or os.getenv(env):
+            continue
+        # This bridge writes config.yaml straight back into os.environ, and it runs on every gateway
+        # config load, i.e. AFTER every restore. A name in a claimed identity group would be re-supplied
+        # by the profile into the exact hole the rule just made, where no environment rule can see it.
+        # Asked by name rather than by a hard-coded BUZZ_RELAY_URL so a future group member is covered
+        # the day it joins the group.
+        if _acp_host_owns_identity_name(env):
             continue
         if kind == "csv" and isinstance(val, (list, tuple)):
             val = ",".join(str(v) for v in val)
