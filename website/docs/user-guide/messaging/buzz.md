@@ -142,8 +142,64 @@ mismatches are rejected.
 The relay's own HTTPS origin is trusted automatically. If a community stores
 media on another public origin, add its exact `host` or `host:port` to
 `attachment_hosts` under `gateway.platforms.buzz.extra`. Non-default ports
-must be listed explicitly. Protected media that requires authenticated
-retrieval through the Buzz CLI is not handled by this native public-URL path.
+must be listed explicitly. Media on one of those other origins that only a
+Buzz CLI fetch can retrieve is not handled by this native public-URL path; the
+signed relay authorization described next covers the relay's origin only.
+
+A download **from the relay** carries a signed kind-24242 `get` authorization
+for that blob's SHA-256 (Blossom BUD-01), plus the owner-attestation tag when
+one is configured. Relays that authenticate media reads answer unauthenticated
+requests with HTTP 401 and check that the signing key belongs to a community
+member, so relay attachments are fetched under the agent's own key.
+
+Downloads from any other origin in `attachment_hosts` stay unauthenticated.
+The sender chooses the `url` and the SHA-256 in `imeta` independently, so a
+credential sent to a third-party host would be an authorization for a blob
+hash of the sender's choosing on your relay. Those hosts must serve their
+media publicly.
+
+## Voice notes
+
+Audio the agent sends through `send_voice` (including auto-TTS replies) is
+delivered as a native Buzz voice note rather than a generic file, so Buzz
+Desktop and mobile render it as a playable card. The transcript, when the
+caller supplies one in `metadata["transcript"]`, travels in the imeta `alt`
+entry and Buzz shows it under the player.
+
+How the audio is stored depends on the relay:
+
+- **Relays with the `buzz-audio` extension** (listed under
+  `supported_extensions` in the relay's NIP-11 document) accept bare
+  `audio/mpeg` blobs. The adapter converts the file to a metadata-free MP3 and
+  uploads it with a direct Blossom `PUT`, authorized by a signed kind-24242
+  event, because the `buzz` CLI does not accept audio uploads. The probe result
+  is cached for ten minutes.
+- **Any other relay** only stores video, so the audio is wrapped in Buzz's
+  voice-note envelope (AAC inside a tiny MP4 with a stub video track) and
+  uploaded through the CLI. Inbound envelopes are unpacked back to audio.
+
+Both paths need `ffmpeg` on the gateway host. It is looked up in
+`BUZZ_FFMPEG_PATH` first, then on `PATH`, then in the usual install roots
+(`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/local/bin`) for a
+gateway started with a stripped environment. Without it, or when every voice
+path fails, the audio is sent as a plain file attachment. Converted files live
+in a private scratch file under the system temp directory and are deleted as
+soon as the send finishes.
+
+An auto-TTS reply arrives as **two messages**: the voice card, then the reply
+text on its own. Telegram folds the text into the audio caption instead, but a
+Buzz voice note is published straight to the relay as a kind-9 event, so a
+caption would bypass the normal send path and lose mention resolution and
+message chunking, and would carry no text at all when the voice paths fall
+back to a plain file attachment. Two messages keep the text reply intact and
+searchable. When a long reply is split into several audio chunks, the
+transcript rides on the first card only.
+
+Inbound voice notes (a `voice-note-*` audio attachment from Buzz Desktop,
+mobile, or another agent) dispatch as voice messages, so the gateway
+transcribes them when speech-to-text is configured. Other audio attachments
+are handed to the agent as files. A note that also appears as a media URL in
+the message text is localized once.
 
 ## Run the gateway
 

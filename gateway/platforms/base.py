@@ -602,10 +602,28 @@ def _looks_like_image(data: bytes) -> bool:
                or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP"))
 
 
-def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> str:
-    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string."""
+def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes, mode: Optional[int] = None) -> str:
+    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string.
+
+    ``mode`` creates the file with those permission bits from the start (``O_CREAT|O_EXCL``)
+    rather than writing it at the default 0644 and chmodding after: a caller that needs the
+    bytes private (inbound voice notes on a shared host) has no window where another local user
+    can open the file, and no half-written 0644 file survives a cancelled write."""
     filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
-    filepath.write_bytes(data)
+    if mode is None:
+        filepath.write_bytes(data)
+        return str(filepath)
+    fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            filepath.unlink()
+        raise
+    # os.open applies the umask; the caller asked for exactly these bits.
+    with contextlib.suppress(OSError, NotImplementedError):
+        os.chmod(filepath, mode)
     return str(filepath)
 
 
@@ -679,17 +697,22 @@ get_audio_cache_dir, cleanup_audio_cache = _cache_dir_accessors(
     "audio", "AUDIO_CACHE_DIR", "cache/audio", "audio_cache")
 
 
-def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
-    """Save raw audio bytes to the cache (container-sniffed ext); return the path."""
+def cache_audio_from_bytes(data: bytes, ext: str = ".ogg", mode: Optional[int] = None) -> str:
+    """Save raw audio bytes to the cache (container-sniffed ext); return the path.
+    ``mode`` (e.g. ``0o600``) creates the file with those bits instead of the default 0644."""
     # tools.audio_container is the ONE owner of container detection (outbound TTS repair + here).
     from tools.audio_container import sniff_audio_ext
     validate_inbound_media_size(len(data), media_type="audio")
-    return _write_cache_file(get_audio_cache_dir(), "audio", sniff_audio_ext(data, ext), data)
+    return _write_cache_file(get_audio_cache_dir(), "audio", sniff_audio_ext(data, ext), data, mode)
 
 
-async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
+async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg", mode: Optional[int] = None) -> str:
     """Cache audio bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+    # Forwarded only when asked for, so the default call stays the same plain passthrough as the
+    # image/video/document wrappers (their shared parity test pins the forwarded arguments).
+    if mode is None:
+        return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+    return await asyncio.to_thread(cache_audio_from_bytes, data, ext, mode)
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:

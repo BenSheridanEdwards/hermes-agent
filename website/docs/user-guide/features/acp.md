@@ -32,8 +32,79 @@ Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. I
 - skills
 - execute_code and delegate_task
 - vision
+- `text_to_speech`, when a TTS provider is configured (see [Voice notes](#voice-notes))
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
+
+To run ACP sessions with a different toolset, set `acp.toolsets` in `config.yaml`
+(the default is `["hermes-acp"]`; MCP server toolsets are added on top):
+
+```yaml
+acp:
+  toolsets: ["hermes-acp"]
+```
+
+`text_to_speech` does not come from `hermes-acp` itself: ACP sessions add the
+one-tool `tts` toolset on top, so any ACP host can answer a voice note with one
+once a TTS provider is configured. The tool's own requirements check drops it
+when no provider is set up, so a session without a voice setup sees the tool list
+`hermes-acp` has always had. To keep it off a host that does have a TTS provider:
+
+```yaml
+acp:
+  tts: false
+```
+
+## Voice notes
+
+Hosts that carry attachments (Buzz Desktop via `buzz-acp`) can hand a voice note
+to `session/prompt` as a `resource_link` to an audio file, an embedded `resource`
+blob, or an `audio` content block. Hermes treats such a prompt as a voice turn,
+the same way the gateway does on Telegram or Discord:
+
+- **Speech-to-text first.** Each audio attachment (`audio/*` MIME, or an audio
+  extension such as `.ogg`, `.opus`, `.mp3`, `.m4a`, `.wav`, `.webm`, `.flac`,
+  `.aac` whose magic bytes agree) is transcribed with the configured `stt`
+  provider before the model sees the prompt, with the local fallback the gateway
+  uses. The transcript is prepended to any typed text as a quoted line. If STT is
+  disabled, fails, or returns nothing, the model instead sees a short note naming
+  the attached file. Audio is never inlined into the prompt as text.
+- **Embedded clips land in the audio cache.** A voice note sent as bytes rather
+  than a file path is written to the profile audio cache
+  (`$HERMES_HOME/cache/audio`), owner-readable only, the same place the gateway
+  puts inbound Telegram and Discord clips. It is removed at the end of the turn,
+  or kept for the agent to reach when transcription failed and the note names it,
+  in which case the cache sweep collects it: the ACP server prunes that cache on
+  the gateway's policy (files older than 24 hours) each time a session starts, so
+  kept clips do not accumulate on a machine that never runs the gateway. A docker
+  or ssh terminal backend sees the path mapped into the container.
+- **Voice-first reply.** When the turn carried audio, `voice.auto_tts` is on, and
+  the `text_to_speech` tool is available (a TTS provider such as `tts.provider: xai`
+  is configured), Hermes adds a per-turn instruction asking the model to call
+  `text_to_speech` with a spoken version of its answer, then give the text answer
+  and end it with the tool's `MEDIA:<absolute path>` line. The audio file is written
+  under `<session cwd>/voice/` so the host can publish it alongside the text. That
+  directory holds untracked mp3s inside your project, so add `voice/` to
+  `.gitignore` (or point `acp.voice_dir` somewhere outside the repo).
+- **Paths with spaces.** Hosts read a `MEDIA:` line up to the first space, so a
+  reply file whose path contains whitespace could never be published. When the
+  session cwd has a space in it (`~/Documents/My Project`), Hermes logs a warning
+  and writes the reply audio to the profile audio cache instead.
+- A voice note sent while the session is still working on the previous turn is
+  transcribed straight away and queued; the queued turn still answers voice-first.
+- Text-only prompts never trigger any of this, so editor hosts that never send
+  audio see no change.
+
+Related config keys (all optional):
+
+```yaml
+voice:
+  auto_tts: true          # the gateway's key (default false); also gates ACP voice-first replies
+acp:
+  auto_tts: true          # override voice.auto_tts for ACP hosts only
+  voice_dir: voice        # where text_to_speech writes, relative to the session cwd
+  tts: false              # drop text_to_speech from ACP sessions entirely
+```
 
 ## Installation
 
