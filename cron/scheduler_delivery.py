@@ -805,16 +805,23 @@ def _normalize_deliver_value(deliver) -> str:
 
     The token SET is folded too, not just each token: see ``_fold_deliver_token_set``.
 
+    The empty-token filter runs on the FOLDED token, not on the raw one. Filtering the raw token
+    let a ``None`` element through (``str(None)`` is ``"None"``, which is truthy) to fold into the
+    empty string, and that empty token then counted as a surviving token inside
+    ``_fold_deliver_token_set`` and evicted the ``local``: ``["local", null]`` normalized to
+    ``""``, resolved to no target, and was recorded ``failed`` with the job body logged on every
+    tick. That is the shape the set fold exists to prevent, reached through the list branch.
+
     A value with no usable token at all (whitespace only) is returned unchanged, so it still
     surfaces as an unresolved target rather than being silently downgraded to ``local``."""
     if deliver is None or deliver == "":
         return "local"
     if isinstance(deliver, (list, tuple)):
         parts = _fold_deliver_token_set(
-            [canonical_deliver_token(p) for p in deliver if str(p).strip()])
+            [t for t in (canonical_deliver_token(p) for p in deliver) if t])
         return ",".join(parts) if parts else "local"
     parts = _fold_deliver_token_set(
-        [canonical_deliver_token(p) for p in str(deliver).split(",") if str(p).strip()])
+        [t for t in (canonical_deliver_token(p) for p in str(deliver).split(",")) if t])
     return ",".join(parts) if parts else str(deliver)
 
 
