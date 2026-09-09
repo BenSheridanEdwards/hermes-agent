@@ -488,7 +488,10 @@ def _try_dispatch_background_run(
 
     started_at = time.time()
     # Scheduler's own normalizer (falsy -> "local", list -> comma string) on the claimed snapshot.
-    from cron.scheduler import _normalize_deliver_value
+    # Imported from the module that DEFINES it, the same path ``_manual_run_delivery_note`` uses:
+    # ``cron.scheduler`` only re-exports it, and two names for one function in one file means a
+    # test that stubs one leaves the other site unstubbed.
+    from cron.scheduler_delivery import _normalize_deliver_value
     deliver = _normalize_deliver_value(claimed_job.get("deliver", "local"))
 
     def _runner() -> Dict[str, Any]:
