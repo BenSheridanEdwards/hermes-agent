@@ -677,6 +677,7 @@ def _mark_acp_hosted(monkeypatch, env_loader):
     monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
     monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
     monkeypatch.setattr(env_loader, "_ACP_KEYLESS_CLAIM_LOGGED", False)
+    monkeypatch.setattr(env_loader, "_ACP_OVERLAY_KEYLESS_CLAIM_LOGGED", False)
     env_loader.mark_acp_hosted()
 
 
@@ -1581,6 +1582,69 @@ def test_managed_overlay_never_shows_a_reader_a_split_identity(tmp_path, monkeyp
 
     _assert_one_principal(observed, "a reader parked between the overlay load and the settle")
     assert final == ("", json.dumps(json.loads(_ADMIN_TAG), separators=(",", ":")))
+
+
+def test_managed_overlay_claim_without_a_key_warns_instead_of_failing_silently(
+    tmp_path, monkeypatch, caplog
+):
+    """An overlay that claims the identity with an attestation and defines no key fails closed, which
+    is right, and used to do it in total silence, which is not.
+
+    _warn_if_host_claim_has_no_key cannot cover this and must not try: it returns early when the HOST
+    supplied BUZZ_PRIVATE_KEY, and that is exactly the case here. So the one situation where the
+    operator most needs a line, the host DID pass a key and something else removed it, was the one that
+    produced none at all. The claimant is a different principal and a different file, so it gets its
+    own warning naming that file."""
+    import logging
+
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(f"BUZZ_AUTH_TAG={_ADMIN_TAG}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger=env_loader.__name__):
+            load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert "BUZZ_PRIVATE_KEY" not in os.environ  # failed closed, as intended
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(managed / ".env") in m and "BUZZ_PRIVATE_KEY" in m for m in warnings), warnings
+    # Names and paths only, never the values it just handled.
+    assert not any(_HOST_KEY in m or "admin-sig" in m for m in warnings), warnings
+
+
+def test_acp_host_key_without_the_managed_marker_says_so(tmp_path, monkeypatch, caplog):
+    """The whole BUZZ_ protection hangs on BUZZ_MANAGED_AGENT being present at snapshot time, and a
+    managed harness that omits it reverts to the pre-fix precedence: safely, since the profile then
+    supplies both halves and nothing is mismatched, but silently. One debug line names it, which is
+    what would have identified the original Studio failure in one line rather than four rounds."""
+    import logging
+
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)  # no BUZZ_MANAGED_AGENT beside it
+
+    with caplog.at_level(logging.DEBUG, logger=env_loader.__name__):
+        _mark_acp_hosted(monkeypatch, env_loader)
+        load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == _PROFILE_KEY  # pre-fix precedence, as documented
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("BUZZ_MANAGED_AGENT" in m and "BUZZ_PRIVATE_KEY" in m for m in messages), messages
+    assert not any(_HOST_KEY in m for m in messages), messages
 
 
 @pytest.mark.parametrize("text,expected", [
