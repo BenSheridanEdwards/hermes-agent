@@ -74,8 +74,10 @@ the same way the gateway does on Telegram or Discord:
   (`$HERMES_HOME/cache/audio`), owner-readable only, the same place the gateway
   puts inbound Telegram and Discord clips. It is removed at the end of the turn,
   or kept for the agent to reach when transcription failed and the note names it,
-  in which case the usual cache sweep collects it. A docker or ssh terminal
-  backend sees the path mapped into the container.
+  in which case the cache sweep collects it: the ACP server prunes that cache on
+  the gateway's policy (files older than 24 hours) each time a session starts, so
+  kept clips do not accumulate on a machine that never runs the gateway. A docker
+  or ssh terminal backend sees the path mapped into the container.
 - **Voice-first reply.** When the turn carried audio, `voice.auto_tts` is on, and
   the `text_to_speech` tool is available (a TTS provider such as `tts.provider: xai`
   is configured), Hermes adds a per-turn instruction asking the model to call

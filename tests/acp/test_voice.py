@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -224,6 +225,21 @@ class TestDetection:
         ghost = tmp_path / "gone.ogg"
         assert [a.mime for a in audio_attachments([_link(ghost, mime=None)])] == ["audio/ogg"]
 
+    def test_unknown_audio_mime_suffix_is_a_container_not_bin(self):
+        """``.bin`` is rejected by ``tools.transcription_audio`` on extension alone, so an
+        ``audio/*`` type outside the map could only ever produce a failure note, and a failure
+        note keeps its clip. The sniffer overrides this whenever it recognises the bytes."""
+        from tools.transcription_common import SUPPORTED_FORMATS
+        from acp_adapter.content import AudioAttachment
+
+        def _suffix(mime):
+            return AudioAttachment(index=0, uri="", display="voice-note", mime=mime).suffix
+
+        assert _suffix("audio/amr") == ".ogg"
+        assert _suffix("audio/3gpp") == ".ogg"
+        assert _suffix("audio/x-caf") == ".caf"
+        assert all(_suffix(m) in SUPPORTED_FORMATS for m in ("audio/amr", "audio/3gpp", "audio/x-caf"))
+
     def test_an_explicit_audio_mime_still_wins_without_sniffing(self, tmp_path):
         notes = tmp_path / "clip.ogg"
         notes.write_text("not really ogg", encoding="utf-8")
@@ -365,6 +381,72 @@ class TestEmbeddedClipFiles:
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
     @pytest.mark.asyncio
+    async def test_clip_is_private_from_creation_not_chmodded_after(
+        self, tmp_path, stt, config, audio_cache, monkeypatch
+    ):
+        """Writing 0644 and chmodding after leaves a window where another local user can open the
+        clip, and a cancellation delivered inside it leaves a 0644 file behind for good. With
+        ``chmod`` neutered the file still has to come out owner-only, which only holds if the
+        cache helper created it that way."""
+        chmods = []
+        monkeypatch.setattr(os, "chmod", lambda *a, **k: chmods.append(a))
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        [path] = turn.temp_paths
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+    @pytest.mark.asyncio
+    async def test_unknown_audio_mime_reaches_stt_instead_of_a_bin_file(
+        self, tmp_path, stt, config, audio_cache
+    ):
+        """An ``audio/*`` container the sniffer does not know (AMR, 3GPP, a vendor type) used to
+        land as ``audio_<hex>.bin``, which the transcriber refuses by extension before uploading:
+        the turn could only produce a failure note, and the failure note keeps the clip."""
+        from tools.transcription_common import SUPPORTED_FORMATS
+
+        unsniffable = b"#!AMR\n" + b"\x3c" * 64
+        turn = await voice.prepare_voice_turn(
+            [_blob_block(data=unsniffable, mime="audio/amr")], cwd=str(tmp_path), agent=_agent_with_tts())
+        [path] = turn.temp_paths
+        assert Path(path).suffix in SUPPORTED_FORMATS
+        assert stt.calls == [(path, "acp")]
+        assert turn.keep_paths == set()
+
+    @pytest.mark.asyncio
+    async def test_inbound_cap_refusal_says_too_large_not_unreadable(
+        self, tmp_path, stt, config, audio_cache, monkeypatch
+    ):
+        """The configured inbound media cap can sit below our own 25 MiB, in which case the cache
+        helper raises and the user is owed the "too large" note, not a generic read failure."""
+        from gateway.platforms import base
+
+        def _refuse(size, *, media_type="media", max_bytes=None):
+            raise ValueError(f"Inbound {media_type} payload is too large ({size} bytes > 8 bytes)")
+
+        monkeypatch.setattr(base, "validate_inbound_media_size", _refuse)
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        assert stt.calls == [] and turn.temp_paths == []
+        assert "too large to transcribe" in turn.audio_notes[0]
+        assert not audio_cache.exists()  # refused before the cache is even touched
+
+    @pytest.mark.asyncio
+    async def test_stt_disabled_note_names_the_agent_visible_path(
+        self, tmp_path, stt, config, audio_cache, monkeypatch
+    ):
+        """The STT-disabled note exists so the agent can open the clip, so it goes through the
+        same mapping as the failure note: on a docker or ssh backend the host cache path is not
+        the path the agent sees."""
+        from tools import credential_files
+
+        monkeypatch.setattr(credential_files, "to_agent_visible_cache_path",
+                            lambda p, **_k: "/root/.hermes/cache/audio/" + os.path.basename(p))
+        stt.enabled = False
+        turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
+        [path] = turn.temp_paths
+        assert turn.audio_notes[0] == (
+            f"[The user sent a voice message: /root/.hermes/cache/audio/{os.path.basename(path)}]")
+        assert turn.keep_paths == {path}
+
+    @pytest.mark.asyncio
     async def test_extension_comes_from_the_bytes_not_the_declared_mime(self, tmp_path, stt, config, audio_cache):
         """The gateway cache sniffs the container, so a mislabelled voice note still lands as
         something STT and players can read."""
@@ -439,6 +521,59 @@ class TestEmbeddedClipFiles:
         turn = await voice.prepare_voice_turn([_blob_block()], cwd=str(tmp_path), agent=_agent_with_tts())
         assert stt.calls == [] and turn.temp_paths == []
         assert "could not be read" in turn.audio_notes[0]
+
+
+class TestAudioCacheSweep:
+    """``cleanup_audio_cache`` used to have one caller in the tree, the gateway's hourly
+    housekeeping. An install that only ever runs ``hermes-acp`` (an editor host, or Buzz Desktop)
+    never starts that loop, so every clip a failure note keeps would live for the life of the
+    profile, and an ACP host with no STT provider fails every voice note."""
+
+    def _clip(self, cache, name, age_hours):
+        cache.mkdir(parents=True, exist_ok=True)
+        path = cache / name
+        path.write_bytes(OGG_BYTES)
+        stamp = time.time() - age_hours * 3600
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def _server(self):
+        return HermesACPAgent(session_manager=SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent")))
+
+    @pytest.mark.asyncio
+    async def test_new_session_prunes_stale_clips(self, tmp_path, audio_cache):
+        stale = self._clip(audio_cache, "audio_stale.ogg", voice.AUDIO_CACHE_MAX_AGE_HOURS + 1)
+        await self._server().new_session(cwd=str(tmp_path))
+        assert not stale.exists()
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_cannot_take_a_clip_this_session_just_wrote(self, tmp_path, audio_cache):
+        """Age-based, so a live turn's clip is hours away from the cutoff even if another session
+        starts mid-turn."""
+        fresh = self._clip(audio_cache, "audio_fresh.ogg", 0)
+        await self._server().new_session(cwd=str(tmp_path))
+        assert fresh.exists()
+
+    @pytest.mark.asyncio
+    async def test_resumed_and_loaded_sessions_sweep_too(self, tmp_path, audio_cache):
+        """A host that reconnects to an existing session never calls new_session."""
+        server = self._server()
+        resp = await server.new_session(cwd=str(tmp_path))
+        for call in (server.load_session, server.resume_session):
+            stale = self._clip(audio_cache, "audio_stale.ogg", voice.AUDIO_CACHE_MAX_AGE_HOURS + 1)
+            await call(cwd=str(tmp_path), session_id=resp.session_id)
+            assert not stale.exists()
+
+    @pytest.mark.asyncio
+    async def test_sweep_failure_never_breaks_session_start(self, tmp_path, audio_cache, monkeypatch):
+        from gateway.platforms import base
+
+        def _boom(**_kwargs):
+            raise OSError("cache directory vanished")
+
+        monkeypatch.setattr(base, "cleanup_audio_cache", _boom)
+        resp = await self._server().new_session(cwd=str(tmp_path))
+        assert resp.session_id
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +676,27 @@ class TestVoiceReply:
             voice.bind_voice_turn(agent, turn)
         assert agent.ephemeral_system_prompt == "keep me"
         assert tts_tool._default_output_dir() == before
+
+    def test_bind_binds_the_output_dir_before_the_instruction(self, tmp_path):
+        """The undo handler covers either order, so nothing else pins the ordering the comment
+        argues for: the ContextVar is the half that can fail, and the instruction names the
+        directory, so the directory has to be bound by the time the instruction is attached."""
+        seen = {}
+
+        class _Agent:
+            valid_tool_names = {"text_to_speech"}
+            ephemeral_system_prompt = None
+
+            def __setattr__(self, name, value):
+                seen.setdefault(name, tts_tool._default_output_dir())
+                object.__setattr__(self, name, value)
+
+        agent, out = _Agent(), str(tmp_path / "voice")
+        restore = voice.bind_voice_turn(agent, voice.VoiceTurn(voice_reply=True, output_dir=out))
+        try:
+            assert seen["ephemeral_system_prompt"] == out
+        finally:
+            restore()
 
     def test_explicit_output_path_still_wins_over_bound_dir(self, tmp_path):
         token = tts_tool.set_tts_output_dir(str(tmp_path / "voice"))
@@ -677,6 +833,73 @@ class TestPromptIntegration:
             await task
         assert list(audio_cache.iterdir()) == []
         release.set()
+
+    @pytest.mark.asyncio
+    async def test_kept_clip_survives_a_cancel_while_the_agent_is_still_reading_it(
+        self, tmp_path, stt, config, audio_cache
+    ):
+        """``handed_on`` is set when the executor accepts the work, not after the await:
+        cancelling the await does not stop the worker thread, and the note it is holding names a
+        clip it may still be about to open. Nothing else pins that placement."""
+        stt.result = {"success": False, "error": "boom"}  # the note names the clip, so it is kept
+        started, release, done = threading.Event(), threading.Event(), threading.Event()
+        read_back = []
+
+        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+        server = HermesACPAgent(session_manager=manager)
+        resp = await server.new_session(cwd=str(tmp_path))
+        state = manager.get_session(resp.session_id)
+        server._conn = None
+
+        def _run(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+            try:
+                read_back.append(Path(stt.calls[0][0]).read_bytes())
+            except OSError as exc:
+                read_back.append(exc)
+            done.set()
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.ephemeral_system_prompt = None
+        state.agent.valid_tool_names = {"text_to_speech"}
+
+        task = asyncio.create_task(server.prompt(prompt=[_blob_block()], session_id=resp.session_id))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+        assert read_back == [OGG_BYTES]
+        assert Path(stt.calls[0][0]).exists()  # left for the cache sweep, not deleted underfoot
+
+    @pytest.mark.asyncio
+    async def test_kept_clip_goes_when_the_executor_never_accepts_the_turn(
+        self, tmp_path, stt, config, audio_cache, monkeypatch
+    ):
+        """The other side of that placement: a submit that never happens (executor shut down
+        between the claim and the run) hands nothing on, so a clip kept for a note no one will
+        ever receive goes with the turn instead of waiting out the sweep."""
+        from acp_adapter import server as server_module
+
+        class _ShutDown:
+            def submit(self, *_args, **_kwargs):
+                raise RuntimeError("cannot schedule new futures after shutdown")
+
+        monkeypatch.setattr(server_module, "_executor", _ShutDown())
+        stt.result = {"success": False, "error": "boom"}
+        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+        server = HermesACPAgent(session_manager=manager)
+        resp = await server.new_session(cwd=str(tmp_path))
+        server._conn = None
+
+        await server.prompt(prompt=[_blob_block()], session_id=resp.session_id)
+        assert stt.calls and not Path(stt.calls[0][0]).exists()
+        assert list(audio_cache.iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_stt_exception_does_not_break_the_turn(self, tmp_path, stt, config, monkeypatch):
