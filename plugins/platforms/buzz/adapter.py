@@ -149,6 +149,15 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+def _acp_host_owns_buzz_identity() -> bool:
+    """THE rule, asked once: an ACP host claimed the Buzz identity, so it owns the whole group and no other
+    supplier may complete it. Every guard in this module derives from this rather than inventing its own
+    condition. See ``hermes_cli.env_loader.acp_host_owns_buzz_identity``."""
+    from hermes_cli.env_loader import acp_host_owns_buzz_identity
+
+    return acp_host_owns_buzz_identity()
+
+
 def _acp_host_owns_identity_name(name: str) -> bool:
     """Whether the unscoped fallback below must NOT answer for ``name``.
 
@@ -466,6 +475,10 @@ def _resolve_cli_path(configured: str = "") -> str:
 
 
 def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
+    """Credential records to try, in order. No ACP gate here on purpose: ``_resolve_identity`` decides
+    whether the record may supply the identity at all, so both the configured path and the default-directory
+    glob below are already unreachable for a claimed group. The multiplex gate stays because it is about a
+    different question (whose profile the ambient directory belongs to)."""
     configured = _configured_credentials_file(extra)
     if configured:
         return [Path(configured).expanduser()]
@@ -501,33 +514,54 @@ def _resolve_credentials_data(extra: Optional[dict] = None) -> dict:
     return {}
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: scoped secret first, then credentials JSON. NEVER log it."""
+def _resolve_identity(extra: Optional[dict] = None) -> Tuple[str, Any]:
+    """Resolve the signing key and the owner attestation TOGETHER, as a pair, from ONE supplier.
+
+    They are one credential, not two settings. A NIP-OA tag is an attestation bound to a single signing key,
+    and ``build_auth_event`` (nostr_auth.py) appends whatever tag it is handed to the kind-22242 event it
+    signs with no consistency check, so a key from one supplier beside a tag from another is an agent that
+    signs as itself and presents someone else's ownership. An owner-gated relay rejects that, and a relay
+    that does not reject it is worse. Resolving the two independently, each with its own fallback chain, is
+    what produced that pairing through four different routes across four review rounds; this function is the
+    single place the pairing is decided.
+
+    Suppliers, in order:
+
+    1. The ACP host, when it claimed the identity. It owns the whole group, so the pair is exactly what the
+       scoped/env layer holds and the credentials record is not consulted for EITHER half. Both directions
+       matter and each was a separate blocker: the record's tag beside the host's managed key, and (the
+       mirror, for a host that passes only ``BUZZ_AUTH_TAG``) the record's key beside the host's attestation.
+       A tag-only host now resolves to no key at all, which is the fail-closed outcome
+       ``_warn_if_host_claim_has_no_key`` already promises the operator.
+    2. The scoped/env layer, when it holds the key. The record did not supply the key, so it may not supply
+       the tag. This also closes the ``config.yaml`` route, which no environment rule can reach:
+       ``_configured_credentials_file`` reads ``extra["credentials_file"]`` from the profile's own config.
+    3. The credentials record. The profile owner's own ``buzz login`` output. An ambient ``BUZZ_AUTH_TAG``
+       beside it is the same principal (the documented NIP-OA membership flow in
+       ``website/docs/user-guide/messaging/buzz.md``), so it still rides along with the record's key.
+
+    Returns the tag RAW and unvalidated; :func:`_resolve_auth_tag` owns parsing. NEVER log the key."""
     key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
-    return key or _credentials_key(_resolve_credentials_data(extra))
+    tag: Any = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
+    if _acp_host_owns_buzz_identity() or key:
+        return key, tag
+    data = _resolve_credentials_data(extra)
+    return _credentials_key(data), (tag or data.get("auth_tag", ""))
+
+
+def _resolve_private_key(extra: Optional[dict] = None) -> str:
+    """The signing half of :func:`_resolve_identity`. NEVER log it."""
+    return _resolve_identity(extra)[0]
 
 
 def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
-    """Resolve and validate the optional NIP-OA owner-attestation tag.
+    """The attestation half of :func:`_resolve_identity`, parsed and re-serialized compactly.
 
-    The tag comes from the SAME source as the key it attests, never a different one. A NIP-OA tag is an
-    owner attestation bound to one signing key, and ``build_auth_event`` (nostr_auth.py) appends whatever
-    tag it is handed to the kind-22242 event it signs, with no consistency check. So mixing sources means
-    signing with one identity and presenting another, which is what an owner-gated relay rejects.
-
-    ``_resolve_private_key`` prefers the scoped/env ``BUZZ_PRIVATE_KEY`` over the credentials record, so
-    when that key is set the record did NOT supply the key and may not supply the tag either. That closes
-    the ``config.yaml`` route as well as the env one: ``_configured_credentials_file`` reads
-    ``extra["credentials_file"]`` from the profile's own config, which no environment rule can reach, and
-    an ACP host injecting a managed key would otherwise still sign it with the profile owner's attestation.
-    """
-    raw: Any = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
-    if not raw:
-        if str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip():
-            return ""  # the key did not come from the credentials record, so neither may the tag
-        if "auth_tag" not in (data := _resolve_credentials_data(extra)):
-            return ""
-        raw = data["auth_tag"]
+    A blank tag is "not provided" (the same test :func:`hermes_cli.env_loader._env_provides` applies to the
+    host's values); anything else must parse as a four-string NIP-OA tag or this raises."""
+    raw = _resolve_identity(extra)[1]
+    if isinstance(raw, str) and not raw.strip():
+        return ""
     return json.dumps(_nostr_auth.parse_auth_tag(raw, "Buzz auth tag"), separators=(",", ":"))
 
 

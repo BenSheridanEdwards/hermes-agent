@@ -4403,6 +4403,84 @@ class TestCredentialResolution:
         assert _resolve_private_key() == "profile-key"
         assert json.loads(_resolve_auth_tag()) == tag
 
+    @pytest.mark.parametrize("route", ["env-var", "config-yaml-extra", "default-dir-glob"])
+    def test_acp_tag_only_host_never_signs_with_the_profile_credentials_record(
+        self, monkeypatch, tmp_path, route
+    ):
+        """The mirror of test_credentials_file_tag_is_not_paired_with_an_env_key.
+
+        A managed host that supplies BUZZ_AUTH_TAG and no BUZZ_PRIVATE_KEY has
+        claimed the identity and cannot sign it, and the loader's warning says
+        so: "the profile's key was dropped and not replaced. Buzz sends will
+        fail". The first half was true and the second was not. Key resolution
+        fell through to the profile owner's credentials record, reachable by
+        three routes no environment rule touches, so the agent signed with the
+        profile owner's key and presented the host's attestation.
+
+        Both halves are asserted here because the pairing is the failure, not
+        either value on its own, and the not-hosted control at the end pins the
+        guard rather than the fallback: off the ACP path the record is exactly
+        what the fallback is for and it still answers."""
+        import hermes_cli.env_loader as env_loader
+
+        host_tag = ["auth", "a" * 64, "", "d" * 128]
+        record_tag = ["auth", "b" * 64, "", "c" * 128]
+        creds_dir = tmp_path / "creds"
+        creds_dir.mkdir()
+        creds = creds_dir / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "profile-owner-key-from-record", "auth_tag": record_tag}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(host_tag))
+        extra = None
+        if route == "env-var":
+            monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        elif route == "config-yaml-extra":
+            extra = {"credentials_file": str(creds)}
+        else:
+            monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", creds_dir)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+        env_loader.mark_acp_hosted()
+
+        assert _resolve_private_key(extra) == ""              # nothing signs, so nothing is mis-signed
+        assert json.loads(_resolve_auth_tag(extra)) == host_tag  # the host's, and the host's alone
+
+        # Control: not ACP-hosted, so the record is the profile owner's own
+        # `buzz login` output and supplies BOTH halves consistently.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        assert _resolve_private_key(extra) == "profile-owner-key-from-record"
+        assert json.loads(_resolve_auth_tag(extra)) == record_tag
+
+    def test_ambient_auth_tag_still_rides_with_the_profiles_own_record(self, monkeypatch, tmp_path):
+        """The documented NIP-OA membership flow, which the host rule must not
+        break: `buzz login` writes a record with a key and no attestation, and
+        the user sets BUZZ_AUTH_TAG in their own .env
+        (website/docs/user-guide/messaging/buzz.md). One principal supplies both
+        halves, so this is not a mismatch and _resolve_identity still pairs them.
+
+        This is why the tag-only refusal is gated on an ACP host claim rather
+        than applied to every supplier: the rule is about two PRINCIPALS, not
+        two files."""
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile"}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(tag))
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+
+        assert _resolve_private_key() == "nsec1fromfile"
+        assert json.loads(_resolve_auth_tag()) == tag
+
     def test_invalid_owner_auth_tag_fails_closed(self, monkeypatch, tmp_path):
         creds = tmp_path / "agent_credentials.json"
         creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": ["bad"]}), encoding="utf-8")
