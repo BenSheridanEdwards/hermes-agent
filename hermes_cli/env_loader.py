@@ -145,20 +145,29 @@ def is_acp_hosted() -> bool:
     return _ACP_HOSTED
 
 
+def acp_host_owns_buzz_identity() -> bool:
+    """THE rule, asked as one question: an ACP host in this process supplied a signing member of the Buzz
+    identity group, so it owns the whole group and no other principal may complete it.
+
+    Every enforcement point in the codebase derives from this predicate rather than re-deriving its own
+    version of "is the host in charge here": the env restore (:func:`_restore_acp_host_env`), the managed
+    overlay (:func:`_settle_buzz_identity_after_managed_env`), the Buzz plugin's unscoped disk fallback and
+    its credentials-record fallback (``plugins/platforms/buzz/adapter.py``). Four rounds of review found the
+    same mismatch through four different routes because each route carried its own condition; one predicate
+    is what stops the fifth."""
+    return _ACP_HOSTED and _host_owns_buzz_identity()
+
+
 def acp_host_owns_buzz_identity_key(name: str) -> bool:
-    """True when ``name`` belongs to the Buzz identity AND an ACP host has claimed that identity in this
-    process, i.e. the restore has already deleted the profile's value for it from ``os.environ``.
+    """:func:`acp_host_owns_buzz_identity` narrowed to one name: ``name`` is in the claimed group, so the
+    restore has already deleted the profile's value for it from ``os.environ``.
 
     For consumers that can reach the profile's values by some route other than ``os.environ``. The Buzz
     plugin's unscoped fallback is one: ``build_profile_secret_scope`` re-reads ``<home>/.env`` off disk, so
     without this it hands back the very names the restore dropped and pairs the host's managed key with the
     profile owner's attestation again. An env-level rule cannot see a file read, so the rule has to be
     askable."""
-    return (
-        _ACP_HOSTED
-        and name in _BUZZ_IDENTITY_DROP_KEYS
-        and _host_owns_buzz_identity()
-    )
+    return name in _BUZZ_IDENTITY_DROP_KEYS and acp_host_owns_buzz_identity()
 
 
 def _is_acp_host_owned_env_key(name: str) -> bool:
