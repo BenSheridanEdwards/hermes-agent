@@ -27,6 +27,21 @@ export function splitCronList(value: unknown): string[] {
   return items.map((item) => String(item).trim()).filter(Boolean);
 }
 
+/** True when a stored `deliver` value names only the local lane.
+ *
+ * Mirrors the fold the scheduler applies in `_normalize_deliver_value`
+ * (`cron/scheduler_delivery.py`): a lane keyword means the same thing however it
+ * is typed, and a value whose tokens are ALL `local` is still just the local
+ * lane. The dashboard only ever writes lowercase `local` itself, so this can
+ * differ only for a job created elsewhere (`Local`, `local,local`, `" local "`),
+ * and the whole effect is whether a redundant delivery badge is drawn. Kept here
+ * rather than inline so the one comparison the dashboard makes on the lane has
+ * the same shape as the Python readers. */
+export function isLocalDeliverLane(deliver: unknown): boolean {
+  const tokens = splitCronList(deliver);
+  return tokens.length > 0 && tokens.every((token) => token.toLowerCase() === "local");
+}
+
 /** Trim to a non-empty string, or null. Optionally strip trailing slashes
  * (base URLs). Mirrors the backend's `_cron_optional_text`. */
 function optionalText(value: string, stripTrailingSlash = false): string | null {
