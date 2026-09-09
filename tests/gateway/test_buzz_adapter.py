@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import os
 import hashlib
 import json
 import tempfile
@@ -4556,7 +4557,7 @@ class TestCredentialResolution:
 
 
 class TestClaimedIdentityIsResolvedAsOnePair:
-    """The pair is the only thing a consumer of the Buzz identity can obtain."""
+    """S3: the pair is the only thing a consumer can obtain, and S1: the relay is in the group."""
 
     @staticmethod
     def _alternating_identity(monkeypatch):
@@ -4652,6 +4653,75 @@ class TestClaimedIdentityIsResolvedAsOnePair:
         asyncio.run(adapter._authenticate_websocket(ws))
 
         assert [t for t in ws.sent[0][1]["tags"] if t and t[0] == "auth"] == []
+
+    def test_acp_claimed_relay_is_not_resupplied_by_the_profile_config(self, monkeypatch, caplog):
+        """S1, the fourteenth route. BUZZ_RELAY_URL is a member of the claimed group, not a free
+        setting: it is signed into the same kind-22242 event as the key and the attestation.
+
+        The profile's own config.yaml re-supplied it after the restore deleted it, which does not
+        mismatch an attestation but does falsify the stated rule, and lets a fleet agent that can edit
+        its own config.yaml choose which relay its managed identity authenticates to. The control is the
+        same call with no claim, where extra is exactly what it is for."""
+        import logging
+
+        import hermes_cli.env_loader as env_loader
+
+        monkeypatch.setattr(_buzz_mod, "_ACP_RELAY_CLAIM_LOGGED", False)
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        env_loader.mark_acp_hosted()
+        extra = {"relay_url": "ws://profile-chosen.example"}
+
+        with caplog.at_level(logging.WARNING, logger=_buzz_mod.logger.name):
+            assert _buzz_mod._configured_relay(extra) == ""
+        assert any("BUZZ_RELAY_URL" in r.getMessage() for r in caplog.records), caplog.records
+        # The GATES ask the same question, so status cannot report an agent as connected on a relay
+        # the connecting read will refuse: "configured" and "usable" have to be the same answer.
+        from gateway.config import PlatformConfig
+
+        assert validate_config(PlatformConfig(enabled=True, extra=extra)) is False
+        assert _buzz_mod.is_connected(PlatformConfig(enabled=True, extra=extra)) is False
+
+        # Control: no claim, so the profile's own config.yaml is exactly what this reads.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        assert _buzz_mod._configured_relay(extra) == "ws://profile-chosen.example"
+        assert validate_config(PlatformConfig(enabled=True, extra=extra)) is True
+
+    def test_acp_claimed_relay_is_not_resupplied_by_the_yaml_bridge(self, monkeypatch):
+        """The same route through the other door. _apply_yaml_config writes config.yaml values straight
+        back into os.environ, it runs from the gateway config load AFTER every restore, and it asked no
+        rule: it wrote the profile's relay into the exact hole the group rule had just made."""
+        import hermes_cli.env_loader as env_loader
+
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", {})
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        monkeypatch.delenv("BUZZ_CLI_PATH", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        env_loader.mark_acp_hosted()
+        cfg = {"extra": {"relay_url": "ws://profile-chosen.example", "cli_path": "/profile/bin/buzz"}}
+
+        _buzz_mod._apply_yaml_config({}, cfg)
+
+        assert "BUZZ_RELAY_URL" not in os.environ
+        # The bridge is not disabled, only the claimed group is: BUZZ_CLI_PATH is the profile's
+        # plugin configuration, which the drop set has never included.
+        assert os.environ["BUZZ_CLI_PATH"] == "/profile/bin/buzz"
+
+        # Control: no claim, and the relay bridges as it always has.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        _buzz_mod._apply_yaml_config({}, cfg)
+        assert os.environ["BUZZ_RELAY_URL"] == "ws://profile-chosen.example"
+
 
 # ── Env enablement / registration / standalone send ──────────────────────
 
