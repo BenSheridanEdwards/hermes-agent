@@ -1176,8 +1176,8 @@ class GatewayStartupMixin:
             logger.warning("No messaging platforms enabled.")
             logger.info(
                 "Gateway will continue running for cron job execution; cron output addressed to a "
-                "platform is written to logs/agent.log and logs/errors.log until a platform is "
-                "enabled.")
+                "platform is written to logs/agent.log (and logs/errors.log when the run or the "
+                "delivery actually failed) until a platform is enabled.")
             return False
         if startup_retryable_errors:
             # All retryable: stay alive (cron runs, watcher recovers) rather than systemd restart-loop.

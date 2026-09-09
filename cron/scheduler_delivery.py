@@ -1586,13 +1586,16 @@ def _log_undelivered_output(
     ``hermes_logging`` restricts to ``gateway.*`` loggers.
 
     ``level`` decides whether it ALSO lands in ``logs/errors.log``, which only carries WARNING and
-    above. A genuine delivery failure logs at WARNING and belongs there. A lane that is not a
-    failure does not: origin-less ``deliver: origin`` is the default for agent- and blueprint-created
-    jobs (``tools/blueprints.py``) and CLI/TUI sessions never capture an origin, so on a
-    home-channel-less gateway that lane fires on every run of a job that is recorded ok. At WARNING
-    a 4 KB report every few minutes would rotate the whole 2 MB error history away and bury real
-    errors under successful output, so that lane logs at INFO instead: still in ``agent.log`` and
-    still under ``hermes logs``, just not in the error log."""
+    above. A failing RUN and a failed DELIVERY both belong there. What does not is a successful run
+    on a lane that simply has nowhere to go: origin-less ``deliver: origin`` is the default for
+    agent- and blueprint-created jobs (``tools/blueprints.py``) and CLI/TUI sessions never capture
+    an origin, so on a home-channel-less gateway that lane fires on every run of a job that is
+    recorded ok. At WARNING a 4 KB report every few minutes would rotate the whole 2 MB error
+    history away and bury real errors under successful output, so that lane logs at INFO instead:
+    still in ``agent.log`` and still under ``hermes logs``, just not in the error log.
+
+    The INFO lane follows the configured log level: with ``logging.level: WARNING`` the file
+    handlers are built at WARNING (``hermes_logging``) and this line is not written at all."""
     text = (content or "").strip()
     if not text:
         return
@@ -1764,13 +1767,16 @@ def _deliver_result(
         # resolve to nothing at all: they never reach the per-target loop below, so the output has
         # to be logged here or it stays invisible. `local` passes reason=None and stays silent.
         if undelivered_reason:
-            # WARNING only when this really is a delivery failure (``outcome`` carries the error).
-            # The origin-less ``origin`` lane returns outcome=None and the run is recorded ok, so
-            # logging its body at WARNING would spool successful cron output into ``errors.log``
-            # on every run of the very install shape this lane exists for.
+            # WARNING when the delivery failed (``outcome`` carries the error) OR when the text
+            # being delivered is itself a failure notice (``for_failure``): a job failing every
+            # tick is exactly what an operator wants in ``errors.log``, and the origin-less
+            # ``origin`` lane returns outcome=None even for a failure summary, so keying on
+            # ``outcome`` alone left the error log empty on the install this lane exists for.
+            # A SUCCESSFUL run on that lane still logs at INFO, or its body would spool into
+            # ``errors.log`` on every run.
             _log_undelivered_output(
                 job, content, [undelivered_reason],
-                level=logging.WARNING if outcome else logging.INFO)
+                level=logging.WARNING if (outcome or for_failure) else logging.INFO)
         return outcome
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
