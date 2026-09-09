@@ -164,11 +164,14 @@ def _manual_run_delivery_note(deliver: str, refreshed: Dict[str, Any]) -> str:
     """
     # Falsy deliver ("", stored JSON null) is normalized to "local" at fire time -> saved
     # locally. Whitespace-only values fall through so the fire-time "no target" error surfaces.
-    # The lane is folded through the scheduler's own helper, so ``Local`` or `` local `` reads as
-    # the local lane here too: this line is relayed to the user, and claiming a mis-cased lane
-    # "was delivered there by the job itself" reports a send that never happened.
-    from cron.scheduler_delivery import canonical_deliver_token
-    if not deliver or canonical_deliver_token(deliver) == "local":
+    # The lane is folded through the scheduler's own normalizer, so ``Local`` or `` local ``
+    # reads as the local lane here too, and so does a value whose TOKENS are all local
+    # (``"Local, LOCAL"``, ``"local,local"``, which the create path stores as written). This line
+    # is relayed to the user, and claiming such a value "was delivered there by the job itself"
+    # reports a send that never happened. Folding the whole value, not one token, is what the
+    # stored value can actually be: the normalizer is the same one fire time reads it through.
+    from cron.scheduler_delivery import _normalize_deliver_value
+    if not deliver or _normalize_deliver_value(deliver) == "local":
         return " (output saved locally only)"
     err = str(refreshed.get("last_delivery_error") or "").strip()
     if not err:

@@ -520,6 +520,15 @@ case or surrounding spaces, so `deliver: Local` is the same opt-out as
 `deliver: local` and is recorded the same way. A `platform:chat_id` target
 keeps its case.
 
+A repeated target is collapsed, and a `local` token sitting beside a real
+target is dropped: `deliver: "Local, LOCAL"` is the plain local opt-out, and
+`deliver: "origin,local"` is the plain `origin` lane. Neither sends anything
+different (`local` asks for no target, and every lane writes `last_output`
+regardless), but the collapsed form is what the run is recorded as and what the
+agent's manual-run summary reports. Repeated targets reach the stored value
+because the create path de-duplicates the tokens as written, before they are
+folded.
+
 `deliver: local` never needs a target and stays silent, and a `bot-chat`
 target that was queued, claimed or left ambiguous by a live owner counts as
 delivered (the output may already have been consumed). The check is per job,

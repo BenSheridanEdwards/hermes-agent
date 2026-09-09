@@ -150,6 +150,25 @@ class TestDeliveryNote:
                 == expected
             )
 
+    def test_a_value_whose_tokens_are_all_local_reads_as_the_local_lane(self):
+        """The stored value can list the lane more than once: the create path de-duplicates RAW
+        tokens, so ``deliver="Local, LOCAL"`` is stored as two. Folded one token at a time it is
+        neither ``local`` nor a platform, and this line then told the user the output "was
+        delivered there by the job itself" for a job that delivered nothing. The whole value is
+        folded through the scheduler's normalizer, which is what fire time reads it through."""
+        expected = " (output saved locally only)"
+        for lane in ("Local, LOCAL", "local,local", "LOCAL,local", " local , Local "):
+            assert _manual_run_delivery_note(lane, {}) == expected
+            assert (
+                _manual_run_delivery_note(lane, {"last_delivery_error": "telegram 400"})
+                == expected
+            )
+        # A real target beside the local token is still a delivery.
+        assert (
+            _manual_run_delivery_note("local,telegram:123", {})
+            == " (output was delivered there by the job itself)"
+        )
+
     def test_remote_without_error_keeps_legacy_wording(self):
         expected = " (output was delivered there by the job itself)"
         assert _manual_run_delivery_note("telegram", {}) == expected
