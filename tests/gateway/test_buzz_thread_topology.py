@@ -345,3 +345,246 @@ class TestDisplayDefaults:
         # No user config: must come from the buzz platform tier, not the
         # verbose _GLOBAL_DEFAULTS ("all").
         assert resolve_display_setting({}, "buzz", "tool_progress") != "all"
+
+
+# ── 5. Direct-message carve-out (buzz#32) ────────────────────────────────
+
+DM_CHANNEL = "6468cc16-a114-4f23-8b8c-02c1655cbf6b"
+TEST_PRIVATE_KEY = "00" * 31 + "03"
+
+
+def _dm_top_level_event(event_id, content="what is on my calendar?", pubkey=OTHER_PUBKEY):
+    """A kind-9 DM with no NIP-10 tags: the everyday "user asks the agent something" event."""
+    return {
+        "id": event_id,
+        "pubkey": pubkey,
+        "content": content,
+        "created_at": 1000,
+        "kind": 9,
+        "tags": [["h", DM_CHANNEL]],
+    }
+
+
+def _dm_reply_event(event_id, *, root, parent, content="and tomorrow?", pubkey=OTHER_PUBKEY):
+    """A kind-9 DM the human deliberately posted inside a thread."""
+    return {
+        "id": event_id,
+        "pubkey": pubkey,
+        "content": content,
+        "created_at": 1000,
+        "kind": 9,
+        "tags": [["h", DM_CHANNEL], ["e", root, "", "root"], ["e", parent, "", "reply"]],
+    }
+
+
+class _RelayWs:
+    """Minimal relay websocket that accepts every EVENT frame it is handed."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    async def recv(self):
+        return json.dumps(["OK", self.sent[-1][1]["id"], True, ""])
+
+
+async def _publish_voice_note(adapter, channel, **kwargs):
+    """Drive _publish_voice_note against a fake relay socket; returns the signed event."""
+    import sys
+    from types import ModuleType
+    from unittest.mock import patch
+
+    ws = _RelayWs()
+    fake_ws_mod = ModuleType("websockets")
+    fake_ws_mod.connect = lambda *a, **kw: ws
+    adapter._private_key = TEST_PRIVATE_KEY
+    adapter._authenticate_websocket = AsyncMock()
+    desc = {"url": "https://test.relay/media/x.mp3", "sha256": "d" * 64, "size": 5}
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        result = await adapter._publish_voice_note(
+            channel, desc, "voice-note-1.mp3", "audio/mpeg", **kwargs)
+    assert result.success is True
+    return ws.sent[0][1]
+
+
+def _reply_tags(event):
+    return [tag for tag in event["tags"] if tag[0] == "e"]
+
+
+async def _receive(adapter, channel, event):
+    """Feed an inbound event through the real handler so thread state is recorded as it is live."""
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock(return_value=True)
+    adapter._run_cli = _stub_cli
+    await adapter._handle_event(channel, adapter._channel_state[channel], event)
+
+
+def _dm_adapter(**kwargs):
+    adapter = _make_adapter(**kwargs)
+    adapter._channel_state[DM_CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+    return adapter
+
+
+def _group_adapter(**kwargs):
+    adapter = _make_adapter(**kwargs)
+    adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+    return adapter
+
+
+class TestDirectMessageReplyAnchoring:
+    """A DM answer to a top-level message must itself be top-level.
+
+    Buzz clients keep depth-1 replies out of the main timeline unless the event carries a
+    broadcast tag, so an anchored answer in a 1:1 conversation renders nowhere the human is
+    looking. Mirrors buzz-acp's own rule in crates/buzz-acp/src/queue.rs (format_prompt):
+    in a DM, anchor only when the triggering event already carries a NIP-10 root.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dm_top_level_trigger_posts_flat(self):
+        adapter = _dm_adapter()
+        await _receive(adapter, DM_CHANNEL, _dm_top_level_event("dm-evt"))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send(DM_CHANNEL, "the answer", reply_to="dm-evt")
+
+        args, _ = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_channel_top_level_trigger_still_threads(self):
+        """The control: channels are where threading is wanted and must not change."""
+        adapter = _group_adapter()
+        await _receive(adapter, CHANNEL, _top_level_event("chan-evt"))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send(CHANNEL, "the answer", reply_to="chan-evt")
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "chan-evt"
+
+    @pytest.mark.asyncio
+    async def test_dm_in_thread_trigger_still_joins_the_thread(self):
+        """A thread the human started inside a DM is still answered in that thread."""
+        adapter = _dm_adapter()
+        await _receive(
+            adapter, DM_CHANNEL,
+            _dm_reply_event("dm-child", root=ROOT_EVT, parent=MID_EVT))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send(DM_CHANNEL, "the answer", reply_to="dm-child")
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == ROOT_EVT
+
+    @pytest.mark.asyncio
+    async def test_dm_progress_synthesised_thread_id_posts_flat(self):
+        """Streaming and progress sends carry a thread_id synthesised from the trigger id
+        (_resolve_progress_thread_id), which is not evidence of a real thread."""
+        adapter = _dm_adapter()
+        await _receive(adapter, DM_CHANNEL, _dm_top_level_event("dm-evt"))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send(
+            DM_CHANNEL, "working on it",
+            metadata={"thread_id": "dm-evt", "reply_to_message_id": "dm-evt"})
+
+        args, _ = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_dm_carve_out_wins_over_reply_to_mode(self):
+        """reply_to_mode selects WHICH anchor to thread on, never whether a DM is threaded."""
+        for mode in ("first", "all"):
+            adapter = _dm_adapter(reply_to_mode=mode)
+            await _receive(adapter, DM_CHANNEL, _dm_top_level_event("dm-evt"))
+            cli = _CapturingCli()
+            adapter._run_cli = cli
+            await adapter.send(DM_CHANNEL, "the answer", reply_to="dm-evt")
+            args, _ = cli.calls[0]
+            assert "--reply-to" not in args, f"reply_to_mode={mode} re-anchored a DM reply"
+
+    @pytest.mark.asyncio
+    async def test_unclassified_channel_keeps_threading(self):
+        """Only a conversation the adapter classified as a DM takes the carve-out."""
+        adapter = _make_adapter()
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send("unknown-chat", "the answer", reply_to="evt-1")
+        assert "--reply-to" in cli.calls[0][0]
+
+    # ── Attachments publish through their own paths and need the same rule ──
+
+    @pytest.mark.asyncio
+    async def test_dm_file_attachment_posts_flat(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _dm_adapter()
+        await _receive(adapter, DM_CHANNEL, _dm_top_level_event("dm-evt"))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send_image(DM_CHANNEL, str(img), caption="pic", reply_to="dm-evt")
+
+        args, _ = cli.calls[0]
+        assert "--file" in args and "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_channel_file_attachment_still_threads(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _group_adapter()
+        await _receive(adapter, CHANNEL, _top_level_event("chan-evt"))
+
+        cli = _CapturingCli()
+        adapter._run_cli = cli
+        await adapter.send_image(CHANNEL, str(img), caption="pic", reply_to="chan-evt")
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "chan-evt"
+
+    @pytest.mark.asyncio
+    async def test_dm_voice_note_posts_flat(self):
+        """Voice notes publish a signed event directly, bypassing --reply-to entirely."""
+        adapter = _dm_adapter()
+        await _receive(adapter, DM_CHANNEL, _dm_top_level_event("dm-evt"))
+
+        event = await _publish_voice_note(
+            adapter, DM_CHANNEL, caption="listen", reply_to="dm-evt", metadata=None)
+
+        assert _reply_tags(event) == []
+
+    @pytest.mark.asyncio
+    async def test_channel_voice_note_still_threads(self):
+        adapter = _group_adapter()
+        await _receive(adapter, CHANNEL, _top_level_event("chan-evt"))
+
+        event = await _publish_voice_note(
+            adapter, CHANNEL, caption="listen", reply_to="chan-evt", metadata=None)
+
+        assert _reply_tags(event) == [["e", "chan-evt", "", "reply"]]
+
+    @pytest.mark.asyncio
+    async def test_dm_voice_note_in_thread_still_joins_the_thread(self):
+        adapter = _dm_adapter()
+        await _receive(
+            adapter, DM_CHANNEL,
+            _dm_reply_event("dm-child", root=ROOT_EVT, parent=MID_EVT))
+
+        event = await _publish_voice_note(
+            adapter, DM_CHANNEL, caption="listen", reply_to="dm-child", metadata=None)
+
+        assert _reply_tags(event) == [["e", ROOT_EVT, "", "reply"]]

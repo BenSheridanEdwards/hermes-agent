@@ -1289,7 +1289,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # Anchor: metadata.thread_id, then metadata.reply_to_message_id (stream/progress sends), then reply_to.
         meta = metadata or {}
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        args += self._reply_args(meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to)
+        args += self._reply_args(
+            meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to,
+            chat_id=chat_id, metadata=meta, reply_to=reply_to)
         mention_pubkeys = await self._mention_pubkeys_for(chat_id, content)
         code, out, err = await self._run_message_send(args, content, mention_pubkeys)
         result = self._send_result(chat_id, code, out, err)
@@ -1298,10 +1300,13 @@ class BuzzAdapter(BasePlatformAdapter):
             self._remember_event_meta(str(chat_id), result.message_id, self._self_pubkey, content)
         return result
 
-    def _reply_args(self, anchor: Optional[str]) -> List[str]:
-        """``--reply-to`` CLI args for *anchor*, honoring ``reply_to_mode``."""
-        reply_target = self._resolve_reply_anchor(anchor)
-        return ["--reply-to", str(reply_target)] if reply_target and self._reply_to_mode != "off" else []
+    def _reply_args(
+        self, anchor: Optional[str], *, chat_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None, reply_to: Optional[str] = None,
+    ) -> List[str]:
+        """``--reply-to`` CLI args for *anchor*, honoring ``reply_to_mode`` and the DM carve-out."""
+        reply_target = self._outbound_reply_anchor(anchor, chat_id=chat_id, metadata=metadata, reply_to=reply_to)
+        return ["--reply-to", str(reply_target)] if reply_target else []
 
     def _send_result(self, chat_id: str, code: int, out: str, err: str, *, redact_path: Optional[Path] = None) -> SendResult:
         """``messages send`` result -> SendResult; marks the verified id seen (echo suppression belt-and-braces)."""
@@ -1386,7 +1391,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Never leak host filesystem paths into chat-visible errors.
             return SendResult(success=False, error="Media file not found")
         args = ["messages", "send", "--channel", str(chat_id), "--file", str(local), "--content", "-"]
-        args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
+        args += self._reply_args(
+            (metadata or {}).get("thread_id") or reply_to,
+            chat_id=chat_id, metadata=metadata, reply_to=reply_to)
         code, out, err = await self._run_message_send(args, caption or "")
         return self._send_result(chat_id, code, out, err, redact_path=local)
 
@@ -1634,8 +1641,12 @@ class BuzzAdapter(BasePlatformAdapter):
         """Publish a kind-9 message whose imeta presents uploaded blob *desc* as the voice note *fname*."""
         imeta = self._voice_note_imeta(desc, fname, default_mime, (metadata or {}).get("transcript"))
         tags: List[List[str]] = [["h", str(chat_id)], imeta]
-        anchor = self._resolve_reply_anchor((metadata or {}).get("thread_id") or reply_to)
-        if anchor and self._reply_to_mode != "off":
+        # Voice notes publish their own signed event instead of shelling out to ``messages send``, so the
+        # NIP-10 anchor is built here, under the same rule as _reply_args (DM carve-out included).
+        anchor = self._outbound_reply_anchor(
+            (metadata or {}).get("thread_id") or reply_to,
+            chat_id=chat_id, metadata=metadata, reply_to=reply_to)
+        if anchor:
             tags.append(["e", str(anchor), "", "reply"])
         body = (caption or "").strip()
         content = f"{body}\n[{fname}]({desc['url']})" if body else f"[{fname}]({desc['url']})"
@@ -2410,6 +2421,54 @@ class BuzzAdapter(BasePlatformAdapter):
     def _resolve_reply_anchor(self, anchor: Optional[str]) -> Optional[str]:
         """Thread root when the trigger was inside a thread (reply joins it), else the anchor unchanged."""
         return (self._thread_roots.get(str(anchor)) or anchor) if anchor else anchor
+
+    def _is_dm_channel(self, chat_id: Optional[str]) -> bool:
+        """Whether *chat_id* is a 1:1 direct message, per the adapter's own classification."""
+        state = self._channel_state.get(str(chat_id)) if chat_id else None
+        return bool(state) and state.get("chat_type") == "dm"
+
+    def _answers_a_thread(self, metadata: Optional[Dict[str, Any]], reply_to: Optional[str]) -> bool:
+        """Whether this send answers a message that already lives in a thread.
+
+        A candidate qualifies when it is an inbound message with a recorded NIP-10 root, or when it IS
+        the root some inbound message hangs off. A plain top-level message satisfies neither, which is
+        exactly what the DM carve-out in ``_outbound_reply_anchor`` keys on. Progress and stream sends
+        can carry a synthesised ``thread_id`` equal to the triggering event id (see
+        ``_resolve_progress_thread_id``), so truthiness of ``thread_id`` alone is not evidence of a thread.
+        """
+        roots = self._thread_roots
+        meta = metadata or {}
+        for candidate in (meta.get("thread_id"), meta.get("reply_to_message_id"), reply_to):
+            if not candidate:
+                continue
+            key = str(candidate)
+            if roots.get(key) or any(root == key for root in roots.values()):
+                return True
+        return False
+
+    def _outbound_reply_anchor(
+        self, anchor: Optional[str], *, chat_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None, reply_to: Optional[str] = None,
+    ) -> Optional[str]:
+        """The reply anchor an outbound message should carry, or None to post it at the top level.
+
+        ``reply_to_mode == "off"`` posts flat everywhere, as before. On top of that, a DM answer to a
+        top-level message is itself top-level: Buzz clients keep depth-1 replies out of the main
+        timeline unless the event carries a broadcast tag, so in a 1:1 conversation a threaded answer
+        renders nowhere the human is looking: invisible on mobile until an unrelated refetch, hidden
+        behind a "N replies" link on desktop (buzz#32).
+
+        This mirrors the rule Buzz's own managed harness applies in
+        ``crates/buzz-acp/src/queue.rs`` (``format_prompt``): in a DM it anchors only when the
+        triggering event already carries a NIP-10 root, and otherwise hands the agent no anchor at all.
+        Channel threading is deliberately untouched, because a channel is where threading is wanted; a DM
+        thread the human started is still joined rather than broken out of.
+        """
+        if not anchor or self._reply_to_mode == "off":
+            return None
+        if self._is_dm_channel(chat_id) and not self._answers_a_thread(metadata, reply_to):
+            return None
+        return self._resolve_reply_anchor(anchor)
 
     def _remember_event(self, state: dict, event: dict) -> None:
         """Record author + content snippet for later NIP-10 parent lookup."""
