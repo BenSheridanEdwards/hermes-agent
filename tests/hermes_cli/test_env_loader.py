@@ -1457,8 +1457,14 @@ def test_inline_comment_in_dotenv_does_not_scrub_the_keys_below_it(tmp_path, mon
     very common style. python-dotenv parses all three assignments and sets them;
     the scrub then used to delete the two it could not see, so the profile lost
     its ACP auth method and its Copilot binary on every invocation."""
+    # setenv-then-delenv, not a bare delenv: MonkeyPatch.delitem records nothing for a key that is
+    # already absent, so the teardown would restore nothing and the load below would leave
+    # COPILOT_CLI_PATH=/usr/local/bin/copilot in the real os.environ for the rest of the process.
+    # test_external_process_provider_seam.py then fails on a copilot binary that does not exist.
+    # scripts/run_tests.sh hides it by isolating per file; `pytest tests/hermes_cli/` does not.
     for key in ("HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "COPILOT_CLI_PATH"):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     home = tmp_path / "profile"
     home.mkdir()
     (home / ".env").write_text(
