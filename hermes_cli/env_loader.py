@@ -229,8 +229,10 @@ def _host_owns_buzz_identity() -> bool:
 
 
 def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
-    """Re-assert the snapshot, and drop every ``_BUZZ_IDENTITY_DROP_KEYS`` name that APPEARED DURING the
-    load and that the host did not pass (a split identity fails relay auth).
+    """Drop every ``_BUZZ_IDENTITY_DROP_KEYS`` name that APPEARED DURING the load and that the host did
+    not pass (a split identity fails relay auth), and THEN re-assert the snapshot. In that order: the
+    restore is a sequence of ``os.environ`` writes with no lock over the readers, so its intermediate
+    states are as observable as its result. See the comment on the two loops below.
 
     The drop is the identity group, NOT the ``BUZZ_`` prefix. The prefix is what the host OWNS, so a
     managed harness passing ``BUZZ_CHANNELS`` still beats the profile's; but deleting the prefix took the
@@ -251,10 +253,17 @@ def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
     snapshot = _ACP_HOST_ENV
     if not snapshot:
         return
-    replaced = [k for k, v in snapshot.items() if os.environ.get(k) != v]
-    for key in replaced:
-        os.environ[key] = snapshot[key]
-
+    # DROP FIRST, RE-ASSERT SECOND, and that order is load bearing rather than cosmetic. The two loops
+    # touch disjoint names (``dropped`` excludes everything in ``snapshot`` by construction), so the end
+    # state is identical either way and only the INTERMEDIATE state differs. Re-asserting first published
+    # the host's managed key beside the profile owner's attestation for the length of a dict scan: the
+    # exact pairing this module exists to refuse, visible to every non-loading reader, which take no lock
+    # and read ``os.environ`` directly. That is reachable by the real consumer and not only by
+    # instrumentation, because ``load_hermes_dotenv`` runs on background threads in an ACP process (see
+    # ``_ACP_HOST_ENV`` above) while the main thread resolves the identity pair for a Buzz send.
+    # Dropping first makes the intermediate state the profile's key with no attestation, or its mirror,
+    # which an owner-gated relay REFUSES rather than accepts. Pinned by
+    # test_acp_restore_never_shows_a_reader_a_split_identity.
     dropped: list[str] = []
     if _host_owns_buzz_identity():
         dropped = sorted(
@@ -265,6 +274,11 @@ def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
         )
         for key in dropped:
             del os.environ[key]
+
+    replaced = [k for k, v in snapshot.items() if os.environ.get(k) != v]
+    for key in replaced:
+        os.environ[key] = snapshot[key]
+    if _host_owns_buzz_identity():
         _warn_if_host_claim_has_no_key()
 
     if (replaced or dropped) and not _ACP_RESTORE_LOGGED:
@@ -772,6 +786,14 @@ def _apply_managed_env() -> None:
         return
     _sanitize_env_file_if_needed(managed_env)
     managed_names = _env_keys_defined_in_dotenv(managed_env) if acp_host_owns_buzz_identity() else set()
+    # Settle BEFORE the load as well as after. The overlay claims the group by NAME, and the names it
+    # claims are known from the file scan before a single value is read, so the members it does not
+    # define can go first and the mixed state never exists. Settling only afterwards left the host's key
+    # beside the admin's attestation for a whole dotenv read and parse, which is a far wider window than
+    # the one inside _restore_acp_host_env and reachable by the same non-loading readers.
+    # The second call is not redundant: _env_keys_defined_in_dotenv is a line scanner, and any name it
+    # under-reports is a name the load itself would re-introduce after the pre-clear.
+    _settle_buzz_identity_after_managed_env(managed_names)
     _load_dotenv_with_fallback(managed_env, override=True)
     _settle_buzz_identity_after_managed_env(managed_names)
 
