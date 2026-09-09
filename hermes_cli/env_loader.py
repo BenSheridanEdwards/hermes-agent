@@ -754,7 +754,11 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
 
 def _apply_managed_env() -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
-    from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
+    from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup.
+
+    The admin overlay outranks the ACP host, and that stays true, but when it claims the Buzz identity it
+    claims the whole group: see :func:`_settle_buzz_identity_after_managed_env`. This is the last writer of
+    ``BUZZ_*`` in the load, so it is the last place the all-or-nothing rule has to hold."""
     try:
         from hermes_cli import managed_scope
 
@@ -767,7 +771,36 @@ def _apply_managed_env() -> None:
     if not managed_env.exists():
         return
     _sanitize_env_file_if_needed(managed_env)
+    managed_names = _env_keys_defined_in_dotenv(managed_env) if acp_host_owns_buzz_identity() else set()
     _load_dotenv_with_fallback(managed_env, override=True)
+    _settle_buzz_identity_after_managed_env(managed_names)
+
+
+def _settle_buzz_identity_after_managed_env(managed_names: set[str]) -> None:
+    """Apply the all-or-nothing identity rule to the managed overlay, the one writer of ``BUZZ_*`` that runs
+    AFTER the final :func:`_restore_acp_host_env`.
+
+    ``/etc/hermes/.env`` beats the host by design (admin lockdown, root-owned, documented top of stack) and
+    that precedence is unchanged. What changes is the granularity. The overlay used to win one NAME at a
+    time, so a managed file carrying only ``BUZZ_AUTH_TAG`` left the host's managed key signing the admin's
+    attestation: the same split identity this module refuses from the profile, reached by the one writer
+    positioned after every restore. The admin is a third principal, and the rule does not care which two
+    principals are mixed.
+
+    An overlay that defines a SIGNING member (``_BUZZ_IDENTITY_TRIGGER_KEYS``) has claimed the identity, so
+    it owns the group and the members it did not define are removed. An overlay that defines none has
+    claimed nothing, and keeps its ordinary per-name precedence: ``BUZZ_RELAY_URL`` alone is an org relay
+    pointed at the host's own key, which is exactly the admin lockdown this overlay is for, and
+    ``_host_owns_buzz_identity`` refuses to read a bare relay URL as a claim for the same reason everywhere
+    else.
+
+    Gated on :func:`acp_host_owns_buzz_identity` via the caller: with no host claim there is only one
+    principal supplying the identity and the overlay is ordinary admin precedence over the profile owner's
+    own files, which a single-profile machine legitimately uses to centralize the attestation."""
+    if not managed_names & _BUZZ_IDENTITY_TRIGGER_KEYS:
+        return
+    for key in sorted(_BUZZ_IDENTITY_DROP_KEYS - managed_names):
+        os.environ.pop(key, None)
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

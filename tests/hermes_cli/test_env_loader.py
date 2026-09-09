@@ -1189,6 +1189,78 @@ def test_acp_hosted_blank_host_member_is_not_completed_by_the_profile(
     assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
 
 
+def test_acp_hosted_managed_env_claiming_the_identity_owns_the_whole_group(tmp_path, monkeypatch):
+    """The managed overlay is the one writer of BUZZ_* that runs after the last
+    restore, so it could complete the host's identity one name at a time: an
+    /etc/hermes/.env carrying only BUZZ_AUTH_TAG left the host's managed key
+    signing the admin's attestation.
+
+    The overlay still outranks the host. It now does so as a group: defining a
+    signing member claims the identity, and the members it did not define are
+    removed rather than inherited from the host.
+
+    test_acp_hosted_managed_env_still_beats_host is the other half of this pair:
+    an overlay that defines only BUZZ_RELAY_URL has claimed nothing (a bare
+    relay URL is never a claim, here or anywhere else in this module) and keeps
+    its ordinary per-name precedence over the host."""
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(
+        'BUZZ_AUTH_TAG=["auth","admin-npub","admin-sig","1"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+    monkeypatch.setenv("BUZZ_RELAY_URL", "ws://host.example")
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert os.environ["BUZZ_AUTH_TAG"] == '["auth","admin-npub","admin-sig","1"]'
+    assert "BUZZ_PRIVATE_KEY" not in os.environ  # not the host's, to go with the admin's tag
+    assert "BUZZ_RELAY_URL" not in os.environ
+
+
+def test_managed_env_tag_over_a_profile_key_is_untouched_without_a_host_claim(tmp_path, monkeypatch):
+    """The overlay group rule is gated on an ACP host claim, and this pins the
+    gate rather than the rule.
+
+    With no host in the picture there is one principal: the machine's admin and
+    the profile owner are the same party as far as the identity goes, and
+    centralizing the attestation in /etc/hermes/.env over a key in the profile's
+    own .env is a legitimate single-profile lockdown. Applying the group rule
+    here would delete that profile's working key."""
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".env").write_text(
+        'BUZZ_AUTH_TAG=["auth","admin-npub","admin-sig","1"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    assert os.environ["BUZZ_PRIVATE_KEY"] == "profile-key"
+    assert os.environ["BUZZ_AUTH_TAG"] == '["auth","admin-npub","admin-sig","1"]'
+    assert os.environ["BUZZ_RELAY_URL"] == "ws://profile.example"
+
+
 def test_acp_hosted_profile_without_env_keeps_host_env(tmp_path, monkeypatch):
     """Bare profile (no .env): nothing to restore, host env untouched."""
     import hermes_cli.env_loader as env_loader
