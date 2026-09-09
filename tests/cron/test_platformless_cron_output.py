@@ -386,6 +386,31 @@ def test_a_delivered_co_target_suppresses_the_body_for_a_failed_one(
     assert not any("output not delivered" in m for m in _messages(caplog))
 
 
+def test_policy_dropped_attachments_are_named_in_the_logged_reason(
+    platformless_env, monkeypatch, caplog
+):
+    """The logged reason is the complete account of why nothing arrived, so it has to include the
+    attachments media policy refused. ``policy_drop_errors`` was appended to ``delivery_errors``
+    AFTER the log call, so a run whose files were dropped and whose targets then all failed logged
+    the body under the target errors alone and the operator never saw the dropped file."""
+    monkeypatch.setattr(
+        s, "run_job",
+        _succeeding_run_job("report body\nMEDIA:/nonexistent/hermes-drop-me.png"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-mediadrop", "name": "drop", "deliver": "telegram:123"},
+            adapters={}, loop=None,
+        )
+
+    records = _undelivered_records(caplog)
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "not configured/enabled" in logged
+    assert "dropped by media path" in logged
+
+
 def test_component_cron_filter_shows_the_header_but_drops_the_body(gateway_mode_logging):
     """Why the docs point operators at plain ``hermes logs`` and not ``--component cron``.
 
@@ -677,6 +702,8 @@ def test_the_lane_is_folded_at_the_source_not_only_at_the_consumers(
     # Distinct targets are never collapsed, and order is preserved.
     ("telegram:123,discord:456", "telegram:123,discord:456"),
     ("all,bot-chat", "all,bot-chat"),
+    # A falsy non-string token names itself instead of vanishing.
+    ([0], "0"),
 ])
 def test_normalize_deliver_value_folds_the_token_set_too(deliver, expected):
     """Folding each token was not enough: the SET has to fold too.
@@ -733,6 +760,22 @@ def test_a_local_token_beside_the_origin_lane_reads_as_the_origin_lane(
     _args, kw = platformless_env["marked"][0]
     assert kw["delivery_error"] is None
     assert _recorded_outcome(platformless_env) == "not_configured"
+
+
+def test_a_whitespace_only_lane_is_quoted_in_the_reason(platformless_env, monkeypatch, caplog):
+    """The normalizer deliberately leaves a whitespace-only value alone so it surfaces here
+    rather than being downgraded to ``local``. Replayed raw the reason read ``deliver=`` followed
+    by invisible padding; quoted, the operator can see what the job was actually configured with.
+    Values with a real token keep their bare spelling (the test above)."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("blank lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-blank", "name": "blank", "deliver": "  "}, adapters={}, loop=None,
+        )
+
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] == "no delivery target resolved for deliver='  '"
 
 
 def test_the_unresolved_reason_carries_the_folded_lane(platformless_env, monkeypatch, caplog):
