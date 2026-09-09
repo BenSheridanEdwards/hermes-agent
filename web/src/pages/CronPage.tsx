@@ -23,6 +23,7 @@ import {
   cronJobHasExecutionContent,
   cronJobFormFromJob,
   cronLastResult,
+  isLocalDeliverLane,
   type CronJobFormState,
 } from "@/lib/cron-job";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
@@ -1124,7 +1125,7 @@ export default function CronPage() {
                       </Badge>
                     )}
                     <Badge tone="outline">{profileLabel(profile)}</Badge>
-                    {deliver && deliver !== "local" && (
+                    {deliver && !isLocalDeliverLane(deliver) && (
                       <Badge tone="outline">{deliver}</Badge>
                     )}
                     {Array.isArray(job.skills) && job.skills.length > 0 && (
