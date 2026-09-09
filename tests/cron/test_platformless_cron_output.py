@@ -715,7 +715,26 @@ def test_normalize_deliver_value_folds_the_token_set_too(deliver, expected):
     assert sched_delivery._normalize_deliver_value(deliver) == expected
 
 
-@pytest.mark.parametrize("deliver", ["Local, LOCAL", "LOCAL,local", ["local", "Local"]])
+@pytest.mark.parametrize("deliver,expected", [
+    (["local", None], "local"),
+    ([None], "local"),
+    (["local", None, "telegram:1"], "telegram:1"),
+])
+def test_a_null_in_a_deliver_list_does_not_evict_the_local_lane(deliver, expected):
+    """The empty-token filter has to run on the FOLDED token, not on the raw one.
+
+    ``str(None)`` is ``"None"``, so a ``None`` element passed a filter on the raw token, folded to
+    the empty string, and entered ``_fold_deliver_token_set`` as a token. The set fold then saw a
+    token other than ``local`` survive and dropped the ``local``, so ``["local", null]``
+    normalized to ``""``: no target resolved, the run was recorded ``failed``, and up to 4 KB of
+    job output went into ``agent.log`` and ``errors.log`` at WARNING on every tick. That is the
+    rotation problem the set fold was written to close, reached through the list branch. A
+    hand-edited ``jobs.json`` or an MCP client sending a JSON ``null`` is the reachable source."""
+    assert sched_delivery._normalize_deliver_value(deliver) == expected
+
+
+@pytest.mark.parametrize(
+    "deliver", ["Local, LOCAL", "LOCAL,local", ["local", "Local"], ["local", None]])
 def test_a_redundant_local_lane_stays_silent_and_is_recorded_suppressed(
     platformless_env, monkeypatch, caplog, deliver
 ):
