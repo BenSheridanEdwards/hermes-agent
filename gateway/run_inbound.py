@@ -58,9 +58,15 @@ def untranscribed_audio_note(path: str) -> str:
 
 
 def voice_message_attached_note(path: str, duration_str: Optional[str] = None) -> str:
-    """Marker for a voice clip that is attached but deliberately not transcribed (STT disabled)."""
+    """Marker for a voice clip that is attached but deliberately not transcribed (STT disabled).
+
+    Rendered through ``to_agent_visible_cache_path`` like the failure note above: the note exists
+    so the agent can open the clip, and on a docker or ssh terminal backend the host path is not
+    the path it sees. A local backend, and any path outside the Hermes cache, is unchanged."""
+    from tools.credential_files import to_agent_visible_cache_path
     suffix = f" (duration: {duration_str})" if duration_str else ""
-    return f"[The user sent a voice message: {os.path.abspath(path)}{suffix}]"
+    agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+    return f"[The user sent a voice message: {agent_path}{suffix}]"
 
 
 async def transcribe_clip(

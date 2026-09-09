@@ -38,6 +38,7 @@ from acp_adapter.session import (
 )
 from acp_adapter.voice import (
     VoiceTurn, bind_voice_turn, cleanup_voice_turn, prepare_voice_turn, replay_voice_turn,
+    sweep_audio_cache,
 )
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
@@ -583,6 +584,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def _attach_session_mcp(self, state: SessionState, mcp_servers: list | None, log: str, *log_args) -> None:
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
+        # Session start is this process's housekeeping tick: an ACP-only install never runs the
+        # gateway loop that prunes the inbound audio cache, so voice clips a failure note keeps
+        # would otherwise accumulate for the life of the profile.
+        await sweep_audio_cache()
         logger.info(log, *log_args)
 
     async def new_session(self, cwd: str, mcp_servers: list | None = None, **kwargs: Any) -> NewSessionResponse:
@@ -865,11 +870,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 pre_turn_hermes_id = getattr(state.agent, "session_id", None)
                 # Fresh context copy: concurrent sessions on the shared executor must not share ContextVars.
                 ctx = contextvars.copy_context()
-                # Handed on before the await, not after: cancelling the await does not stop the
-                # executor thread, and a clip the agent may still be reading must not vanish
-                # under it. The cache sweep collects whatever a cancelled turn leaves.
+                # Handed on the moment the executor accepts the work, before the await and not
+                # after: cancelling the await does not stop the worker thread, and a clip the
+                # agent may still be reading must not vanish under it (the cache sweep collects
+                # whatever a cancelled turn leaves). ``run_in_executor`` submits synchronously,
+                # so a submit that never happens (executor shut down) hands nothing on and its
+                # clip goes with the turn rather than outliving a note no one ever received.
+                running = loop.run_in_executor(_executor, ctx.run, _run_agent)
                 handed_on = True
-                result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+                result = await running
             except Exception:
                 logger.exception("Executor error for session %s", session_id)
                 with state.runtime_lock:
