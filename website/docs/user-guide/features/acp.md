@@ -399,10 +399,29 @@ The group is `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, `BUZZ_RELAY_URL` and
 `BUZZ_CREDENTIALS_FILE` (a credentials record is itself a key and an
 attestation). Members the host did not supply are dropped rather than merged.
 
+"By every route" includes the profile's `config.yaml`, which no environment
+rule can see. `relay_url` there is refused under a claim for the same reason
+`credentials_file` is: the relay is signed into the same kind-22242 event as
+the key and the attestation, so a profile that could still supply it would
+choose which relay the managed identity authenticates to, and on a
+Buzz-managed fleet the agent often owns that file.
+
+The rule is applied **atomically**. The restore is a sequence of `os.environ`
+writes and non-loading readers take no lock, so its intermediate states are as
+observable as its result: it deletes the profile's members before it re-asserts
+the host's, and the managed overlay removes the members it does not define
+before it reads the file rather than after. Taken the other way round, a reader
+landing mid-restore saw exactly the pairing the rule refuses, and in an ACP
+process that is not hypothetical: `load_hermes_dotenv` runs on background
+threads (MCP discovery, session server registration) while the main thread
+resolves the identity for a send.
+
 #### Every route into the identity, and what the rule does to it
 
 A private key and an attestation can reach the running agent independently by
-these routes. The rule is enforced at four seams, named in the last column.
+these routes. Rows 14 to 17 are the ones the earlier thirteen-row table missed:
+the plugin's configuration seam, the ordering inside the restore itself, and two
+that are stated rather than closed.
 
 | # | Route | Reaches the identity via | Under a claiming host |
 |---|-------|--------------------------|-----------------------|
@@ -419,11 +438,25 @@ these routes. The rule is enforced at four seams, named in the last column.
 | 11 | Machine-wide overlay `/etc/hermes/.env` | `_apply_managed_env`, after the last restore | Outranks the host, **as a group**: an overlay defining a signing member owns all four names and the ones it did not define are removed. |
 | 12 | Plugin, MCP and terminal children | `os.environ.copy()`, `_sanitize_subprocess_env` | Inherit the corrected environment. |
 | 13 | A terminal child running `buzz` **itself** | outside Hermes entirely | **Not closed, and not closable here.** The child reads `~/.config/buzz/*.json` with its own code. While the host supplies a key that key is in the child's environment and wins; a tag-only host leaves the child free to pair the record's key with the inherited tag. Scrubbing the child's environment would not close it either, since an agent holding a terminal can re-export any value it can read. The fix belongs in the `buzz` CLI's own credential resolution. |
+| 14 | `relay_url` in the profile's `config.yaml`, and the YAML-to-env bridge that writes it back into `os.environ` after every restore | `_configured_relay`, `_apply_yaml_config` | Refused. The relay is a group member, signed into the same auth event. A configured relay that the claim suppresses is logged once, so the agent does not simply stop connecting in silence. |
+| 15 | The restore itself, mid-flight | `_restore_acp_host_env`, `_apply_managed_env` | Closed by ordering: members are dropped before the snapshot is re-asserted, and the overlay settles the group before its file is read, so no intermediate state pairs two principals. |
+| 16 | The profile secret scope under multiplexing | `_get_scoped_secret`, scoped rung | Not reachable today (a Buzz-managed ACP host is single-profile) and fails closed in both directions if it ever is. Stated rather than closed: a host tag-only claim beside a scope holding only a key resolves to the scoped key and no tag, and an empty scope to neither. |
+| 17 | `hermes_cli/config.py::reload_env()` | unguarded `os.environ[key] = value` over the whole profile `.env` | Not reachable from ACP: its callers are the REPL's reload command and the `reload.env` RPC, while `acp_adapter/session.py` goes straight to `run_agent`. The function carries a comment naming the predicate to ask before that changes. |
 
 Seams 1 to 6 are the environment restore in `hermes_cli/env_loader.py`; 7 and 8
 are pair resolution in the Buzz plugin (the key and the attestation are resolved
-together, from one supplier, never each with its own fallback chain); 9 and 10
-are the same rule asked at the plugin's read seam; 11 is the managed overlay.
+together, from one supplier, never each with its own fallback chain, and the
+pair is the only thing a consumer can obtain); 9 and 10 are the same rule asked
+at the plugin's read seam; 11 is the managed overlay; 14 is the plugin's
+configuration seam, where `config.yaml` reaches the identity without passing
+through the environment at all; 15 is the ordering inside 1 to 6 and 11.
+
+A host claim that leaves nothing able to sign is always logged, once per
+process and by names only, whether the claimant is the host (`BUZZ_AUTH_TAG`
+with no `BUZZ_PRIVATE_KEY`) or the overlay (a claim that strips the key the
+host did supply). Failing closed is correct; failing closed silently leaves the
+operator with Buzz's generic "must be configured" error and nothing pointing at
+the cause.
 
 The overlay is the only route that may outrank the host, and only wholesale.
 `/etc/hermes/.env` is root-owned admin lockdown and keeps its documented
@@ -448,7 +481,12 @@ passes; it just does not delete the ones it did not.
 
 `BUZZ_RELAY_URL` is a member of the identity group but does not by itself claim
 it: it is a non-secret endpoint, so a host passing only a relay URL leaves the
-profile's own key and tag in place rather than deleting them.
+profile's own key and tag in place rather than deleting them. Under someone
+else's claim it is a full member, dropped from the environment and refused from
+`config.yaml` alike, because it is signed into the same auth event as the key.
+A managed host that claims the identity must therefore pass the relay too; if
+it does not, and the profile configured one, the plugin logs why it stopped
+using it.
 
 `BUZZ_AUTH_TAG` is not symmetric with that. It **does** claim the group, so a
 host that supplies an attestation and no `BUZZ_PRIVATE_KEY` drops the profile's
@@ -462,7 +500,10 @@ precedence back to the profile.
 
 Without `BUZZ_MANAGED_AGENT` the host is a plain editor (Zed, VS Code) and
 nothing changes: the shell-export flow documented above for `buzz-acp` keeps
-working, and `.env` keeps its usual precedence over it.
+working, and `.env` keeps its usual precedence over it. A harness that injects
+`BUZZ_PRIVATE_KEY` and forgets the marker therefore gets the pre-fix behaviour,
+safely (the profile then supplies both halves, so nothing is mismatched) but
+otherwise silently, so Hermes logs a debug line naming exactly that at startup.
 
 Set `HERMES_ACP_HOST_ENV=0` to turn the whole exception off and put every
 variable back on the normal `.env`-wins rule. It is read from the **environment
