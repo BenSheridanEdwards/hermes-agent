@@ -674,8 +674,11 @@ def test_the_lane_is_folded_at_the_source_not_only_at_the_consumers(
     noticed when the SOURCE fold regressed: reverting both branches of ``_normalize_deliver_value``
     to a bare ``str(p).strip()`` left every lane test green, and the defensive re-folding hid it.
 
-    The reason string is where the normalized value is reported verbatim (into ``last_output``'s
-    delivery error and into the log line the operator reads), so it is what pins the source fold.
+    The reason string is where the SCHEDULER reports the normalized value verbatim (into
+    ``last_output``'s delivery error and into the log line the operator reads), so it is what pins
+    the source fold here. It is not the only such surface in the codebase: the manual-run
+    completion summary in ``tools/cronjob_tools.py`` prints ``Delivery target: {deliver}`` from
+    the same normalizer, and that line is relayed to the user by the calling agent.
     One case per branch of the normalizer: a comma string and a list."""
     monkeypatch.setattr(s, "run_job", _succeeding_run_job("source fold body"))
 
