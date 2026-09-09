@@ -376,23 +376,68 @@ identity:
 Everything else, `OPENAI_API_KEY` and the other provider credentials included,
 keeps the normal rule: `.env` wins.
 
-The Buzz **identity** is treated as **one credential, not three**.
-`BUZZ_AUTH_TAG` is an owner attestation bound to the key in `BUZZ_PRIVATE_KEY`,
-and `BUZZ_RELAY_URL` is carried in the same signed auth event. So when a managed
-host supplies `BUZZ_PRIVATE_KEY` or `BUZZ_AUTH_TAG`, the profile may not supply
-the others: those three names, plus `BUZZ_CREDENTIALS_FILE` (a credentials record
-is itself a key and attestation), are dropped rather than merged, since an agent
-that signs with one identity and presents another fails relay verification. That
-covers every route the profile has into the environment (`.env`, the project
-`.env`, `.op.env` and external secret sources), not just the `.env` file.
+#### The rule
 
-Two of the profile's routes never touch the environment at all, and the Buzz
-plugin closes those at the point of use rather than in the loader: an owner
-attestation is only ever read from the same credential that supplied the
-signing key, so a `credentials_file` set in the profile's `config.yaml` cannot
-lend its `auth_tag` to a host-supplied key; and the plugin's fallback read of
-the profile's `.env` (used when a value is absent from the environment) skips
-the identity names while a host owns them.
+The Buzz **identity** is **one credential, not three**. `BUZZ_AUTH_TAG` is an
+owner attestation bound to the key in `BUZZ_PRIVATE_KEY`, and `BUZZ_RELAY_URL` is
+carried in the same signed auth event. An agent that signs with one identity and
+presents another fails relay verification, and a relay that accepts it is worse.
+So there is one rule, and everything below is that rule applied at a different
+seam:
+
+> Once an ACP host supplies a **signing** member of the Buzz identity group
+> (`BUZZ_PRIVATE_KEY` or `BUZZ_AUTH_TAG`, non-blank), the host owns the whole
+> group. Every member the host did not supply resolves to **nothing**, by every
+> route. No second principal may complete the identity.
+
+"Supplied" means present **and non-blank** everywhere the rule is asked: `""`,
+`"   "` and a trailing newline are what a harness that reads a value out of a
+file exports when the file is missing, and counting one as supplied would pin a
+value that cannot sign while claiming the group with it.
+
+The group is `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, `BUZZ_RELAY_URL` and
+`BUZZ_CREDENTIALS_FILE` (a credentials record is itself a key and an
+attestation). Members the host did not supply are dropped rather than merged.
+
+#### Every route into the identity, and what the rule does to it
+
+A private key and an attestation can reach the running agent independently by
+these routes. The rule is enforced at four seams, named in the last column.
+
+| # | Route | Reaches the identity via | Under a claiming host |
+|---|-------|--------------------------|-----------------------|
+| 1 | Host-injected process environment | `os.environ` at spawn | Owns the group. Re-asserted after every profile source. |
+| 2 | Profile `<home>/.env` | `load_dotenv(override=True)` | Dropped. Appeared during the load, absent from the host snapshot. |
+| 3 | Project `./.env` | `load_dotenv(override=not loaded)` | Dropped, same rule. |
+| 4 | `<home>/.op.env` | direct `os.environ` write | Dropped, same rule. |
+| 5 | External secret managers (Bitwarden, 1Password, `override_existing: true`) | `registry.apply_all` | Dropped. The restore runs after the vault round trip. |
+| 6 | `BUZZ_CREDENTIALS_FILE` in the environment | `_configured_credentials_file` | Dropped. It is a member of the group. |
+| 7 | `credentials_file` in the profile's `config.yaml` | `_resolve_credentials_data` | Refused. The record supplies **neither** half of a claimed identity. |
+| 8 | `~/.config/buzz/*credentials*.json` autodiscovery | `_credentials_candidates` | Refused, same seam as 7. |
+| 9 | The plugin's unscoped fallback read of `<home>/.env` off disk | `build_profile_secret_scope` | Refused. The env rule cannot see a file read, so the rule is asked at the read. |
+| 10 | Cached copies of 9 (`_UNSCOPED_PROFILE_SECRETS`, `_SECRET_SOURCE_VALUES_BY_HOME`) | memoised mappings | Refused. The rule is evaluated at read time, ahead of the cache. |
+| 11 | Machine-wide overlay `/etc/hermes/.env` | `_apply_managed_env`, after the last restore | Outranks the host, **as a group**: an overlay defining a signing member owns all four names and the ones it did not define are removed. |
+| 12 | Plugin, MCP and terminal children | `os.environ.copy()`, `_sanitize_subprocess_env` | Inherit the corrected environment. |
+| 13 | A terminal child running `buzz` **itself** | outside Hermes entirely | **Not closed, and not closable here.** The child reads `~/.config/buzz/*.json` with its own code. While the host supplies a key that key is in the child's environment and wins; a tag-only host leaves the child free to pair the record's key with the inherited tag. Scrubbing the child's environment would not close it either, since an agent holding a terminal can re-export any value it can read. The fix belongs in the `buzz` CLI's own credential resolution. |
+
+Seams 1 to 6 are the environment restore in `hermes_cli/env_loader.py`; 7 and 8
+are pair resolution in the Buzz plugin (the key and the attestation are resolved
+together, from one supplier, never each with its own fallback chain); 9 and 10
+are the same rule asked at the plugin's read seam; 11 is the managed overlay.
+
+The overlay is the only route that may outrank the host, and only wholesale.
+`/etc/hermes/.env` is root-owned admin lockdown and keeps its documented
+top-of-stack precedence, but the admin is a different principal from both the
+host and the profile owner, so an overlay carrying only `BUZZ_AUTH_TAG` no
+longer leaves the host's key signing the admin's attestation. An overlay that
+defines no signing member has claimed nothing and keeps its ordinary per-name
+precedence, so `BUZZ_RELAY_URL` alone still points a host-keyed agent at the org
+relay.
+
+Outside a host claim none of this applies: there is one principal, and the
+profile owner may mix their own sources freely. An ambient `BUZZ_AUTH_TAG`
+alongside a `buzz login` record is the documented NIP-OA membership flow and
+still works.
 
 The rest of the `BUZZ_*` namespace is **plugin configuration, not identity**, and
 is left alone. `BUZZ_CHANNELS`, `BUZZ_HOME_CHANNEL`, `BUZZ_ALLOWED_USERS`,
@@ -407,10 +452,13 @@ profile's own key and tag in place rather than deleting them.
 
 `BUZZ_AUTH_TAG` is not symmetric with that. It **does** claim the group, so a
 host that supplies an attestation and no `BUZZ_PRIVATE_KEY` drops the profile's
-key and supplies no replacement, and Buzz sends then fail with a generic
-"must be configured" error. Hermes logs a warning naming that case at load time.
-Pass the signing key that owns the attestation, unset `BUZZ_AUTH_TAG` on the
-host, or set `HERMES_ACP_HOST_ENV=0` to hand precedence back to the profile.
+key and supplies no replacement. That is a real fail-closed and not a warning
+only: the plugin will not sign with a key from the profile's credentials record
+either, so Buzz sends fail with the "no private key" error rather than going out
+under the profile owner's key with the host's attestation. Hermes logs a warning
+naming that case at load time. Pass the signing key that owns the attestation,
+unset `BUZZ_AUTH_TAG` on the host, or set `HERMES_ACP_HOST_ENV=0` to hand
+precedence back to the profile.
 
 Without `BUZZ_MANAGED_AGENT` the host is a plain editor (Zed, VS Code) and
 nothing changes: the shell-export flow documented above for `buzz-acp` keeps
