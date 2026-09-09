@@ -497,8 +497,8 @@ component, so it lands in `logs/agent.log`, not in `logs/gateway.log`. A
 failed run or a failed delivery logs it at `WARNING`, so it is in
 `logs/errors.log` too, and on the gateway's stderr (`gateway.error.log` under
 launchd, the journal under systemd). A successful run whose lane simply has
-nowhere to go — origin-less `deliver: origin`, which is not a failure and is
-recorded `ok` — logs at `INFO`, so routine output does not fill the error log;
+nowhere to go, origin-less `deliver: origin`, which is not a failure and is
+recorded `ok`, logs at `INFO`, so routine output does not fill the error log;
 that line reaches stderr only when the gateway runs with `-v`. Note that the
 `INFO` line follows the configured log level: with `logging.level: WARNING` in
 `config.yaml` the log files are written at `WARNING` and the successful-run
