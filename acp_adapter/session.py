@@ -100,10 +100,68 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
 
+DEFAULT_ACP_TOOLSET = "hermes-acp"
+ACP_TTS_TOOLSET = "tts"
+
+
+def load_acp_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The merged Hermes config (``{}`` when it cannot be read), or ``config`` when the caller
+    already has it. Load once at the top of a turn and pass it down: ``load_config()`` reads and
+    merges files, and a voice turn otherwise pays for it on the event loop thread per helper."""
+    if config is not None:
+        return config
+    try:
+        from hermes_cli.config import load_config
+        return load_config() or {}
+    except Exception:
+        logger.debug("ACP: config unavailable, using defaults", exc_info=True)
+        return {}
+
+
+def acp_settings(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The ``acp:`` config section (``{}`` when absent); loads the merged config when not given."""
+    section = load_acp_config(config).get("acp")
+    return section if isinstance(section, dict) else {}
+
+
+def acp_voice_reply_enabled(config: Dict[str, Any] | None = None) -> bool:
+    """Whether ACP turns that start with a voice note ask for a spoken reply (the gateway's
+    ``voice.auto_tts`` default), with ``acp.auto_tts: true|false`` overriding it for ACP hosts."""
+    config = load_acp_config(config)
+    override = acp_settings(config).get("auto_tts")
+    if override is not None:
+        return bool(override)
+    voice = config.get("voice")
+    return bool(voice.get("auto_tts", False)) if isinstance(voice, dict) else False
+
+
+def acp_tts_enabled(config: Dict[str, Any] | None = None) -> bool:
+    """Whether an ACP session gets the ``tts`` toolset (``text_to_speech``).
+
+    On in every ACP host by default, so a host that carries attachments can answer a voice note
+    with one without per-profile config; the tool's own check_fn still drops it when no TTS
+    provider is configured. ``acp.tts: false`` opts a host out and restores the pre-voice
+    ``hermes-acp`` tool list exactly."""
+    return acp_settings(config).get("tts", True) is not False
+
+
+def default_acp_toolsets(config: Dict[str, Any] | None = None) -> List[str]:
+    """Base toolsets for an ACP session: ``acp.toolsets`` when set, else ``["hermes-acp"]``, plus
+    ``tts`` unless ``acp.tts: false``. ``hermes-acp`` itself is unchanged by the voice work."""
+    config = load_acp_config(config)
+    raw = acp_settings(config).get("toolsets")
+    if isinstance(raw, str):
+        raw = [raw]
+    names = [str(n).strip() for n in (raw or []) if str(n or "").strip()] or [DEFAULT_ACP_TOOLSET]
+    if acp_tts_enabled(config):
+        names.append(ACP_TTS_TOOLSET)
+    return list(dict.fromkeys(names))
+
+
 def _expand_acp_enabled_toolsets(toolsets: List[str] | None = None,
                                  mcp_server_names: List[str] | None = None) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
-    names = [n for n in (toolsets or ["hermes-acp"]) if n]
+    names = [n for n in (toolsets or default_acp_toolsets()) if n]
     names += [f"mcp-{s}" for s in (mcp_server_names or []) if s]
     return list(dict.fromkeys(names))
 
@@ -129,6 +187,18 @@ def _first_user_preview(history: List[Dict[str, Any]], default: str) -> str:
 
 
 @dataclass
+class QueuedPrompt:
+    """A prompt absorbed while a turn was already running.
+
+    ``voice`` marks one that arrived as a voice note. The clip is transcribed once, at queue time,
+    so the replay carries only text; without the flag the voice-first instruction never fires and
+    the user gets a text answer to a voice message."""
+
+    text: str
+    voice: bool = False
+
+
+@dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
 
@@ -139,7 +209,7 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
-    queued_prompts: List[str] = field(default_factory=list)
+    queued_prompts: List[QueuedPrompt] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
@@ -390,7 +460,8 @@ class SessionManager:
         ]
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
-            "enabled_toolsets": _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=configured_mcp_servers),
+            "enabled_toolsets": _expand_acp_enabled_toolsets(
+                default_acp_toolsets(config), mcp_server_names=configured_mcp_servers),
             "model": model or default_model,
         }
         try:
