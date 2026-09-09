@@ -109,6 +109,7 @@ _ACP_HOST_ENV: dict[str, str] = {}
 _ACP_ENV_LOCK = threading.RLock()
 _ACP_RESTORE_LOGGED = False  # once-per-process guard, like _WARNED_KEYS / _SCOPED_SKIP_LOGGED
 _ACP_KEYLESS_CLAIM_LOGGED = False  # ditto, for the tag-without-key warning
+_ACP_OVERLAY_KEYLESS_CLAIM_LOGGED = False  # ditto, for the same warning about the managed overlay
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
@@ -138,6 +139,16 @@ def mark_acp_hosted(enabled: bool = True) -> None:
         return  # already armed: the first snapshot is the only pre-load one there is
     _ACP_HOSTED = bool(enabled)
     _ACP_HOST_ENV = _snapshot_acp_host_env() if _ACP_HOSTED else {}
+    if _ACP_HOSTED and _env_provides("BUZZ_PRIVATE_KEY") and not os.environ.get("BUZZ_MANAGED_AGENT"):
+        # The whole BUZZ_ protection hangs on this marker being present AT SNAPSHOT TIME
+        # (_is_acp_host_owned_env_key). A managed harness that forgets it reverts to the pre-fix
+        # precedence -- safely, the profile then supplies both halves and nothing is mismatched, but
+        # silently, and naming it here is what would have identified the original Studio failure in one
+        # line instead of four review rounds.
+        logger.debug(
+            "acp: the host passed BUZZ_PRIVATE_KEY without BUZZ_MANAGED_AGENT, so no BUZZ_ name is "
+            "host-owned in this process and the profile .env keeps its usual precedence over all of them"
+        )
 
 
 def is_acp_hosted() -> bool:
@@ -253,6 +264,7 @@ def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
     snapshot = _ACP_HOST_ENV
     if not snapshot:
         return
+
     # DROP FIRST, RE-ASSERT SECOND, and that order is load bearing rather than cosmetic. The two loops
     # touch disjoint names (``dropped`` excludes everything in ``snapshot`` by construction), so the end
     # state is identical either way and only the INTERMEDIATE state differs. Re-asserting first published
@@ -796,6 +808,7 @@ def _apply_managed_env() -> None:
     _settle_buzz_identity_after_managed_env(managed_names)
     _load_dotenv_with_fallback(managed_env, override=True)
     _settle_buzz_identity_after_managed_env(managed_names)
+    _warn_if_managed_overlay_claim_has_no_key(managed_names, managed_env)
 
 
 def _settle_buzz_identity_after_managed_env(managed_names: set[str]) -> None:
@@ -823,6 +836,33 @@ def _settle_buzz_identity_after_managed_env(managed_names: set[str]) -> None:
         return
     for key in sorted(_BUZZ_IDENTITY_DROP_KEYS - managed_names):
         os.environ.pop(key, None)
+
+
+def _warn_if_managed_overlay_claim_has_no_key(managed_names: set[str], managed_env: Path) -> None:
+    """The overlay claimed the identity with an attestation and left nothing that can sign it.
+
+    :func:`_warn_if_host_claim_has_no_key` cannot cover this and must not try: it returns early when the
+    HOST supplied ``BUZZ_PRIVATE_KEY``, which is precisely the case here, so the one situation where an
+    operator most needs the line (the host DID pass a key and the overlay's claim removed it) was the one
+    that produced silence. Downstream all they see is Buzz's generic "no private key (set
+    BUZZ_PRIVATE_KEY or a credentials file)" for an agent whose host passed one.
+
+    Failing closed is still right, an attestation belongs to one key. Only the silence was wrong. Own
+    flag, own text, own claimant: the admin overlay is a different principal from the host and the fix is
+    a different file. Once per process, names and paths only, never values."""
+    global _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED
+    if _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED:
+        return
+    if not managed_names & _BUZZ_IDENTITY_TRIGGER_KEYS or _env_provides("BUZZ_PRIVATE_KEY"):
+        return
+    _ACP_OVERLAY_KEYLESS_CLAIM_LOGGED = True
+    logger.warning(
+        "acp: the managed overlay %s claimed the Buzz identity with BUZZ_AUTH_TAG but defines no "
+        "BUZZ_PRIVATE_KEY, so the ACP host's key was dropped and not replaced. Buzz sends will fail "
+        "until that file also carries the signing key that owns its attestation, or drops "
+        "BUZZ_AUTH_TAG and lets the host's identity stand.",
+        managed_env,
+    )
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
