@@ -494,11 +494,23 @@ def _resolve_private_key(extra: Optional[dict] = None) -> str:
 
 
 def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
-    """Resolve and validate the optional NIP-OA owner-attestation tag."""
+    """Resolve and validate the optional NIP-OA owner-attestation tag.
+
+    The tag comes from the SAME source as the key it attests, never a different one. A NIP-OA tag is an
+    owner attestation bound to one signing key, and ``build_auth_event`` (nostr_auth.py) appends whatever
+    tag it is handed to the kind-22242 event it signs, with no consistency check. So mixing sources means
+    signing with one identity and presenting another, which is what an owner-gated relay rejects.
+
+    ``_resolve_private_key`` prefers the scoped/env ``BUZZ_PRIVATE_KEY`` over the credentials record, so
+    when that key is set the record did NOT supply the key and may not supply the tag either. That closes
+    the ``config.yaml`` route as well as the env one: ``_configured_credentials_file`` reads
+    ``extra["credentials_file"]`` from the profile's own config, which no environment rule can reach, and
+    an ACP host injecting a managed key would otherwise still sign it with the profile owner's attestation.
+    """
     raw: Any = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
     if not raw:
-        if str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip() and not _configured_credentials_file(extra):
-            return ""
+        if str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip():
+            return ""  # the key did not come from the credentials record, so neither may the tag
         if "auth_tag" not in (data := _resolve_credentials_data(extra)):
             return ""
         raw = data["auth_tag"]

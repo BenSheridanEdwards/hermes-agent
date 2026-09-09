@@ -4322,6 +4322,38 @@ class TestCredentialResolution:
         monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
         assert json.loads(_resolve_auth_tag()) == tag
 
+    @pytest.mark.parametrize("route", ["env-var", "config-yaml-extra"])
+    def test_credentials_file_tag_is_not_paired_with_an_env_key(self, monkeypatch, tmp_path, route):
+        """A NIP-OA tag attests ONE key, and build_auth_event signs whatever pair
+        it is handed without checking them against each other. So when the key
+        comes from the environment, the credentials record did not supply it and
+        may not supply the tag either.
+
+        The config.yaml route is the one no env rule can reach: an ACP host that
+        injects a managed BUZZ_PRIVATE_KEY, and whose env the loader has already
+        reduced to exactly that key, still used to pick up the tag through the
+        profile's own `extra["credentials_file"]` and sign the managed key with
+        the profile owner's attestation."""
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1fromenv")
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        extra = None
+        if route == "env-var":
+            monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        else:
+            monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+            extra = {"credentials_file": str(creds)}
+
+        assert _resolve_private_key(extra) == "nsec1fromenv"  # the env key is what signs
+        assert _resolve_auth_tag(extra) == ""                 # so the file's tag must not ride along
+
+        # Control: with no env key the record supplies BOTH, and the pair is consistent.
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        assert _resolve_private_key(extra) == "nsec1fromfile"
+        assert json.loads(_resolve_auth_tag(extra)) == tag
+
     def test_invalid_owner_auth_tag_fails_closed(self, monkeypatch, tmp_path):
         creds = tmp_path / "agent_credentials.json"
         creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": ["bad"]}), encoding="utf-8")
