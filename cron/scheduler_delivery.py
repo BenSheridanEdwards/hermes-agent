@@ -1607,7 +1607,9 @@ def _log_undelivered_output(
     logger.log(
         level,
         "Job '%s': output not delivered to any target (%s); output follows%s:\n%s",
-        job.get("id", "?"),
+        # Ids are hex today (``cron/jobs.py``) so this cannot bite, but every OTHER argument of
+        # this record is scrubbed and one unscrubbed surrogate anywhere drops the whole record.
+        _scrub_surrogates(str(job.get("id", "?"))),
         _scrub_surrogates("; ".join(errors) or "no target accepted the send"), suffix, text)
 
 

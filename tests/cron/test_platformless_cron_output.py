@@ -444,6 +444,19 @@ def test_failing_run_on_the_origin_lane_logs_the_body_at_warning(
     assert "boom: the script exited 1" in records[0].getMessage()
 
 
+def test_a_surrogate_in_the_job_id_does_not_drop_the_record(gateway_mode_logging):
+    """Every other argument of the record is scrubbed; the id was not. One lone surrogate
+    anywhere in the record raises inside ``logging`` and drops the whole line, which is the exact
+    failure mode the body scrub closes. Unreachable with today's hex ids, pinned anyway."""
+    sched_delivery._log_undelivered_output(
+        {"id": "j-\udcff-id"}, "id-scrub body", ["platform 'telegram' not configured/enabled"])
+    hermes_logging.flush_log_queue()
+
+    written = (gateway_mode_logging / "agent.log").read_text()
+    assert "id-scrub body" in written
+    assert "\udcff" not in written
+
+
 @pytest.mark.parametrize("raw,expected", [
     (" Local ", "local"),
     ("ORIGIN", "origin"),
