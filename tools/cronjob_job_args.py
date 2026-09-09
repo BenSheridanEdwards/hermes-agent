@@ -91,7 +91,9 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
             "error alert. prompt/skills are ignored.")
     _deliver = (user_deliver or "").strip().lower()
     if _deliver:
-        if "all" in _deliver.split(","):
+        # Stripped per token: ``deliver="origin, all"`` is the same request as ``"origin,all"``
+        # and must get the same note (the lane itself is folded at fire time).
+        if "all" in [p.strip() for p in _deliver.split(",")]:
             notes.append(
                 "deliver='all' resolves at fire time and never includes "
                 "bot-chat targets — channels connected later are picked up "

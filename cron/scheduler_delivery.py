@@ -846,8 +846,12 @@ def canonical_deliver_token(token) -> str:
     depth that nothing exercises is defense that silently rots, in BOTH directions: each of the
     four is pinned by a test that stubs ``_normalize_deliver_value`` to the identity (or calls the
     consumer directly with a raw lane), and the source fold is pinned separately by the reason
-    string, which reports the normalized value verbatim."""
-    raw = str(token or "").strip()
+    string, which reports the normalized value verbatim.
+
+    Only None becomes the empty string. ``str(token or "")`` also swallowed a FALSY token, so
+    ``deliver: [0]`` reported ``no delivery target resolved for deliver=`` with no token at all
+    instead of naming the ``0`` the operator wrote."""
+    raw = ("" if token is None else str(token)).strip()
     lowered = raw.lower()
     return lowered if lowered in _LANE_KEYWORDS else raw
 
@@ -1782,7 +1786,12 @@ def _unresolved_delivery_outcome(
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
         return None, "deliver=origin but no origin or home channels"
-    msg = f"no delivery target resolved for deliver={deliver_value}"
+    # A whitespace-only value is deliberately left unfolded by the normalizer (so it surfaces
+    # here rather than being downgraded to ``local``), and replaying its padding raw produced
+    # ``deliver=  ``, and an operator cannot see what is wrong with a value they cannot see.
+    # Quote that one shape; every value with a real token keeps its bare, canonical spelling.
+    shown = deliver_value if deliver_value.strip() else repr(deliver_value)
+    msg = f"no delivery target resolved for deliver={shown}"
     logger.warning("Job '%s': %s", job["id"], msg)
     return msg, msg
 
@@ -1940,11 +1949,14 @@ def _deliver_result(
     # receipt that was queued, claimed or left ambiguous) a human may already be reading it, so the
     # body is not repeated in the log even though another target failed. That failure is still
     # reported in the returned error and in ``last_delivery_error``; only the body is withheld.
+    # Filter-time drops apply to every target; report them once. Extended BEFORE the log call:
+    # a run whose attachments were dropped by media policy and whose targets then all failed
+    # would otherwise log the body under the target errors alone, leaving the reason incomplete
+    # in the one place the operator reads the output back.
+    delivery_errors.extend(policy_drop_errors)
+
     if delivered_targets == 0:
         _log_undelivered_output(job, content, delivery_errors)
-
-    # Filter-time drops apply to every target; report them once.
-    delivery_errors.extend(policy_drop_errors)
     _record_delivery_verification(job, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 
