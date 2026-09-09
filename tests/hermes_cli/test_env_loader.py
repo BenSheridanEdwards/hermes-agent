@@ -1,7 +1,9 @@
 import codecs
 import importlib
+import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -1406,6 +1408,179 @@ def test_acp_hosted_reader_window_is_closed_for_every_profile_source(tmp_path, m
     assert seen_mid_window == [("managed-key", None)]
     assert os.environ["BUZZ_PRIVATE_KEY"] == "managed-key"
     assert "BUZZ_AUTH_TAG" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# The restore is a SEQUENCE of os.environ writes, and non-loading readers take
+# no lock, so its intermediate states are as observable as its result. The
+# tests below park the loader inside one window each and ask the real Buzz
+# consumer, on the main thread, what identity it would send with right then.
+# ---------------------------------------------------------------------------
+
+_HOST_KEY = "managed-key"
+_HOST_TAG = '["auth","host-npub","host-sig","1"]'
+_PROFILE_KEY = "profile-key"
+_PROFILE_TAG = '["auth","owner-npub","profile-sig","1"]'
+_ADMIN_TAG = '["auth","admin-npub","admin-sig","1"]'
+
+_PRINCIPALS = {
+    _HOST_KEY: "host", _HOST_TAG: "host",
+    _PROFILE_KEY: "profile", _PROFILE_TAG: "profile",
+    _ADMIN_TAG: "admin",
+}
+
+
+def _assert_one_principal(pair, where):
+    """A (key, tag) pair must never name two different principals: that is the whole failure."""
+    key_owner, tag_owner = _PRINCIPALS.get(pair[0]), _PRINCIPALS.get(pair[1])
+    assert not (key_owner and tag_owner and key_owner != tag_owner), (
+        f"{where}: signs with {key_owner}'s key while presenting {tag_owner}'s attestation ({pair!r})"
+    )
+
+
+def _ask_the_real_consumer():
+    """What the agent's send_message tool would sign and present, resolved through the plugin."""
+    from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+    return load_plugin_adapter("buzz")._resolve_identity_pair()
+
+
+def _park_the_loader(home, install_park, **load_kwargs):
+    """Run load_hermes_dotenv on a background thread, park it where ``install_park`` says, and ask the
+    real consumer from the main thread while it is parked.
+
+    A background thread running the load while the main thread sends is not a contrived arrangement:
+    acp_adapter.entry starts background MCP discovery and ACP registers session MCP servers via
+    asyncio.to_thread, both of which reach load_hermes_dotenv. The module comment on _ACP_HOST_ENV says
+    so, and the lock it takes covers other LOADERS, never readers."""
+    import threading
+
+    parked, release = threading.Event(), threading.Event()
+    loader = {"ident": None}
+
+    def park():
+        if threading.get_ident() != loader["ident"] or parked.is_set():
+            return  # never park the consumer's own thread: it asks the same predicate
+        parked.set()
+        release.wait(10)
+
+    install_park(park)
+    failures: list = []
+
+    def run_load():
+        loader["ident"] = threading.get_ident()
+        try:
+            load_hermes_dotenv(hermes_home=home, **load_kwargs)
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread below
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_load)
+    thread.start()
+    try:
+        assert parked.wait(10), "the loader never reached the park point"
+        observed = _ask_the_real_consumer()
+    finally:
+        release.set()
+        thread.join(10)
+    assert not failures, failures
+    return observed, _ask_the_real_consumer()
+
+
+@pytest.mark.parametrize("host_shape", ["key-only-host", "tag-only-host"])
+def test_acp_restore_never_shows_a_reader_a_split_identity(tmp_path, monkeypatch, host_shape):
+    """_restore_acp_host_env drops the profile's members BEFORE it re-asserts the host snapshot, and
+    that order is the fix rather than a preference.
+
+    Re-asserting first published the host's managed key beside the profile owner's attestation for the
+    length of a dict scan. It is the exact pairing the PR is named after, reached with no credentials
+    file, no vault, no .op.env and no config route, and it is observable by the real consumer: the
+    _resolve_identity_pair call behind the agent's send_message tool, running on the main thread while a
+    sibling thread loads. The mirror case is the tag-only host, where the profile's key met the host's
+    attestation the same way.
+
+    The two loops touch disjoint names, so the end state is identical either way and ONLY the window
+    differs; swap them back and this test is the thing that notices."""
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(
+        tmp_path,
+        f"BUZZ_PRIVATE_KEY={_PROFILE_KEY}\n"
+        f"BUZZ_AUTH_TAG={_PROFILE_TAG}\n"
+        "BUZZ_RELAY_URL=ws://profile.example\n",
+    )
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    if host_shape == "key-only-host":
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    else:
+        monkeypatch.setenv("BUZZ_AUTH_TAG", _HOST_TAG)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    seen: list = []
+    real = env_loader._host_owns_buzz_identity
+
+    def install(park):
+        def hooked():
+            # The first question the restore asks about the claim. In the fixed order it is asked
+            # before anything has been written; reversed, it is asked with the split already published.
+            seen.append((os.environ.get("BUZZ_PRIVATE_KEY"), os.environ.get("BUZZ_AUTH_TAG")))
+            park()
+            return real()
+
+        monkeypatch.setattr(env_loader, "_host_owns_buzz_identity", hooked)
+
+    observed, final = _park_the_loader(home, install)
+
+    _assert_one_principal(observed, "a reader parked inside the restore")
+    for pair in seen:
+        _assert_one_principal(pair, "the restore's own view of os.environ")
+    if host_shape == "key-only-host":
+        assert final == (_HOST_KEY, "")
+    else:
+        assert final == ("", json.dumps(json.loads(_HOST_TAG), separators=(",", ":")))
+
+
+def test_managed_overlay_never_shows_a_reader_a_split_identity(tmp_path, monkeypatch):
+    """The same shape, wider: _apply_managed_env used to load the overlay and settle the group only
+    afterwards, so the gap was a whole dotenv read and parse rather than a dict scan, and it held the
+    host's key beside the admin's attestation.
+
+    The overlay claims the group by NAME, and the names are known from the file scan before a single
+    value is read, so the members it does not define are removed first and the mixed state never
+    exists. Parked at the moment the overlay's load returns, which is the widest point of that gap."""
+    import hermes_cli.env_loader as env_loader
+    from hermes_cli import managed_scope
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_env = managed / ".env"
+    managed_env.write_text(f"BUZZ_AUTH_TAG={_ADMIN_TAG}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", _HOST_KEY)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    real_load = env_loader._load_dotenv_with_fallback
+
+    def install(park):
+        def hooked(path, *args, **kwargs):
+            result = real_load(path, *args, **kwargs)
+            if Path(path) == managed_env:
+                park()
+            return result
+
+        monkeypatch.setattr(env_loader, "_load_dotenv_with_fallback", hooked)
+
+    try:
+        observed, final = _park_the_loader(home, install)
+    finally:
+        managed_scope.invalidate_managed_cache()
+
+    _assert_one_principal(observed, "a reader parked between the overlay load and the settle")
+    assert final == ("", json.dumps(json.loads(_ADMIN_TAG), separators=(",", ":")))
 
 
 @pytest.mark.parametrize("text,expected", [
