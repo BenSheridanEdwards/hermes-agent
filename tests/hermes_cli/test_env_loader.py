@@ -1135,6 +1135,60 @@ def test_acp_hosted_blank_host_value_is_filled_from_profile_env(tmp_path, monkey
     assert os.environ["BUZZ_RELAY_URL"] == "ws://profile.example"
 
 
+_BUZZ_PROFILE_ENV_WITH_TAG = (
+    "BUZZ_PRIVATE_KEY=profile-key\n"
+    'BUZZ_AUTH_TAG=["auth","owner-npub","profile-sig","1"]\n'
+    "BUZZ_RELAY_URL=ws://profile.example\n"
+    "OPENAI_API_KEY=sk-from-profile\n"
+)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
+@pytest.mark.parametrize(
+    "supplied, blanked",
+    [("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG"), ("BUZZ_AUTH_TAG", "BUZZ_PRIVATE_KEY")],
+)
+def test_acp_hosted_blank_host_member_is_not_completed_by_the_profile(
+    tmp_path, monkeypatch, blank, supplied, blanked
+):
+    """A BLANK host value for one identity member, beside a real value for the
+    other, used to hand the profile's value to the blanked one.
+
+    _snapshot_acp_host_env reads "provided" as non-blank, so the blank name is
+    NOT host-owned. _buzz_env_names used to read it as `in os.environ`, so the
+    blank name WAS in the pre-load baseline, and the drop rule spares baseline
+    names. The name the host disclaimed was therefore the one name the profile
+    was allowed to fill, and the override=True load filled it: the managed key
+    signing the profile owner's attestation, or the profile owner's key beside
+    the host's attestation. No credentials file, no vault, no .op.env needed,
+    and a harness that reads its values out of files and exports them
+    unconditionally produces the empty and trailing-newline shapes as a matter
+    of course.
+
+    Both directions, because the group has two signing members and either one
+    can be the blank. _env_provides is now the single test both functions apply.
+    """
+    import hermes_cli.env_loader as env_loader
+
+    home = _seed_buzz_profile(tmp_path, _BUZZ_PROFILE_ENV_WITH_TAG)
+    _clear_buzz_env(monkeypatch)
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    monkeypatch.setenv(supplied, "from-host")
+    monkeypatch.setenv(blanked, blank)
+    _mark_acp_hosted(monkeypatch, env_loader)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ[supplied] == "from-host"
+    # The host claimed the group with `supplied`; it disclaimed `blanked` by
+    # leaving it blank, so `blanked` resolves to nothing rather than to the
+    # profile owner's value. Fail closed, do not sign as a second identity.
+    assert blanked not in os.environ
+    assert "BUZZ_RELAY_URL" not in os.environ
+    # ...and the rest of the profile's Buzz configuration is still untouched.
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-profile"
+
+
 def test_acp_hosted_profile_without_env_keeps_host_env(tmp_path, monkeypatch):
     """Bare profile (no .env): nothing to restore, host env untouched."""
     import hermes_cli.env_loader as env_loader
