@@ -4552,7 +4552,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     print("└─────────────────────────────────────────────────────────┘")
     print()
 
-    # Exit 1 if no platform connects so systemd Restart=always retries transient errors.
+    # Exit 1 when start_gateway() reports a failed start (PID claim, replace) so systemd
+    # Restart=always retries transient errors. Zero enabled platforms is not a failure: the
+    # gateway stays up for cron and housekeeping.
     verbosity = None if quiet else verbose
 
     import atexit as _atexit

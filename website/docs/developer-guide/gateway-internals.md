@@ -260,6 +260,21 @@ The gateway runs periodic maintenance alongside message handling:
 - **Memory flush** — commits memory before soft cache eviction
 - **Cache refresh** — refreshes model lists and provider status
 
+### Running with no messaging platform
+
+A gateway with zero enabled platforms is a supported mode, not a configuration error. `GatewayRunner.start()` logs `No messaging platforms enabled.` and continues: the run loop, control socket, cron ticker, housekeeping thread and watchers all start exactly as they do with a platform connected. Use it when another surface owns the chat face (for example a managed harness) but the profile still needs its cron jobs, heartbeats and scheduled work.
+
+What changes for cron output:
+
+- `deliver: local` and `bot-chat:<profile>` targets work unchanged (neither needs a platform adapter).
+- A platform target (`telegram:123`, `origin`, `all`) has nothing to send through. The job is recorded as `delivery_failed` with the reason (`origin` with no captured origin stays a non-failure, as before), and the output is written to the log (`Job '<id>': output not delivered to any target ...`, bounded to 4000 characters) so the result is still visible. The full text stays in `last_output`.
+- That line is emitted by the `cron.scheduler` logger, so `_ComponentFilter` in `hermes_logging.py` keeps it out of `gateway.log`: it lands in `logs/agent.log`. A failed run or a real delivery failure logs at `WARNING`, so it also reaches `logs/errors.log` and the gateway's stderr (`gateway.error.log` under launchd, the journal under systemd; the stderr handler is added unless `-q`, and sits at `WARNING` by default, `INFO` under `-v` and `DEBUG` under `-vv`, `gateway/run.py`). A successful run on the origin-less `origin` lane is not a failure and logs at `INFO`, keeping the 2 MB error log for actual errors; that line reaches stderr only under `-v`, and disappears from the files entirely when `logging.level` is set to `WARNING`. Log files run the `RedactingFormatter`, so the body is redacted unless `security.redact_secrets` is off, and lone surrogates from `surrogateescape`-decoded job output are replaced before the record is built (the file handlers have no `errors=` and would otherwise drop the record).
+- `hermes logs --component cron` filters per line and only the header carries a logger name, so it hides the body. Read these with plain `hermes logs`.
+- Lane keywords (`local`, `origin`, `all`, `bot-chat`) are folded by `canonical_deliver_token` in `cron/scheduler_delivery.py`, which `_normalize_deliver_value` applies to every comma token. Normalizing only at the resolution sites is not enough: `_classify_delivery_outcome` and `_is_origin_lane` in `cron/scheduler.py` and `_manual_run_delivery_note` in `tools/cronjob_tools.py` compare the lane to decide what the run is recorded as and what the agent tells the user, so a lane spelling they did not recognize was recorded as `delivered` with nothing sent. Those consumers fold again rather than trusting their caller, which makes their own fold redundant whenever the value did come from the normalizer; each is pinned by a test that hands it a raw lane with the normalizer stubbed out, so neither the source fold nor a consumer fold can regress unnoticed.
+- `_normalize_deliver_value` also folds the token SET (`_fold_deliver_token_set`): duplicates collapse and a `local` token beside a real target is dropped. Folding tokens alone left `"Local, LOCAL"` as `"local,local"`, which no consumer reads as the local lane, so the run was recorded `delivery_failed`, the body was logged on every tick, and the manual-run note claimed the job had delivered it itself. That shape reaches the stored value through `tools/cronjob_job_args.py`, which de-duplicates raw tokens before anything is folded.
+
+The fatal `EX_CONFIG` (78) exit is reserved for real configuration conflicts: a token already polled by another gateway, or an invalid multiplexer config. Disabling every platform never triggers it.
+
 ## Process Management
 
 The gateway runs as a long-lived process, managed via:

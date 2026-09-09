@@ -488,6 +488,54 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
+When no target accepts the output at all (every platform target failed, no
+target resolves because the gateway runs with no messaging platform enabled,
+or `deliver: origin` on a job that never captured an origin), the output is
+also written to the log (`output not delivered to any target`, capped at 4000
+characters) so the result stays visible. The line comes from the `cron`
+component, so it lands in `logs/agent.log`, not in `logs/gateway.log`. A
+failed run or a failed delivery logs it at `WARNING`, so it is in
+`logs/errors.log` too, and on the gateway's stderr (`gateway.error.log` under
+launchd, the journal under systemd). A successful run whose lane simply has
+nowhere to go, origin-less `deliver: origin`, which is not a failure and is
+recorded `ok`, logs at `INFO`, so routine output does not fill the error log;
+that line reaches stderr only when the gateway runs with `-v`. Note that the
+`INFO` line follows the configured log level: with `logging.level: WARNING` in
+`config.yaml` the log files are written at `WARNING` and the successful-run
+body is not recorded at all.
+
+To read one of these lines, use plain `hermes logs` or `hermes logs --level
+INFO`. Do not use `hermes logs --component cron` for this: the component
+filter matches line by line, and only the header line carries a logger name,
+so the body underneath it is dropped.
+
+The logged body passes through the same secret redactor as every other log
+line, so recognised keys and tokens are masked; setting
+`security.redact_secrets: false` disables that and writes the output verbatim
+into the log files. Bytes that are not valid UTF-8 (a script writing latin-1,
+say) are replaced rather than dropped.
+
+Lane names (`local`, `origin`, `all`, `bot-chat`) are matched without regard to
+case or surrounding spaces, so `deliver: Local` is the same opt-out as
+`deliver: local` and is recorded the same way. A `platform:chat_id` target
+keeps its case.
+
+A repeated target is collapsed, and a `local` token sitting beside a real
+target is dropped: `deliver: "Local, LOCAL"` is the plain local opt-out, and
+`deliver: "origin,local"` is the plain `origin` lane. Neither sends anything
+different (`local` asks for no target, and every lane writes `last_output`
+regardless), but the collapsed form is what the run is recorded as and what the
+agent's manual-run summary reports. Repeated targets reach the stored value
+because the create path de-duplicates the tokens as written, before they are
+folded.
+
+`deliver: local` never needs a target and stays silent, and a `bot-chat`
+target that was queued, claimed or left ambiguous by a live owner counts as
+delivered (the output may already have been consumed). The check is per job,
+not per target: if any target took the output, the body is not logged even
+when another target in the same job failed. That failure is still reported in
+`last_delivery_error` and by `hermes cron list`.
+
 ### Bot Chat delivery (`bot-chat`)
 
 `bot-chat` delivers the output **into a profile's canonical "Bot Chat" session as a real message**. Unlike every other target — where the recipient is a human reading a channel — the recipient here is the bot itself: it receives the output as an incoming message, acts on anything that needs action, and responds in its chat. Use it when scheduled output should be *processed*, not just posted.

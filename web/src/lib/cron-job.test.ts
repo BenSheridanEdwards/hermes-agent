@@ -5,6 +5,7 @@ import {
   cronJobHasExecutionContent,
   cronJobFormFromJob,
   cronLastResult,
+  isLocalDeliverLane,
   splitCronList,
   type CronJobFormState,
 } from "./cron-job";
@@ -198,5 +199,30 @@ describe("cronLastResult", () => {
     expect(
       cronLastResult({ last_status: "blocked_config", last_error: "missing API key" }),
     ).toEqual({ status: "blocked_config", tone: "warning", detail: "missing API key" });
+  });
+});
+
+describe("isLocalDeliverLane", () => {
+  it("folds the lane keyword the way the scheduler does", () => {
+    expect(isLocalDeliverLane("local")).toBe(true);
+    expect(isLocalDeliverLane("Local")).toBe(true);
+    expect(isLocalDeliverLane(" local ")).toBe(true);
+    expect(isLocalDeliverLane("local,local")).toBe(true);
+    expect(isLocalDeliverLane("Local, LOCAL")).toBe(true);
+    expect(isLocalDeliverLane(["local", "Local"])).toBe(true);
+  });
+
+  it("leaves every value that names a real target alone", () => {
+    expect(isLocalDeliverLane("origin")).toBe(false);
+    expect(isLocalDeliverLane("telegram:123")).toBe(false);
+    expect(isLocalDeliverLane("local,telegram:123")).toBe(false);
+    expect(isLocalDeliverLane("all")).toBe(false);
+  });
+
+  it("is false for an empty value, which the caller guards separately", () => {
+    expect(isLocalDeliverLane("")).toBe(false);
+    expect(isLocalDeliverLane("   ")).toBe(false);
+    expect(isLocalDeliverLane(null)).toBe(false);
+    expect(isLocalDeliverLane(undefined)).toBe(false);
   });
 });

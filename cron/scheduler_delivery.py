@@ -560,14 +560,18 @@ def _home_target(platform_name: str, chat_id: str, resolved_from: Optional[str] 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
     origin = _resolve_origin(job)
-    if deliver_value == "local":
+    # ``local``/``origin`` are lane keywords, not platform names, so match them the way ``all`` and
+    # ``bot-chat`` are already matched: case-insensitively, on the stripped token. Callers may hand
+    # this a raw token (it is exported as ``_resolve_delivery_target``), so canonicalize here too.
+    lane = canonical_deliver_token(deliver_value)
+    if lane == "local":
         return None
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
     bot_chat_profile = parse_bot_chat_deliver_token(deliver_value)
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
 
-    if deliver_value == "origin":
+    if lane == "origin":
         if origin:
             return {
                 "platform": origin["platform"],
@@ -766,16 +770,59 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
                 os.unlink(query_file)
 
 
+def _fold_deliver_token_set(parts: List[str]) -> List[str]:
+    """Fold an already-token-folded list into its canonical SET: de-duplicated, and with a
+    redundant ``local`` dropped when any other token survives.
+
+    Folding tokens alone was not enough. ``deliver: "Local, LOCAL"`` folded to ``"local,local"``,
+    which no consumer recognizes as the local lane: the run was recorded ``failed`` with
+    ``no delivery target resolved for deliver=local,local``, up to 4 KB of job output was written
+    into ``agent.log`` and ``errors.log`` on EVERY tick, and ``_manual_run_delivery_note`` still
+    told the user the job had delivered the output itself. ``"origin,local"`` did the same. Both
+    shapes reach the stored value through the create path, which de-duplicates raw tokens
+    (``tools/cronjob_job_args.py``) before anything is folded.
+
+    Dropping ``local`` alongside a real target changes no delivery: ``local`` asks for no target
+    (``_resolve_single_delivery_target`` returns None for it) and output is written to
+    ``last_output`` on every lane regardless. It only changes what the run is CLASSIFIED as, which
+    is the bug. An all-``local`` value keeps its single ``local``."""
+    unique = list(dict.fromkeys(parts))
+    with_targets = [p for p in unique if p != "local"]
+    return with_targets or unique
+
+
 def _normalize_deliver_value(deliver) -> str:
     """Normalize ``deliver`` to its canonical comma-separated string; ``"local"`` when falsy.
     Lists/tuples (MCP clients, hand-edited jobs.json) are flattened — ``str(["telegram"])`` would
-    yield ``"['telegram']"`` and fail resolution silently."""
+    yield ``"['telegram']"`` and fail resolution silently.
+
+    Every token goes through ``canonical_deliver_token``, so a lane keyword has ONE spelling from
+    here on. Normalizing only where delivery resolves is not enough: the consumers that classify
+    the run compare this string exactly (``_classify_delivery_outcome`` and the unresolved-origin
+    check in ``cron/scheduler.py``, ``_manual_run_delivery_note`` in ``tools/cronjob_tools.py``),
+    so a lane they failed to recognize was recorded as ``delivered`` and reported to the user as
+    delivered while nothing had been sent.
+
+    The token SET is folded too, not just each token: see ``_fold_deliver_token_set``.
+
+    The empty-token filter runs on the FOLDED token, not on the raw one. Filtering the raw token
+    let a ``None`` element through (``str(None)`` is ``"None"``, which is truthy) to fold into the
+    empty string, and that empty token then counted as a surviving token inside
+    ``_fold_deliver_token_set`` and evicted the ``local``: ``["local", null]`` normalized to
+    ``""``, resolved to no target, and was recorded ``failed`` with the job body logged on every
+    tick. That is the shape the set fold exists to prevent, reached through the list branch.
+
+    A value with no usable token at all (whitespace only) is returned unchanged, so it still
+    surfaces as an unresolved target rather than being silently downgraded to ``local``."""
     if deliver is None or deliver == "":
         return "local"
     if isinstance(deliver, (list, tuple)):
-        parts = [str(p).strip() for p in deliver if str(p).strip()]
+        parts = _fold_deliver_token_set(
+            [t for t in (canonical_deliver_token(p) for p in deliver) if t])
         return ",".join(parts) if parts else "local"
-    return str(deliver)
+    parts = _fold_deliver_token_set(
+        [t for t in (canonical_deliver_token(p) for p in str(deliver).split(",")) if t])
+    return ",".join(parts) if parts else str(deliver)
 
 
 # Routing tokens resolve at fire time (a job outlives platform wiring). ``all`` = platforms with a
@@ -785,6 +832,35 @@ _ROUTING_TOKENS = frozenset({"all"})
 # Pseudo-platform: deliver output as a real inbound turn into a profile's "Bot Chat" (not a mirror).
 # ``bot-chat`` = own profile; ``bot-chat:<name>`` = named profile on THIS machine.
 BOT_CHAT_PLATFORM = "bot-chat"
+
+# Routing verbs, not platform names: a lane keyword means the same thing however it is typed.
+_LANE_KEYWORDS = frozenset({"local", "origin", "all", BOT_CHAT_PLATFORM})
+
+
+def canonical_deliver_token(token) -> str:
+    """Canonical form of ONE ``deliver`` token: stripped, and lowercased when it names a lane.
+
+    The single place a lane keyword is folded. ``platform:chat_id`` and ``bot-chat:<profile>``
+    keep their case: chat ids are opaque and profile names are normalized by the profile layer.
+    Every site that decides what a lane means routes through this: ``_normalize_deliver_value``
+    (so the stored/normalized value the whole scheduler reads is already canonical), the three
+    resolution sites in this module, and the run-classification consumers in ``cron/scheduler.py``
+    and ``tools/cronjob_tools.py``, which must not assume their caller normalized.
+
+    Four of those consumer folds (``_resolve_delivery_targets``, ``_unresolved_delivery_outcome``,
+    ``_is_origin_lane``, ``_classify_delivery_outcome``) are redundant whenever the value did come
+    from ``_normalize_deliver_value``, which is every path through ``run_one_job``. Defense in
+    depth that nothing exercises is defense that silently rots, in BOTH directions: each of the
+    four is pinned by a test that stubs ``_normalize_deliver_value`` to the identity (or calls the
+    consumer directly with a raw lane), and the source fold is pinned separately by the reason
+    string, which reports the normalized value verbatim.
+
+    Only None becomes the empty string. ``str(token or "")`` also swallowed a FALSY token, so
+    ``deliver: [0]`` reported ``no delivery target resolved for deliver=`` with no token at all
+    instead of naming the ``0`` the operator wrote."""
+    raw = ("" if token is None else str(token)).strip()
+    lowered = raw.lower()
+    return lowered if lowered in _LANE_KEYWORDS else raw
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
@@ -850,7 +926,10 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver == "local":
+    # Canonical already, via the normalizer above; folded again so this layer does not depend on
+    # its input having been normalized, and so the local opt-out short-circuits before any token
+    # is resolved (test_target_resolution_does_not_assume_an_already_folded_lane).
+    if canonical_deliver_token(deliver) == "local":
         return []
 
     parts: List[str] = []
@@ -1488,15 +1567,15 @@ def _standalone_send(
 
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
-    """Standalone fallback for a target the live lane did not deliver."""
+) -> bool:
+    """Standalone fallback for a target the live lane did not deliver; True once delivered."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
@@ -1505,7 +1584,7 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        return
+        return False
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1518,6 +1597,64 @@ def _deliver_standalone(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
+
+
+# Bounded so a long report cannot flood the log files; the full text stays in ``last_output``.
+# Counted in characters, not bytes: a multi-byte report can exceed 4000 bytes on disk.
+_UNDELIVERED_OUTPUT_LOG_LIMIT = 4000
+
+
+def _scrub_surrogates(text: str) -> str:
+    """Replace lone surrogates so the text can be encoded by the log file handlers.
+
+    Job output is decoded with ``surrogateescape`` (``tools/environments/base_output.py``,
+    ``tools/file_operations.py``), so any non-UTF-8 byte a script writes arrives here as a lone
+    surrogate. The rotating file handlers open with ``encoding="utf-8"`` and no ``errors=``
+    (``hermes_logging.py``), unlike the console stream which is wrapped with ``errors="replace"``,
+    so emitting one raises ``UnicodeEncodeError`` inside ``logging``: the record is dropped
+    entirely and a ``--- Logging error ---`` traceback goes to stderr. Before this module logged
+    job output, arbitrary bytes never reached those handlers."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _log_undelivered_output(
+    job: dict, content: str, errors: list, *, level: int = logging.WARNING,
+) -> None:
+    """No target took the output (none resolved, or every resolved one refused): surface it in the
+    log. A gateway running with no messaging platform (scheduled work only) still produces results,
+    and without this line they would exist only in ``last_output``.
+
+    This is the ``cron.scheduler`` logger, so the line lands in ``logs/agent.log`` plus the
+    gateway's stderr; it is NOT in ``logs/gateway.log``, which the component filter in
+    ``hermes_logging`` restricts to ``gateway.*`` loggers.
+
+    ``level`` decides whether it ALSO lands in ``logs/errors.log``, which only carries WARNING and
+    above. A failing RUN and a failed DELIVERY both belong there. What does not is a successful run
+    on a lane that simply has nowhere to go: origin-less ``deliver: origin`` is the default for
+    agent- and blueprint-created jobs (``tools/blueprints.py``) and CLI/TUI sessions never capture
+    an origin, so on a home-channel-less gateway that lane fires on every run of a job that is
+    recorded ok. At WARNING a 4 KB report every few minutes would rotate the whole 2 MB error
+    history away and bury real errors under successful output, so that lane logs at INFO instead:
+    still in ``agent.log`` and still under ``hermes logs``, just not in the error log.
+
+    The INFO lane follows the configured log level: with ``logging.level: WARNING`` the file
+    handlers are built at WARNING (``hermes_logging``) and this line is not written at all."""
+    text = (content or "").strip()
+    if not text:
+        return
+    text = _scrub_surrogates(text)
+    suffix = ""
+    if len(text) > _UNDELIVERED_OUTPUT_LOG_LIMIT:
+        suffix = f" (truncated, {len(text)} chars total; full text in last_output)"
+        text = text[:_UNDELIVERED_OUTPUT_LOG_LIMIT]
+    logger.log(
+        level,
+        "Job '%s': output not delivered to any target (%s); output follows%s:\n%s",
+        # Ids are hex today (``cron/jobs.py``) so this cannot bite, but every OTHER argument of
+        # this record is scrubbed and one unscrubbed surrogate anywhere drops the whole record.
+        _scrub_surrogates(str(job.get("id", "?"))),
+        _scrub_surrogates("; ".join(errors) or "no target accepted the send"), suffix, text)
 
 
 def _prepare_target_delivery(
@@ -1626,14 +1763,26 @@ def _prepare_target_delivery(
         opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
 
 
-def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
-    """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
-    origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
-    an error string."""
+def _unresolved_delivery_outcome(
+    job: dict, for_failure: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """``_deliver_result`` outcome when no target resolved, as ``(error, undelivered_reason)``.
+
+    ``error`` is None (not a failure) for ``local`` and for origin-less ``origin`` (CLI jobs never
+    capture an origin, so an error there would fire every run), else an error string.
+    ``undelivered_reason`` is None only for ``local``: that lane asked for no target and its output
+    belongs in the output file alone. Every other lane asked for a platform that is not there, so
+    the caller logs the output under this reason instead of leaving it in ``last_output`` only."""
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver_value == "local":
-        return None
-    if deliver_value == "origin":
+    # Lane names are matched case- and whitespace-insensitively: `"Local"` or `" local "` is the
+    # same opt-out a plain `local` is, and treating it as a platform name would resolve to nothing
+    # and (since this change logs unresolved lanes) dump the job body on every run. The value is
+    # canonical already; folded again so this site holds on its own, pinned by
+    # test_unresolved_outcome_does_not_assume_an_already_folded_lane.
+    lane = canonical_deliver_token(deliver_value)
+    if lane == "local":
+        return None, None
+    if lane == "origin":
         logger.info(
             # deliver=origin with no resolvable origin and no configured home channels: treat as local
             # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
@@ -1643,10 +1792,15 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
             "Job '%s': deliver=origin but no origin or home channels — "
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
-        return None
-    msg = f"no delivery target resolved for deliver={deliver_value}"
+        return None, "deliver=origin but no origin or home channels"
+    # A whitespace-only value is deliberately left unfolded by the normalizer (so it surfaces
+    # here rather than being downgraded to ``local``), and replaying its padding raw produced
+    # ``deliver=  ``, and an operator cannot see what is wrong with a value they cannot see.
+    # Quote that one shape; every value with a real token keeps its bare, canonical spelling.
+    shown = deliver_value if deliver_value.strip() else repr(deliver_value)
+    msg = f"no delivery target resolved for deliver={shown}"
     logger.warning("Job '%s': %s", job["id"], msg)
-    return msg
+    return msg, msg
 
 
 def _deliver_result(
@@ -1660,7 +1814,22 @@ def _deliver_result(
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
+        outcome, undelivered_reason = _unresolved_delivery_outcome(job, for_failure)
+        # `deliver: all` with no enabled platform, and `deliver: origin` with no captured origin,
+        # resolve to nothing at all: they never reach the per-target loop below, so the output has
+        # to be logged here or it stays invisible. `local` passes reason=None and stays silent.
+        if undelivered_reason:
+            # WARNING when the delivery failed (``outcome`` carries the error) OR when the text
+            # being delivered is itself a failure notice (``for_failure``): a job failing every
+            # tick is exactly what an operator wants in ``errors.log``, and the origin-less
+            # ``origin`` lane returns outcome=None even for a failure summary, so keying on
+            # ``outcome`` alone left the error log empty on the install this lane exists for.
+            # A SUCCESSFUL run on that lane still logs at INFO, or its body would spool into
+            # ``errors.log`` on every run.
+            _log_undelivered_output(
+                job, content, [undelivered_reason],
+                level=logging.WARNING if (outcome or for_failure) else logging.INFO)
+        return outcome
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
@@ -1741,6 +1910,7 @@ def _deliver_result(
         return msg
 
     delivery_errors = []
+    delivered_targets = 0
     for target in targets:
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
@@ -1748,10 +1918,19 @@ def _deliver_result(
             if bot_chat_error:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
+                status = receipt["status"] if receipt else None
+                if status not in ("queued", "claimed"):
                     delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
+                if status in ("queued", "claimed", "ambiguous"):
+                    # Queued/claimed: admitted by the live Bot Chat owner, so the output reached
+                    # someone. Ambiguous: the owner MAY have consumed it, which is exactly why a
+                    # replay is refused above; claiming "not delivered to any target" and dumping
+                    # the body would overstate what is known, so it counts here too.
+                    delivered_targets += 1
+                if status == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            else:
+                delivered_targets += 1
             continue
 
         t = _prepare_target_delivery(
@@ -1767,11 +1946,24 @@ def _deliver_result(
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
+            delivered = _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        if delivered:
+            delivered_targets += 1
 
-    # Filter-time drops apply to every target; report them once.
+    # Nothing reached anyone (typically a gateway with no live platform): keep the result visible.
+    # The gate is per JOB, not per target: if any co-target took the output (including a bot-chat
+    # receipt that was queued, claimed or left ambiguous) a human may already be reading it, so the
+    # body is not repeated in the log even though another target failed. That failure is still
+    # reported in the returned error and in ``last_delivery_error``; only the body is withheld.
+    # Filter-time drops apply to every target; report them once. Extended BEFORE the log call:
+    # a run whose attachments were dropped by media policy and whose targets then all failed
+    # would otherwise log the body under the target errors alone, leaving the reason incomplete
+    # in the one place the operator reads the output back.
     delivery_errors.extend(policy_drop_errors)
+
+    if delivered_targets == 0:
+        _log_undelivered_output(job, content, delivery_errors)
     _record_delivery_verification(job, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 

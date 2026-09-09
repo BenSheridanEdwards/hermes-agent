@@ -646,6 +646,24 @@ class TestLocalDeliveryNotice:
         assert "local-only cron job" not in created["message"]
 
 
+class TestDeliverGuidanceNotes:
+    """``_mode_guidance_notes``: the create/update guidance echoed back to the agent."""
+
+    def test_the_all_note_survives_a_spaced_token(self):
+        """The token was matched unstripped, so ``deliver="origin, all"``, the spelling a person
+        types, skipped the note that says ``all`` resolves at fire time. Same class of bug as the
+        lane fold one layer down, where an unstripped token was treated as a platform name."""
+        from tools.cronjob_job_args import _mode_guidance_notes
+
+        for deliver in ("all", "origin,all", "origin, all", " ALL ", "origin , All"):
+            notes = _mode_guidance_notes({}, deliver)
+            assert any("resolves at fire time" in n for n in notes), deliver
+        # Not a false positive on a platform whose name merely contains the token.
+        assert not any(
+            "resolves at fire time" in n for n in _mode_guidance_notes({}, "telegram:all-hands")
+        )
+
+
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored
     credential be sent to an off-host endpoint (CWE-200/CWE-522)."""
