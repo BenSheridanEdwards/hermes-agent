@@ -467,7 +467,9 @@ def test_a_surrogate_in_the_job_id_does_not_drop_the_record(gateway_mode_logging
     ("All", "all"),
     ("BOT-CHAT", "bot-chat"),
     (["Origin"], "origin"),
-    (" local , ALL ", "local,all"),
+    (" origin , ALL ", "origin,all"),
+    # ``local`` beside a real lane asks for no target of its own; see the token-set test below.
+    (" local , ALL ", "all"),
     ("Telegram:ABC", "Telegram:ABC"),
     ("bot-chat:Ops", "bot-chat:Ops"),
     ("", "local"),
@@ -662,6 +664,75 @@ def test_the_lane_is_folded_at_the_source_not_only_at_the_consumers(
     assert not any("ALL" in m for m in reasons)
     _args, kw = platformless_env["marked"][0]
     assert kw["delivery_error"] == "no delivery target resolved for deliver=all"
+
+
+@pytest.mark.parametrize("deliver,expected", [
+    ("Local, LOCAL", "local"),
+    ("LOCAL,local", "local"),
+    (["local", "Local"], "local"),
+    ("local,local,local", "local"),
+    ("origin,local", "origin"),
+    ("Local,Telegram:ABC", "Telegram:ABC"),
+    ("telegram:123,telegram:123", "telegram:123"),
+    # Distinct targets are never collapsed, and order is preserved.
+    ("telegram:123,discord:456", "telegram:123,discord:456"),
+    ("all,bot-chat", "all,bot-chat"),
+])
+def test_normalize_deliver_value_folds_the_token_set_too(deliver, expected):
+    """Folding each token was not enough: the SET has to fold too.
+
+    ``"Local, LOCAL"`` folded to ``"local,local"``, which no consumer recognizes as the local
+    lane, so the run was recorded ``failed`` and the body was logged on every tick. Both shapes
+    reach the stored value through the create path, which de-duplicates RAW tokens before
+    anything is folded."""
+    assert sched_delivery._normalize_deliver_value(deliver) == expected
+
+
+@pytest.mark.parametrize("deliver", ["Local, LOCAL", "LOCAL,local", ["local", "Local"]])
+def test_a_redundant_local_lane_stays_silent_and_is_recorded_suppressed(
+    platformless_env, monkeypatch, caplog, deliver
+):
+    """End to end for the shape above. Before the set fold this was the worst reachable case of
+    the lane change: a job asking only for the local lane was recorded ``failed``, up to 4 KB of
+    its output went into ``agent.log`` and ``errors.log`` on every tick (the rotation problem the
+    INFO lane exists to avoid), and the manual-run note still told the user the job had delivered
+    the output itself."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("redundant lane body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-redundant", "name": "redundant", "deliver": deliver}, adapters={}, loop=None,
+        )
+
+    assert not _undelivered_records(caplog)
+    assert not any("no delivery target resolved" in m for m in _messages(caplog))
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] is None
+    assert _recorded_outcome(platformless_env) == "suppressed"
+
+
+def test_a_local_token_beside_the_origin_lane_reads_as_the_origin_lane(
+    platformless_env, monkeypatch, caplog
+):
+    """``deliver: "origin,local"`` is the origin lane plus a token asking for no target, and the
+    create path stores exactly that shape. Folded as a set it is the origin lane: recorded
+    ``not_configured``, body at INFO. Unfolded it matched neither lane, so it was recorded
+    ``failed`` and its body went to ``errors.log`` at WARNING on every successful run."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("origin plus local body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-origin-local", "name": "both", "deliver": "origin,local"},
+            adapters={}, loop=None,
+        )
+
+    assert not any("no delivery target resolved" in m for m in _messages(caplog))
+    records = _undelivered_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] is None
+    assert _recorded_outcome(platformless_env) == "not_configured"
 
 
 def test_the_unresolved_reason_carries_the_folded_lane(platformless_env, monkeypatch, caplog):

@@ -770,6 +770,27 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
                 os.unlink(query_file)
 
 
+def _fold_deliver_token_set(parts: List[str]) -> List[str]:
+    """Fold an already-token-folded list into its canonical SET: de-duplicated, and with a
+    redundant ``local`` dropped when any other token survives.
+
+    Folding tokens alone was not enough. ``deliver: "Local, LOCAL"`` folded to ``"local,local"``,
+    which no consumer recognizes as the local lane: the run was recorded ``failed`` with
+    ``no delivery target resolved for deliver=local,local``, up to 4 KB of job output was written
+    into ``agent.log`` and ``errors.log`` on EVERY tick, and ``_manual_run_delivery_note`` still
+    told the user the job had delivered the output itself. ``"origin,local"`` did the same. Both
+    shapes reach the stored value through the create path, which de-duplicates raw tokens
+    (``tools/cronjob_job_args.py``) before anything is folded.
+
+    Dropping ``local`` alongside a real target changes no delivery: ``local`` asks for no target
+    (``_resolve_single_delivery_target`` returns None for it) and output is written to
+    ``last_output`` on every lane regardless. It only changes what the run is CLASSIFIED as, which
+    is the bug. An all-``local`` value keeps its single ``local``."""
+    unique = list(dict.fromkeys(parts))
+    with_targets = [p for p in unique if p != "local"]
+    return with_targets or unique
+
+
 def _normalize_deliver_value(deliver) -> str:
     """Normalize ``deliver`` to its canonical comma-separated string; ``"local"`` when falsy.
     Lists/tuples (MCP clients, hand-edited jobs.json) are flattened — ``str(["telegram"])`` would
@@ -782,14 +803,18 @@ def _normalize_deliver_value(deliver) -> str:
     so a lane they failed to recognize was recorded as ``delivered`` and reported to the user as
     delivered while nothing had been sent.
 
+    The token SET is folded too, not just each token: see ``_fold_deliver_token_set``.
+
     A value with no usable token at all (whitespace only) is returned unchanged, so it still
     surfaces as an unresolved target rather than being silently downgraded to ``local``."""
     if deliver is None or deliver == "":
         return "local"
     if isinstance(deliver, (list, tuple)):
-        parts = [canonical_deliver_token(p) for p in deliver if str(p).strip()]
+        parts = _fold_deliver_token_set(
+            [canonical_deliver_token(p) for p in deliver if str(p).strip()])
         return ",".join(parts) if parts else "local"
-    parts = [canonical_deliver_token(p) for p in str(deliver).split(",") if str(p).strip()]
+    parts = _fold_deliver_token_set(
+        [canonical_deliver_token(p) for p in str(deliver).split(",") if str(p).strip()])
     return ",".join(parts) if parts else str(deliver)
 
 
