@@ -16,6 +16,19 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _sandboxed_audio_cache(tmp_path_factory, monkeypatch):
+    """Point the inbound audio cache at a temp dir for every ACP test.
+
+    Session creation now sweeps that cache (an ACP-only install never runs the gateway
+    housekeeping that used to be its only caller), so without this a test run would prune the
+    developer's real profile cache. Tests that assert on the cache re-patch the same constant.
+    """
+    from gateway.platforms import base
+
+    monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path_factory.mktemp("acp_audio_cache"))
+
+
+@pytest.fixture(autouse=True)
 def _offline_model_inventory(monkeypatch):
     """Stub the shared model inventory so ACP tests never hit the network."""
     import hermes_cli.inventory as inventory

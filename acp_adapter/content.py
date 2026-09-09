@@ -92,7 +92,15 @@ _AUDIO_MIME_SUFFIX = {
     "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
     "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/wav": ".wav",
     "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/webm": ".webm", "audio/flac": ".flac",
+    "audio/x-caf": ".caf", "audio/caf": ".caf",
 }
+# Extension for an ``audio/*`` type the map does not know (``audio/amr``, ``audio/3gpp``, a
+# vendor type). The gateway's own fallback, and the same value ``sniff_audio_ext`` falls back to:
+# the container sniffer overrides it whenever it recognises the bytes, and where it does not, an
+# extension STT accepts at least reaches the provider. ``.bin`` never does
+# (``tools.transcription_audio`` rejects any suffix outside ``SUPPORTED_FORMATS`` before upload),
+# so the turn could only ever produce a failure note, and a failure note keeps its clip.
+_DEFAULT_AUDIO_SUFFIX = ".ogg"
 
 
 @dataclass
@@ -111,7 +119,7 @@ class AudioAttachment:
     def suffix(self) -> str:
         if self.path is not None and self.path.suffix:
             return self.path.suffix.lower()
-        return _AUDIO_MIME_SUFFIX.get(_mime_main(self.mime), ".bin")
+        return _AUDIO_MIME_SUFFIX.get(_mime_main(self.mime), _DEFAULT_AUDIO_SUFFIX)
 
 
 # "I have bytes but no idea what they are" MIME types. Treating them as an explicit type would

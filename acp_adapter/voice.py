@@ -20,6 +20,7 @@ or an ``audio`` block. This module mirrors the gateway's voice pipeline without 
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -39,6 +40,9 @@ _MAX_EMBEDDED_AUDIO_BYTES = 25 * 1024 * 1024
 # Owner-only: a voice note is the user's speech, and the audio cache directory itself is not
 # private on every platform.
 _CLIP_MODE = 0o600
+# Same age cutoff the gateway's hourly media-cache housekeeping uses, so a clip's lifetime does
+# not depend on which surface received it (``gateway.run._housekeeping_media_caches``).
+AUDIO_CACHE_MAX_AGE_HOURS = 24
 
 
 @dataclass
@@ -133,35 +137,30 @@ def voice_reply_instruction(output_dir: Optional[str]) -> str:
     )
 
 
-def _restrict(path: str) -> str:
-    with contextlib.suppress(OSError, NotImplementedError):
-        os.chmod(path, _CLIP_MODE)
-    return path
-
-
 async def _materialize(att: AudioAttachment) -> Optional[str]:
     """Write embedded audio bytes into the profile audio cache and return the path; ``None`` when
-    there is nothing to write or the payload exceeds the STT cap.
+    there is nothing to write or the payload exceeds the STT cap. Raises ``ValueError`` when the
+    configured inbound media cap (which can be lower than ours) refuses the payload.
 
     The gateway's cache is the one landing place for inbound audio (issue #29): it sniffs the real
     container for the extension, applies the inbound media cap, writes off the event loop thread,
     and puts the file under HERMES_HOME, where ``to_agent_visible_cache_path`` can map it for a
-    docker/ssh terminal backend and ``cleanup_audio_cache`` sweeps it instead of it living
-    forever. The file is restricted to its owner with no await in between, so a cancellation
-    cannot leave it world-readable; a cancellation during the write itself is the one case the
-    caller cannot clean up, and the cache sweep is what collects that."""
+    docker/ssh terminal backend and the cache sweep collects it instead of it living forever. The
+    file is created 0600 rather than written 0644 and chmodded after, so on a shared host there is
+    no window where another local user can open it and a cancelled write leaves no readable
+    remnant."""
     if att.path is not None or not att.data:
         return None
     if len(att.data) > _MAX_EMBEDDED_AUDIO_BYTES:
         return None
     from gateway.platforms.base import cache_audio_from_bytes_async
 
-    return _restrict(await cache_audio_from_bytes_async(att.data, att.suffix))
+    return await cache_audio_from_bytes_async(att.data, att.suffix, mode=_CLIP_MODE)
 
 
-def _unreadable_note(att: AudioAttachment) -> str:
-    if att.data and len(att.data) > _MAX_EMBEDDED_AUDIO_BYTES:
-        return (f"[The user sent an audio attachment ({att.display}, {att.mime}, {len(att.data)} bytes) "
+def _unreadable_note(att: AudioAttachment, *, too_large: bool = False) -> str:
+    if too_large or (att.data and len(att.data) > _MAX_EMBEDDED_AUDIO_BYTES):
+        return (f"[The user sent an audio attachment ({att.display}, {att.mime}, {len(att.data or b'')} bytes) "
                 "that is too large to transcribe]")
     if att.path is not None:
         return f"[The user sent an audio attachment ({att.display}) but the file is not available: {att.path}]"
@@ -177,6 +176,8 @@ async def _note_for(att: AudioAttachment, path: str, stt_enabled: bool) -> tuple
     )
 
     if not stt_enabled:
+        # Same agent-visible rendering as the failure note: a docker/ssh terminal backend cannot
+        # open the host path, and this is the branch that hands the agent a clip to listen to.
         return None, voice_message_attached_note(path), True
     try:
         from tools import transcription_tools as stt
@@ -209,6 +210,7 @@ async def prepare_voice_turn(
     try:
         for att in attachments:
             path: Optional[str] = None
+            too_large = False
             if att.path is not None:
                 # A link the host could not actually drop (or that points at a directory) is
                 # reported, never handed to STT: the provider would only echo an upload error.
@@ -217,12 +219,19 @@ async def prepare_voice_turn(
             else:
                 try:
                     path = await _materialize(att)
+                except ValueError:
+                    # The configured inbound media cap refused it (``validate_inbound_media_size``
+                    # inside the cache helper). It can be set below our own 25 MiB, and the user
+                    # is owed the "too large" note rather than a generic "could not be read".
+                    logger.info("ACP: embedded audio attachment refused by the inbound media cap",
+                                exc_info=True)
+                    too_large = True
                 except Exception:
                     logger.warning("ACP: could not write embedded audio attachment", exc_info=True)
                 if path:
                     turn.temp_paths.append(path)
             if not path:
-                turn.audio_notes[att.index] = _unreadable_note(att)
+                turn.audio_notes[att.index] = _unreadable_note(att, too_large=too_large)
                 continue
             transcript, note, keeps_file = await _note_for(att, path, stt_enabled)
             if transcript is not None:
@@ -283,6 +292,30 @@ def bind_voice_turn(agent: Any, turn: VoiceTurn) -> Callable[[], None]:
             raise
 
     return _restore
+
+
+async def sweep_audio_cache() -> None:
+    """Prune the profile audio cache on the gateway's policy, from the ACP process.
+
+    ``cleanup_audio_cache`` otherwise has exactly one caller, the gateway's hourly housekeeping
+    (``gateway.run._housekeeping_media_caches``). An install that only ever runs ``hermes-acp``
+    (an editor host, or Buzz Desktop) never starts that loop, so nothing would ever collect the
+    clips a failed transcription keeps on purpose, and an ACP host with no STT provider fails
+    every voice note. Sweeping at session start costs one ``iterdir`` on a directory this process
+    already writes to, and the age cutoff is what keeps it from touching a live turn's clip: a
+    clip materialized moments ago is hours away from the cutoff."""
+    from gateway.platforms.base import cleanup_audio_cache
+
+    def _sweep() -> int:
+        try:
+            return cleanup_audio_cache(max_age_hours=AUDIO_CACHE_MAX_AGE_HOURS)
+        except Exception:
+            logger.debug("ACP: audio cache sweep failed", exc_info=True)
+            return 0
+
+    removed = await asyncio.to_thread(_sweep)
+    if removed:
+        logger.info("ACP audio cache cleanup: removed %d stale file(s)", removed)
 
 
 def cleanup_voice_turn(turn: Optional[VoiceTurn], *, force: bool = False) -> None:
