@@ -583,6 +583,87 @@ def test_unresolved_outcome_does_not_assume_an_already_folded_lane(monkeypatch):
     assert outcome == (None, None)
 
 
+def test_origin_lane_helper_does_not_assume_an_already_folded_lane(monkeypatch):
+    """``_is_origin_lane`` is the single funnel both scheduler origin sites read, and it folds
+    the lane itself instead of trusting ``_normalize_deliver_value`` to have run.
+
+    Pinned with the normalizer stubbed to the identity, the same way the two resolution sites
+    above are. Without the stub the source fold has already canonicalized the value before this
+    helper sees it, so the helper's own fold is invisible and dropping it left the suite green."""
+    monkeypatch.setattr(s, "_normalize_deliver_value", lambda value: value)
+
+    job = {"id": "j-lane-helper", "deliver": " ORIGIN "}
+
+    assert s._is_origin_lane(job, for_failure=False) is True
+    assert s._is_origin_lane(job, for_failure=True) is True
+    assert s._is_origin_lane({"id": "j-lane-helper", "deliver": " Local "},
+                             for_failure=False) is False
+
+
+def test_recorded_origin_outcome_does_not_assume_an_already_folded_lane(
+    platformless_env, monkeypatch
+):
+    """The success-path consumer (``_save_compose_deliver``) reads the lane through
+    ``_is_origin_lane``, not through a raw comparison of the value it was handed.
+
+    Driven end to end with the normalizer stubbed, which is the only way to hand this layer a raw
+    lane now that the value is canonical at the source: reverting the site to its pre-fix
+    ``_normalize_deliver_value(...) == "origin"`` records the run ``delivered`` with nothing
+    sent, which is the bug, and no unstubbed test could see it."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("raw origin body"))
+    monkeypatch.setattr(s, "_normalize_deliver_value", lambda value: value)
+
+    s.run_one_job(
+        {"id": "j-raw-origin", "name": "raw origin", "deliver": " ORIGIN "},
+        adapters={}, loop=None,
+    )
+
+    assert _recorded_outcome(platformless_env) == "not_configured"
+
+
+def test_crash_failure_outcome_does_not_assume_an_already_folded_lane(
+    platformless_env, monkeypatch, caplog
+):
+    """Same contract on the crash path, which classifies the lane on its own (a run that raised
+    out of ``run_job`` never reaches the normal finalizer) and so needs its own pin."""
+    monkeypatch.setattr(s, "_normalize_deliver_value", lambda value: value)
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        delivery_error, outcome = s._deliver_crash_failure(
+            {"id": "j-raw-crash", "name": "crash", "deliver": " ORIGIN "},
+            "the runner raised", adapters={}, loop=None,
+        )
+
+    assert delivery_error is None
+    assert outcome == "not_configured"
+
+
+@pytest.mark.parametrize("deliver", [" ALL ", ["ALL"]])
+def test_the_lane_is_folded_at_the_source_not_only_at_the_consumers(
+    platformless_env, monkeypatch, caplog, deliver
+):
+    """The fold at the source is what makes the value every consumer reads canonical; the
+    consumers fold again only so they hold on their own. Because they do, nothing end to end
+    noticed when the SOURCE fold regressed: reverting both branches of ``_normalize_deliver_value``
+    to a bare ``str(p).strip()`` left every lane test green, and the defensive re-folding hid it.
+
+    The reason string is where the normalized value is reported verbatim (into ``last_output``'s
+    delivery error and into the log line the operator reads), so it is what pins the source fold.
+    One case per branch of the normalizer: a comma string and a list."""
+    monkeypatch.setattr(s, "run_job", _succeeding_run_job("source fold body"))
+
+    with caplog.at_level(logging.INFO, logger="cron"):
+        s.run_one_job(
+            {"id": "j-source-fold", "name": "source", "deliver": deliver}, adapters={}, loop=None,
+        )
+
+    reasons = [m for m in _messages(caplog) if "no delivery target resolved" in m]
+    assert reasons and all("deliver=all" in m for m in reasons)
+    assert not any("ALL" in m for m in reasons)
+    _args, kw = platformless_env["marked"][0]
+    assert kw["delivery_error"] == "no delivery target resolved for deliver=all"
+
+
 def test_the_unresolved_reason_carries_the_folded_lane(platformless_env, monkeypatch, caplog):
     """The reason string is written into ``last_delivery_error`` and into the log line, so it
     shows the canonical lane rather than replaying the padding it was typed with."""

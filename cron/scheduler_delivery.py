@@ -813,7 +813,15 @@ def canonical_deliver_token(token) -> str:
     Every site that decides what a lane means routes through this: ``_normalize_deliver_value``
     (so the stored/normalized value the whole scheduler reads is already canonical), the three
     resolution sites in this module, and the run-classification consumers in ``cron/scheduler.py``
-    and ``tools/cronjob_tools.py``, which must not assume their caller normalized."""
+    and ``tools/cronjob_tools.py``, which must not assume their caller normalized.
+
+    Four of those consumer folds (``_resolve_delivery_targets``, ``_unresolved_delivery_outcome``,
+    ``_is_origin_lane``, ``_classify_delivery_outcome``) are redundant whenever the value did come
+    from ``_normalize_deliver_value``, which is every path through ``run_one_job``. Defense in
+    depth that nothing exercises is defense that silently rots, in BOTH directions: each of the
+    four is pinned by a test that stubs ``_normalize_deliver_value`` to the identity (or calls the
+    consumer directly with a raw lane), and the source fold is pinned separately by the reason
+    string, which reports the normalized value verbatim."""
     raw = str(token or "").strip()
     lowered = raw.lower()
     return lowered if lowered in _LANE_KEYWORDS else raw
@@ -1733,7 +1741,8 @@ def _unresolved_delivery_outcome(
     # Lane names are matched case- and whitespace-insensitively: `"Local"` or `" local "` is the
     # same opt-out a plain `local` is, and treating it as a platform name would resolve to nothing
     # and (since this change logs unresolved lanes) dump the job body on every run. The value is
-    # canonical already; folded again so this site holds on its own.
+    # canonical already; folded again so this site holds on its own, pinned by
+    # test_unresolved_outcome_does_not_assume_an_already_folded_lane.
     lane = canonical_deliver_token(deliver_value)
     if lane == "local":
         return None, None

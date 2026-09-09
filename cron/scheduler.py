@@ -2599,7 +2599,13 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
 def _is_origin_lane(job: dict, *, for_failure: bool) -> bool:
     """Did this run route through the ``origin`` lane? One place, so both the normal and the crash
     failure path agree, and so the comparison goes through ``canonical_deliver_token`` (a job
-    written with ``deliver: Origin`` must be classified ``not_configured``, not ``delivered``)."""
+    written with ``deliver: Origin`` must be classified ``not_configured``, not ``delivered``).
+
+    The fold here is redundant when the caller's value came from ``_normalize_deliver_value``,
+    which is every path through ``run_one_job``; it is pinned anyway, with the normalizer stubbed
+    to the identity, by ``test_origin_lane_helper_does_not_assume_an_already_folded_lane``. Both
+    call sites route through this helper rather than comparing the value themselves, and each has
+    its own end-to-end pin under the same stub."""
     return canonical_deliver_token(
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))) == "origin"
 
@@ -2616,7 +2622,9 @@ def _classify_delivery_outcome(
     if should_deliver and unresolved_origin:
         return "not_configured"
     # Folded through the lane helper rather than compared raw: recording a run as ``delivered``
-    # because a lane keyword was typed ``Local`` would report a send that never happened.
+    # because a lane keyword was typed ``Local`` would report a send that never happened. Callers
+    # in this module always pass a normalized value, so the fold is pinned by calling this
+    # directly with a raw lane (test_classify_delivery_outcome_folds_the_lane_keyword).
     if should_deliver and canonical_deliver_token(normalized_deliver) != "local":
         return "delivered"
     if incident_acked and not success:
