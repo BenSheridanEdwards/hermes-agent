@@ -339,33 +339,6 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-# Buzz identity supplied by a managing harness.
-#
-# A Buzz-managed agent is launched with ``BUZZ_AUTH_TAG``, an owner-signed
-# attestation naming one specific keypair. The same Hermes profile may also
-# run a gateway, whose own ``BUZZ_PRIVATE_KEY`` lives in the profile ``.env``.
-# The dotenv loads below use ``override=True``, so without this the gateway
-# key silently replaces the attested one: the CLI then signs as the gateway
-# while presenting the managed agent's tag, and every publish fails
-# ``BUZZ_AUTH_TAG`` verification. The attestation names the key, so the key
-# the harness launched us with wins.
-_HARNESS_BUZZ_IDENTITY_KEYS: tuple[str, ...] = ("BUZZ_PRIVATE_KEY",)
-
-
-def _capture_harness_buzz_identity() -> dict[str, str]:
-    """Inherited Buzz identity, only when a harness attested one. Else empty."""
-    if not os.environ.get("BUZZ_AUTH_TAG"):
-        return {}
-    return {k: os.environ[k] for k in _HARNESS_BUZZ_IDENTITY_KEYS if k in os.environ}
-
-
-def _restore_harness_buzz_identity(saved: dict[str, str]) -> None:
-    """Reinstate the attested identity after an override dotenv load."""
-    for key, value in saved.items():
-        if os.environ.get(key) != value:
-            os.environ[key] = value
-
-
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         # utf-8-sig strips a leading UTF-8 BOM if present (PowerShell 5.1
@@ -524,13 +497,11 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        harness_identity = _capture_harness_buzz_identity()
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
         _clear_known_keys_missing_from_dotenv(user_env)
-        _restore_harness_buzz_identity(harness_identity)
 
     # Load .op.env AFTER .env so that .env values win, but the bootstrap
     # token (OP_SERVICE_ACCOUNT_TOKEN) becomes available for
@@ -640,9 +611,7 @@ def _apply_managed_env() -> None:
     if not managed_env.exists():
         return
     _sanitize_env_file_if_needed(managed_env)
-    harness_identity = _capture_harness_buzz_identity()
     _load_dotenv_with_fallback(managed_env, override=True)
-    _restore_harness_buzz_identity(harness_identity)
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
