@@ -4,13 +4,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from gateway.platforms.base import CachedMedia
+from gateway.platforms.base import CachedMedia, SendResult
 from gateway.platforms.event import MessageType
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 from gateway.platforms.event import MessageType
@@ -2531,6 +2532,1122 @@ class TestBuzzAdapterSend:
 # ── Thread anchoring ──────────────────────────────────────────────────────
 
 
+# ── Voice notes ───────────────────────────────────────────────────────────
+
+# BIP-340 test vector 0 private key: real signatures without any secret material.
+TEST_PRIVATE_KEY = "00" * 31 + "03"
+_nostr_auth = _buzz_mod._nostr_auth
+
+
+def _decode_nostr_token(header: str) -> dict:
+    """Unpack a ``Nostr <base64 event>`` Authorization value."""
+    scheme, token = header.split(" ", 1)
+    assert scheme == "Nostr"
+    return json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+
+
+def _tag_map(event: dict) -> dict:
+    return {tag[0]: tag[1] for tag in event["tags"]}
+
+
+def _mock_http(monkeypatch, handler):
+    """Route every httpx.AsyncClient through *handler* and return the recorded requests."""
+    import httpx
+
+    requests = []
+    real_async_client = httpx.AsyncClient
+
+    def recording_handler(request):
+        requests.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=httpx.MockTransport(recording_handler), **kwargs),
+    )
+    return requests
+
+
+def _nip11(extensions):
+    import httpx
+
+    def handler(request):
+        assert request.headers["accept"] == "application/nostr+json"
+        return httpx.Response(200, json={"name": "test", "supported_extensions": extensions})
+
+    return handler
+
+
+def _fake_ffmpeg(monkeypatch, output: bytes = b"ID3fake-mp3", returncode: int = 0):
+    """Stand in for the ffmpeg binary: record argv and write *output* to the last argument."""
+    import subprocess
+
+    calls = []
+
+    def run(cmd, capture_output=True, timeout=None):
+        calls.append(list(cmd))
+        if returncode == 0:
+            Path(cmd[-1]).write_bytes(output)
+        return SimpleNamespace(returncode=returncode, stdout=b"", stderr=b"boom" if returncode else b"")
+
+    monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+class TestVoiceNoteDelivery:
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_detects_extension_and_caches(self, monkeypatch):
+        requests = _mock_http(monkeypatch, _nip11(["nip-oa", "buzz-audio"]))
+        adapter = _make_adapter()
+
+        assert await adapter._relay_supports_audio() is True
+        assert await adapter._relay_supports_audio() is True
+
+        assert len(requests) == 1
+        assert str(requests[0].url) == "https://test.relay/"
+        supported, probed_at = adapter._audio_extension_cache
+        assert supported is True and probed_at > 0
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_reprobes_after_ttl(self, monkeypatch):
+        import time
+
+        requests = _mock_http(monkeypatch, _nip11([]))
+        adapter = _make_adapter()
+        adapter._audio_extension_cache = (True, time.monotonic() - _buzz_mod._AUDIO_EXTENSION_TTL - 1)
+
+        assert await adapter._relay_supports_audio() is False
+        assert len(requests) == 1
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_treats_probe_failure_as_unsupported(self, monkeypatch):
+        import httpx
+
+        def handler(request):
+            raise httpx.ConnectError("refused", request=request)
+
+        _mock_http(monkeypatch, handler)
+        adapter = _make_adapter()
+
+        assert await adapter._relay_supports_audio() is False
+        assert adapter._audio_extension_cache[0] is False
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_follows_a_redirect_to_https(self, monkeypatch):
+        """An http:// relay URL that 301s to https must not cache "no audio" for the whole TTL."""
+        import httpx
+
+        nip11 = _nip11(["buzz-audio"])
+
+        def handler(request):
+            if request.url.scheme == "http":
+                return httpx.Response(301, headers={"location": "https://test.relay/"})
+            return nip11(request)
+
+        requests = _mock_http(monkeypatch, handler)
+        adapter = _make_adapter({"relay_url": "http://test.relay"})
+
+        assert await adapter._relay_supports_audio() is True
+        assert [r.url.scheme for r in requests] == ["http", "https"]
+
+    @pytest.mark.asyncio
+    async def test_relay_supports_audio_survives_a_non_object_nip11_body(self, monkeypatch, caplog):
+        """A JSON array is a well-formed "no extensions" answer, not a probe failure.
+
+        The ``isinstance(doc, dict)`` guard is what makes it one: without it the ``.get`` raises an
+        AttributeError that the broad ``except`` turns into a warning about an unusable relay, which is
+        why this asserts on the log as well as the result.
+        """
+        import httpx
+        import logging
+
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, json=["buzz-audio"]))
+        adapter = _make_adapter()
+
+        with caplog.at_level(logging.WARNING, logger=_buzz_mod.logger.name):
+            assert await adapter._relay_supports_audio() is False
+        assert "NIP-11 probe failed" not in caplog.text
+
+    def test_blossom_auth_header_is_signed_upload_event(self):
+        adapter = _make_adapter({"relay_url": "wss://test.relay:8443/relay"})
+        adapter._private_key = TEST_PRIVATE_KEY
+        digest = "ab" * 32
+
+        event = _decode_nostr_token(adapter._blossom_auth_header(digest))
+
+        assert event["kind"] == 24242
+        assert event["content"] == "Upload file"
+        assert event["pubkey"] == _nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+        tags = _tag_map(event)
+        assert tags["t"] == "upload"
+        assert tags["x"] == digest
+        assert tags["server"] == "test.relay:8443"
+        assert int(tags["expiration"]) == event["created_at"] + _buzz_mod._BLOSSOM_AUTH_TTL
+        serialized = json.dumps(
+            [0, event["pubkey"], event["created_at"], 24242, event["tags"], event["content"]],
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode()
+        assert event["id"] == hashlib.sha256(serialized).hexdigest()
+        assert len(bytes.fromhex(event["sig"])) == 64
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_puts_blob_with_auth_and_tries_media_upload(self, monkeypatch, tmp_path):
+        import httpx
+
+        payload = b"mp3 frames"
+        digest = hashlib.sha256(payload).hexdigest()
+        descriptor = {"url": f"https://test.relay/media/{digest}.mp3", "sha256": digest, "size": len(payload), "type": "audio/mpeg"}
+
+        def handler(request):
+            if request.url.path == "/upload":
+                return httpx.Response(404)
+            assert request.method == "PUT"
+            assert request.url.path == "/media/upload"
+            assert request.content == payload
+            assert request.headers["content-type"] == "audio/mpeg"
+            assert request.headers["x-sha-256"] == digest
+            assert request.headers["x-auth-tag"] == '["auth","a","b","c"]'
+            event = _decode_nostr_token(request.headers["authorization"])
+            assert _tag_map(event)["x"] == digest
+            return httpx.Response(200, json=descriptor)
+
+        requests = _mock_http(monkeypatch, handler)
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","a","b","c"]'
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(payload)
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert error is None
+        assert desc == descriptor
+        assert [r.url.path for r in requests] == ["/upload", "/media/upload"]
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_reports_relay_rejection(self, monkeypatch, tmp_path):
+        import httpx
+
+        _mock_http(monkeypatch, lambda request: httpx.Response(422, text="audio validation failed"))
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(b"x")
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert desc is None
+        assert error == "HTTP 422: audio validation failed"
+
+    def test_voice_note_imeta_marks_filename_duration_and_transcript(self):
+        desc = {"url": "https://test.relay/media/abc.mp3", "sha256": "c" * 64, "size": 10, "duration": "3.2", "type": "audio/mpeg"}
+
+        imeta = BuzzAdapter._voice_note_imeta(desc, "voice-note-7.mp3", "audio/mp4", "hello\tthere\nfriend\x00")
+
+        assert imeta == [
+            "imeta",
+            "url https://test.relay/media/abc.mp3",
+            "m audio/mpeg",
+            "x " + "c" * 64,
+            "size 10",
+            "duration 3.2",
+            "filename voice-note-7.mp3",
+            "alt hello there\nfriend",  # the tab becomes a space; the NUL is dropped
+        ]
+        assert "alt" not in " ".join(BuzzAdapter._voice_note_imeta({"url": "u"}, "voice-note-8.mp4", "video/mp4", "  "))
+
+    @pytest.mark.asyncio
+    async def test_send_voice_prefers_mp3_upload_on_audio_relay(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        clean = tmp_path / "voice-note-1.mp3"
+        clean.write_bytes(b"clean")
+        conversions = []
+
+        def convert(path, out, *, reencode=False):
+            conversions.append((path, out, reencode))
+            return clean
+
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", convert)
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda *a: pytest.fail("envelope not needed"))
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        desc = {"url": "https://test.relay/media/x.mp3"}
+        adapter._blossom_upload = AsyncMock(return_value=(desc, None))
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=True, message_id="evt-voice"))
+        adapter._run_cli = AsyncMock(side_effect=AssertionError("CLI must not be used"))
+
+        result = await adapter.send_voice(CHANNEL, str(src), caption="hi", reply_to="parent", metadata={"transcript": "hi"})
+
+        assert result.success is True and result.message_id == "evt-voice"
+        # The destination is allocated by send_voice before the transcode starts, so a cancelled turn
+        # cannot orphan it, and it is unlinked once the upload that reads it has finished.
+        (source, out, reencode), = conversions
+        assert (source, reencode) == (src, False)
+        assert out.parent == _buzz_mod._voice_note_workdir() and out.suffix == ".mp3" and not out.exists()
+        adapter._blossom_upload.assert_awaited_once_with(clean, "audio/mpeg")
+        adapter._publish_voice_note.assert_awaited_once_with(
+            CHANNEL, desc, "voice-note-1.mp3", "audio/mpeg", caption="hi", reply_to="parent", metadata={"transcript": "hi"})
+
+    @pytest.mark.asyncio
+    async def test_send_voice_reencodes_once_when_copied_stream_is_rejected(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        clean = tmp_path / "voice-note-2.mp3"
+        clean.write_bytes(b"clean")
+        conversions = []
+
+        def convert(path, out, *, reencode=False):
+            conversions.append(reencode)
+            return clean
+
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", convert)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=[(None, "HTTP 422: bad frames"), ({"url": "u"}, None)])
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=True, message_id="evt-2"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True
+        assert conversions == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_send_voice_uses_envelope_when_relay_lacks_audio(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        wrapped = tmp_path / "voice-note-3.mp4"
+        wrapped.write_bytes(b"mp4")
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", lambda *a, **k: pytest.fail("mp3 path not expected"))
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path, out: wrapped)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=False)
+        adapter._blossom_upload = AsyncMock(side_effect=AssertionError("no direct upload without buzz-audio"))
+        cli = _ScriptedCli()
+        desc = {"url": "https://test.relay/media/x.mp4", "type": "video/mp4"}
+        cli.script("upload", "file", desc)
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=True, message_id="evt-3"))
+
+        result = await adapter.send_voice(CHANNEL, str(src), caption="c")
+
+        assert result.success is True
+        assert cli.calls[0][0] == ["upload", "file", "--file", str(wrapped)]
+        adapter._publish_voice_note.assert_awaited_once_with(
+            CHANNEL, desc, "voice-note-3.mp4", "video/mp4", caption="c", reply_to=None, metadata=None)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_falls_back_to_plain_attachment(self, monkeypatch, tmp_path):
+        """A rejected publish degrades to the envelope as a plain --file upload; no ffmpeg degrades to the source."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        wrapped = tmp_path / "voice-note-4.mp4"
+        wrapped.write_bytes(b"mp4")
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_wrap_audio_in_voice_note_envelope", lambda path, out: wrapped)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=False)
+        cli = _ScriptedCli()
+        cli.script("upload", "file", {"url": "https://test.relay/media/x.mp4"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=False, error="relay rejected voice note: nope"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        args, _stdin = cli.calls[-1]
+        assert args[:2] == ["messages", "send"]
+        assert args[args.index("--file") + 1] == str(wrapped)
+
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: None)
+        adapter._relay_supports_audio = AsyncMock(side_effect=AssertionError("no probe without ffmpeg"))
+        result = await adapter.send_voice(CHANNEL, str(src))
+        assert result.success is True
+        assert cli.calls[-1][0][cli.calls[-1][0].index("--file") + 1] == str(src)
+
+    @pytest.mark.asyncio
+    async def test_publish_voice_note_sends_kind_9_event_with_imeta(self, monkeypatch):
+        import sys
+        from types import ModuleType
+        from unittest.mock import patch
+
+        class _RelayWs:
+            def __init__(self):
+                self.sent = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+            async def recv(self):
+                return json.dumps(["OK", self.sent[-1][1]["id"], True, ""])
+
+        ws = _RelayWs()
+        fake_ws_mod = ModuleType("websockets")
+        fake_ws_mod.connect = lambda *args, **kwargs: ws
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._authenticate_websocket = AsyncMock()
+        adapter._thread_roots["child"] = "root"
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        desc = {"url": "https://test.relay/media/x.mp3", "sha256": "d" * 64, "size": 5}
+
+        with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+            result = await adapter._publish_voice_note(
+                CHANNEL, desc, "voice-note-9.mp3", "audio/mpeg", caption="listen", reply_to="child",
+                metadata={"transcript": "spoken words"})
+
+        assert result.success is True
+        adapter._authenticate_websocket.assert_awaited_once_with(ws)
+        frame, event = ws.sent[0]
+        assert frame == "EVENT"
+        assert result.message_id == event["id"]
+        assert event["kind"] == 9
+        assert event["pubkey"] == _nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+        assert event["content"] == "listen\n[voice-note-9.mp3](https://test.relay/media/x.mp3)"
+        assert event["tags"][0] == ["h", CHANNEL]
+        assert event["tags"][1][0] == "imeta"
+        assert "filename voice-note-9.mp3" in event["tags"][1]
+        assert "alt spoken words" in event["tags"][1]
+        assert event["tags"][2] == ["e", "root", "", "reply"]
+        assert event["id"] in adapter._channel_state[CHANNEL]["seen"]
+        # Parity with send(): without the meta row a thread reply to the card alone would not read as a
+        # reply to our own message in a require_mention channel, because our own relay echo is suppressed.
+        assert adapter._channel_state[CHANNEL]["event_meta"][event["id"]] == (SELF_PUBKEY, event["content"])
+
+    @pytest.mark.asyncio
+    async def test_publish_voice_note_reports_relay_rejection(self, monkeypatch):
+        import sys
+        from types import ModuleType
+        from unittest.mock import patch
+
+        class _RejectingWs:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            async def send(self, raw):
+                self.event_id = json.loads(raw)[1]["id"]
+
+            async def recv(self):
+                return json.dumps(["OK", self.event_id, False, "blocked: not a member"])
+
+        fake_ws_mod = ModuleType("websockets")
+        fake_ws_mod.connect = lambda *args, **kwargs: _RejectingWs()
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._authenticate_websocket = AsyncMock()
+
+        with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+            result = await adapter._publish_voice_note(CHANNEL, {"url": "u"}, "voice-note-1.mp3", "audio/mpeg", caption=None, reply_to=None, metadata=None)
+
+        assert result.success is False
+        assert result.error == "relay rejected voice note: blocked: not a member"
+
+    @pytest.mark.asyncio
+    async def test_play_tts_file_attaches_transcript(self):
+        adapter = _make_adapter()
+        adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="evt-tts"))
+        deliveries = []
+        event = SimpleNamespace(source=SimpleNamespace(chat_id=CHANNEL))
+
+        skipped_text = await adapter._play_tts_file(event, "spoken reply", "/tmp/tts.mp3", True, {"thread_id": "root"}, deliveries.append)
+
+        # False on purpose: the text reply keeps going out on its own, through send(), which is the only
+        # path with mention resolution and length chunking. A caption would lose both, and would lose the
+        # text entirely whenever the voice paths degrade to a plain file attachment.
+        assert skipped_text is False
+        assert deliveries[0].message_id == "evt-tts"
+        adapter.send_voice.assert_awaited_once_with(
+            chat_id=CHANNEL, audio_path="/tmp/tts.mp3", metadata={"thread_id": "root", "transcript": "spoken reply"})
+
+    @pytest.mark.asyncio
+    async def test_play_tts_file_transcribes_the_first_chunk_only(self):
+        """A reply split into several TTS files must not repeat the whole transcript under every card."""
+        adapter = _make_adapter()
+        adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="evt-tts"))
+        event = SimpleNamespace(source=SimpleNamespace(chat_id=CHANNEL))
+
+        await adapter._play_tts_file(event, "spoken reply", "/tmp/a.mp3", True, {}, lambda _r: None)
+        await adapter._play_tts_file(event, "spoken reply", "/tmp/b.mp3", False, {}, lambda _r: None)
+
+        metadatas = [call.kwargs["metadata"] for call in adapter.send_voice.await_args_list]
+        assert metadatas == [{"transcript": "spoken reply"}, {}]
+
+    def test_mp3_conversion_copies_mp3_frames_and_reencodes_other_formats(self, monkeypatch, tmp_path):
+        # tempdir is redirected and every destination is caller-allocated under tmp_path: a unit test must
+        # not drop scratch files into the workdir that every gateway on this host shares.
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        calls = _fake_ffmpeg(monkeypatch)
+        mp3 = tmp_path / "reply.mp3"
+        mp3.write_bytes(b"x")
+        ogg = tmp_path / "reply.ogg"
+        ogg.write_bytes(b"x")
+        dest = [tmp_path / f"voice-note-{i}.mp3" for i in range(4)]
+
+        out = _buzz_mod._convert_audio_to_clean_mp3(mp3, dest[0])
+        _buzz_mod._convert_audio_to_clean_mp3(mp3, dest[1], reencode=True)
+        _buzz_mod._convert_audio_to_clean_mp3(ogg, dest[2])
+
+        assert out == dest[0]
+        assert out.read_bytes() == b"ID3fake-mp3"
+        codecs = [cmd[cmd.index("-c:a") + 1] for cmd in calls]
+        assert codecs == ["copy", "libmp3lame", "libmp3lame"]
+        assert all(cmd[0] == "/fake/ffmpeg" and "-map_metadata" in cmd and "-id3v2_version" in cmd for cmd in calls)
+        assert _buzz_mod._convert_audio_to_clean_mp3(tmp_path / "missing.mp3", dest[3]) is None
+        assert not (tmp_path / "hermes-buzz-voice").exists()
+
+    def test_ffmpeg_failure_yields_no_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch, returncode=1)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"x")
+
+        assert _buzz_mod._convert_audio_to_clean_mp3(src, _buzz_mod._voice_note_tempfile(".mp3")) is None
+        assert _buzz_mod._wrap_audio_in_voice_note_envelope(src, _buzz_mod._voice_note_tempfile(".mp4")) is None
+        # The mkstemp placeholder goes too; a failed transcode must not leave an empty file behind.
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    def test_converted_voice_files_get_unique_names(self, monkeypatch, tmp_path):
+        """Millisecond stamps collide across the gateways sharing this host's temp dir; mkstemp names cannot."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+        names = {_buzz_mod._voice_note_tempfile(".mp3").name for _ in range(5)}
+        names |= {_buzz_mod._voice_note_tempfile(".mp4").name for _ in range(5)}
+
+        assert len(names) == 10
+        assert all(n.startswith(_buzz_mod._VOICE_NOTE_PREFIX) for n in names)
+        assert sorted(n[-4:] for n in names) == [".mp3"] * 5 + [".mp4"] * 5
+
+    def test_ffmpeg_lookup_prefers_the_env_override_then_path(self, monkeypatch, tmp_path):
+        """No hard-coded Homebrew path: BUZZ_FFMPEG_PATH wins, then PATH, then the usual install roots."""
+        override = tmp_path / "custom-ffmpeg"
+        override.write_bytes(b"#!/bin/sh\n")
+        on_path = tmp_path / "path-ffmpeg"
+        on_path.write_bytes(b"#!/bin/sh\n")
+        monkeypatch.setattr(_buzz_mod.shutil, "which", lambda name: str(on_path))
+
+        monkeypatch.setenv("BUZZ_FFMPEG_PATH", str(override))
+        assert _buzz_mod._ffmpeg_path() == str(override)
+
+        monkeypatch.setenv("BUZZ_FFMPEG_PATH", str(tmp_path / "does-not-exist"))
+        assert _buzz_mod._ffmpeg_path() == str(on_path)
+
+        monkeypatch.delenv("BUZZ_FFMPEG_PATH")
+        monkeypatch.setattr(_buzz_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(_buzz_mod, "_FFMPEG_FALLBACKS", (str(tmp_path / "nope"), str(on_path)))
+        assert _buzz_mod._ffmpeg_path() == str(on_path)
+
+        monkeypatch.setattr(_buzz_mod, "_FFMPEG_FALLBACKS", ())
+        assert _buzz_mod._ffmpeg_path() is None
+
+    @pytest.mark.asyncio
+    async def test_send_voice_unlinks_every_converted_file(self, monkeypatch, tmp_path):
+        """Auto-TTS runs on every voice turn across every gateway; the scratch dir must not grow."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        uploaded = []
+
+        async def upload(path, mime):
+            uploaded.append((Path(path).name, Path(path).is_file()))
+            return {"url": "https://test.relay/media/x.mp3"}, None
+
+        adapter._blossom_upload = upload
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=True, message_id="evt-clean"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True
+        # The file still exists while it is being uploaded, and is gone once send_voice returns.
+        assert len(uploaded) == 1 and uploaded[0][1] is True and uploaded[0][0].startswith(_buzz_mod._VOICE_NOTE_PREFIX)
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_unlinks_scratch_files_on_the_fallback_path(self, monkeypatch, tmp_path):
+        """The re-encode retry, the envelope, and the plain-file fallback all clean up after themselves."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=[(None, "HTTP 422: bad frames"), (None, "HTTP 422: bad frames")])
+        cli = _ScriptedCli()
+        cli.script("upload", "file", {"url": "https://test.relay/media/x.mp4"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=False, error="nope"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert adapter._blossom_upload.await_count == 2  # copied stream, then the re-encode
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_degrades_to_a_plain_file_when_no_scratch_file_can_be_made(self, monkeypatch, tmp_path):
+        """A full or read-only TMPDIR must cost the voice card, not the whole turn.
+
+        send_voice runs inside the gateway's TTS hook, which has no ``except``: an OSError out of mkstemp
+        would land in the turn's outer handler and the text reply would never be sent.
+        """
+        import errno
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+
+        def no_space(**kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkstemp", no_space)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=AssertionError("nothing was converted to upload"))
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert cli.calls[-1][0][cli.calls[-1][0].index("--file") + 1] == str(src)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_returns_a_failure_result_instead_of_raising(self, monkeypatch, tmp_path):
+        """Whatever goes wrong, send_voice answers with a SendResult so the text reply still goes out."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        adapter._blossom_upload = AsyncMock(side_effect=RuntimeError("upload exploded"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is False and "upload exploded" in result.error
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []  # the scratch file goes even so
+
+    @pytest.mark.asyncio
+    async def test_send_voice_cleans_up_a_transcode_that_is_cancelled_mid_flight(self, monkeypatch, tmp_path):
+        """Interrupts are routine on this fleet, and the transcode thread outlives the cancelled turn.
+
+        The destination is allocated and registered before ``asyncio.to_thread`` starts, so the ``finally``
+        unlinks it; the worker holds the open handle and its bytes go with the unlinked inode.
+        """
+        import threading
+        import time as _time
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        src = tmp_path / "reply.wav"
+        src.write_bytes(b"audio")
+        started = threading.Event()
+
+        def slow_convert(source, out, *, reencode=False):
+            with out.open("wb") as handle:  # ffmpeg opens the destination before it writes anything
+                started.set()
+                _time.sleep(0.3)
+                handle.write(b"late frames")
+            return out
+
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: "/fake/ffmpeg")
+        monkeypatch.setattr(_buzz_mod, "_convert_audio_to_clean_mp3", slow_convert)
+        adapter = _make_adapter()
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+
+        task = asyncio.create_task(adapter.send_voice(CHANNEL, str(src)))
+        await asyncio.to_thread(started.wait, 5)
+        # The path exists, and is on send_voice's cleanup list, while the worker is still transcoding.
+        assert len(list(_buzz_mod._voice_note_workdir().iterdir())) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.to_thread(_time.sleep, 0.5)  # let the worker thread finish writing
+
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_reports_a_signing_failure_instead_of_raising(self, monkeypatch, tmp_path):
+        """send_voice runs inside the gateway's TTS hook, which has no ``except``: a raise drops the text reply."""
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(b"x")
+        adapter = _make_adapter()
+        adapter._private_key = ""
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert desc is None and error.startswith("ValueError")
+
+    @pytest.mark.asyncio
+    async def test_send_voice_returns_a_result_when_the_key_cannot_sign(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "")
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: "")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _fake_ffmpeg(monkeypatch)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"audio")
+        adapter = _make_adapter()
+        adapter._private_key = ""
+        adapter._relay_supports_audio = AsyncMock(return_value=True)
+        cli = _ScriptedCli()
+        cli.script("upload", "file", {"url": "https://test.relay/media/x.mp4"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain"})
+        adapter._run_cli = cli
+        adapter._publish_voice_note = AsyncMock(return_value=SendResult(success=False, error="unsigned"))
+
+        result = await adapter.send_voice(CHANNEL, str(src))
+
+        assert result.success is True and result.message_id == "evt-plain"
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blossom_upload_resolves_credentials_lazily(self, monkeypatch, tmp_path):
+        """A send that reaches an adapter whose connect() never ran still signs, the way _run_cli does."""
+        import httpx
+
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: TEST_PRIVATE_KEY)
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: '["auth","lazy"]')
+        payload = b"mp3 frames"
+        blob = tmp_path / "voice-note-1.mp3"
+        blob.write_bytes(payload)
+        descriptor = {"url": "https://test.relay/media/x.mp3"}
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, json=descriptor))
+        adapter = _make_adapter()
+        adapter._private_key = adapter._auth_tag = ""
+
+        desc, error = await adapter._blossom_upload(blob, "audio/mpeg")
+
+        assert (desc, error) == (descriptor, None)
+        assert requests[0].headers["x-auth-tag"] == '["auth","lazy"]'
+        assert _tag_map(_decode_nostr_token(requests[0].headers["authorization"]))["x"] == hashlib.sha256(payload).hexdigest()
+
+
+class TestVoiceNoteInbound:
+
+    @staticmethod
+    def _envelope_metadata(payload: bytes) -> dict:
+        return {
+            "url": "https://test.relay/media/envelope.mp4",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "filename": "voice-note-1710000000.mp4",
+            "mime_type": "video/mp4",
+        }
+
+    @pytest.mark.asyncio
+    async def test_voice_note_envelope_is_demuxed_to_audio(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"\x00\x00\x00\x18ftypmp42 envelope bytes"
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        calls = _fake_ffmpeg(monkeypatch, output=b"\xff\xfb\x90\x00mp3 frames")
+        adapter = _make_adapter()
+
+        cached = await adapter._download_attachment(self._envelope_metadata(payload))
+
+        assert cached is not None
+        assert cached.kind == "audio"
+        assert cached.media_type == "audio/mpeg"
+        assert cached.display_name == "voice-note-1710000000.mp3"
+        assert Path(cached.path).read_bytes() == b"\xff\xfb\x90\x00mp3 frames"
+        (cmd,) = calls
+        assert cmd[cmd.index("-i") + 1].endswith(".mp4") and "-vn" in cmd and cmd[-1].endswith(".mp3")
+        assert Path(cmd[cmd.index("-i") + 1]).exists() is False  # scratch files are cleaned up
+
+    @pytest.mark.asyncio
+    async def test_voice_note_envelope_stays_video_when_ffmpeg_fails(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"\x00\x00\x00\x18ftypmp42 envelope bytes"
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        _fake_ffmpeg(monkeypatch, returncode=1)
+        adapter = _make_adapter()
+
+        cached = await adapter._download_attachment(self._envelope_metadata(payload))
+
+        assert cached is not None
+        assert cached.kind == "video"
+        assert cached.display_name == "voice-note-1710000000.mp4"
+
+    @pytest.mark.asyncio
+    async def test_envelope_demux_fails_soft_when_a_scratch_file_cannot_be_made(self, monkeypatch, tmp_path):
+        """A second scratch file that cannot be created must cost the demux, not the whole inbound event.
+
+        ``_download_attachment`` only wraps its HTTP block, so an OSError from here would propagate through
+        ``_cache_inbound_attachments`` into ``_handle_event`` and drop every attachment on the message. The
+        first file must not leak either.
+        """
+        import errno
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        payload = b"\x00\x00\x00\x18ftypmp42 envelope bytes"
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        _fake_ffmpeg(monkeypatch)
+        real_mkstemp = tempfile.mkstemp
+        made = []
+
+        def second_one_fails(**kwargs):
+            made.append(kwargs)
+            if len(made) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_mkstemp(**kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", second_one_fails)
+        adapter = _make_adapter()
+
+        cached = await adapter._download_attachment(self._envelope_metadata(payload))
+
+        # The envelope is cached as the video it arrived as, and no scratch file is left behind.
+        assert cached is not None and cached.kind == "video"
+        assert len(made) == 2
+        assert list(_buzz_mod._voice_note_workdir().iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_plain_mp4_is_not_demuxed(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"\x00\x00\x00\x18ftypmp42 a real video"
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        calls = _fake_ffmpeg(monkeypatch)
+        adapter = _make_adapter()
+        metadata = dict(self._envelope_metadata(payload), filename="clip.mp4")
+
+        cached = await adapter._download_attachment(metadata)
+
+        assert cached is not None and cached.kind == "video"
+        assert calls == []
+
+
+class TestAttachmentReadAuthorization:
+    """Attachment downloads carry a signed Blossom ``get`` authorization; the relay answers 401 without one."""
+
+    @staticmethod
+    def _metadata(payload: bytes) -> dict:
+        return {
+            "url": "https://test.relay/media/report.pdf",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+        }
+
+    def test_blossom_auth_header_signs_get_event(self):
+        adapter = _make_adapter({"relay_url": "wss://test.relay"})
+        adapter._private_key = TEST_PRIVATE_KEY
+        digest = "cd" * 32
+
+        event = _decode_nostr_token(adapter._blossom_auth_header(digest, verb="get"))
+
+        assert event["kind"] == 24242
+        assert event["content"] == "Get file"
+        assert event["pubkey"] == _nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+        tags = _tag_map(event)
+        assert tags["t"] == "get"
+        assert tags["x"] == digest
+        assert tags["server"] == "test.relay"
+        assert int(tags["expiration"]) > event["created_at"]
+
+    def test_blossom_auth_header_server_tag_drops_userinfo_and_keeps_odd_ports(self):
+        """The relay normalizes scheme, path and default ports away, but not userinfo: never sign it in."""
+        for relay_url, expected in (
+            ("wss://user:pw@test.relay/relay", "test.relay"),
+            ("wss://test.relay:443", "test.relay"),
+            ("https://TEST.Relay./media", "test.relay"),
+            ("wss://test.relay:8443", "test.relay:8443"),
+            ("http://test.relay:8080", "test.relay:8080"),
+        ):
+            adapter = _make_adapter({"relay_url": relay_url})
+            adapter._private_key = TEST_PRIVATE_KEY
+            event = _decode_nostr_token(adapter._blossom_auth_header("cd" * 32))
+            assert _tag_map(event)["server"] == expected, relay_url
+
+    def test_request_headers_carry_get_auth_and_owner_tag(self):
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+        digest = "ef" * 32
+
+        headers = adapter._attachment_request_headers({"sha256": digest}, "https://test.relay/media/x.pdf")
+
+        assert headers["Accept-Encoding"] == "identity"
+        assert headers["x-auth-tag"] == '["auth","owner-attestation"]'
+        event = _decode_nostr_token(headers["Authorization"])
+        assert _tag_map(event)["t"] == "get"
+        assert _tag_map(event)["x"] == digest
+
+    def test_request_headers_never_credential_a_third_party_attachment_host(self):
+        """A configured CDN is a trusted origin to download from, never a party to hand relay credentials to."""
+        adapter = _make_adapter({"attachment_hosts": ["cdn.other.example", "test.relay:8443"]})
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+        digest = "ef" * 32
+
+        for foreign in ("https://cdn.other.example/media/x.pdf", "https://test.relay:8443/media/x.pdf"):
+            assert adapter._attachment_request_headers({"sha256": digest}, foreign) == {"Accept-Encoding": "identity"}
+        # Same host, default port spelled out: still the relay, so still credentialed.
+        assert "Authorization" in adapter._attachment_request_headers({"sha256": digest}, "https://test.relay:443/media/x.pdf")
+
+    def test_request_headers_stay_unauthenticated_without_a_usable_key(self):
+        url = "https://test.relay/media/x.pdf"
+        adapter = _make_adapter()
+        adapter._private_key = ""
+        assert adapter._attachment_request_headers({"sha256": "ab" * 32}, url) == {"Accept-Encoding": "identity"}
+
+        adapter._private_key = "nsec1test"  # cannot sign: the read still goes out, just unauthenticated
+        assert "Authorization" not in adapter._attachment_request_headers({"sha256": "ab" * 32}, url)
+
+    @pytest.mark.asyncio
+    async def test_download_sends_signed_get_authorization_for_the_blob(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% signed read\n"
+        metadata = self._metadata(payload)
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+
+        cached = await adapter._download_attachment(metadata)
+
+        assert cached is not None and cached.kind == "document"
+        (request,) = requests
+        assert request.headers["accept-encoding"] == "identity"
+        event = _decode_nostr_token(request.headers["authorization"])
+        assert event["kind"] == 24242
+        assert _tag_map(event)["t"] == "get"
+        assert _tag_map(event)["x"] == metadata["sha256"]
+
+    @pytest.mark.asyncio
+    async def test_download_from_a_configured_cdn_carries_no_relay_credentials(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% public blob\n"
+        metadata = dict(self._metadata(payload), url="https://cdn.other.example/media/report.pdf")
+        requests = _mock_http(monkeypatch, lambda request: httpx.Response(200, content=payload, headers={"content-length": str(len(payload))}))
+        adapter = _make_adapter({"attachment_hosts": ["cdn.other.example"]})
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._auth_tag = '["auth","owner-attestation"]'
+
+        cached = await adapter._download_attachment(metadata)
+
+        assert cached is not None  # the download still happens, just without our credentials
+        (request,) = requests
+        assert request.headers["accept-encoding"] == "identity"
+        assert "authorization" not in request.headers
+        assert "x-auth-tag" not in request.headers
+
+    @pytest.mark.asyncio
+    async def test_download_reports_unauthorized_read(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        payload = b"%PDF-1.4\n% denied\n"
+        _mock_http(monkeypatch, lambda request: httpx.Response(401, json={"error": "unauthorized"}))
+        adapter = _make_adapter()
+        adapter._private_key = TEST_PRIVATE_KEY
+
+        assert await adapter._download_attachment(self._metadata(payload)) is None
+
+
+class TestVoiceNoteClassification:
+    """Voice notes dispatch as MessageType.VOICE (the only type the gateway transcribes); other audio stays AUDIO."""
+
+    MP3 = b"\xff\xfb\x90\x00voice note frames"
+
+    @staticmethod
+    def _audio_metadata(payload: bytes, filename: str) -> dict:
+        return {
+            "url": f"https://test.relay/media/{filename}",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "filename": filename,
+            "mime_type": "audio/mpeg",
+        }
+
+    def _adapter_with_attachments(self, attachments):
+        adapter = _make_adapter()
+        adapter._user_names[OTHER_PUBKEY] = "Other"
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._cache_inbound_attachments = AsyncMock(return_value=attachments)
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        return adapter, dispatched
+
+    @staticmethod
+    def _audio_event(count: int) -> dict:
+        event = _event("voice", content="@Chip listen")
+        for index in range(count):
+            event["tags"].append([
+                "imeta", f"url https://test.relay/media/{index}.mp3", "m audio/mpeg",
+                "x " + format(index + 1, "064x"), "size 1", f"filename voice-note-{index}.mp3",
+            ])
+        return event
+
+    @pytest.mark.asyncio
+    async def test_download_marks_voice_note_audio(self, monkeypatch, tmp_path):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        _mock_http(monkeypatch, lambda request: httpx.Response(200, content=self.MP3, headers={"content-length": str(len(self.MP3))}))
+        adapter = _make_adapter()
+
+        voice = await adapter._download_attachment(self._audio_metadata(self.MP3, "voice-note-1710000000.mp3"))
+        plain = await adapter._download_attachment(self._audio_metadata(self.MP3, "song.mp3"))
+
+        assert isinstance(voice, _buzz_mod._VoiceNoteMedia) and voice.kind == "audio"
+        assert isinstance(plain, CachedMedia) and not isinstance(plain, _buzz_mod._VoiceNoteMedia)
+
+    @pytest.mark.asyncio
+    async def test_voice_note_attachment_dispatches_as_voice(self):
+        cached = CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3")
+        adapter, dispatched = self._adapter_with_attachments([_buzz_mod._VoiceNoteMedia.of(cached)])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(1))
+
+        assert dispatched[-1]["message_type"] is MessageType.VOICE
+        assert dispatched[-1]["media_types"] == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
+    async def test_plain_audio_attachment_stays_audio(self):
+        adapter, dispatched = self._adapter_with_attachments([CachedMedia("/cache/audio/song.mp3", "audio/mpeg", "audio", "song.mp3")])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(1))
+
+        assert dispatched[-1]["message_type"] is MessageType.AUDIO
+
+    @pytest.mark.asyncio
+    async def test_voice_note_beside_plain_audio_stays_audio(self):
+        voice = _buzz_mod._VoiceNoteMedia.of(CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3"))
+        song = CachedMedia("/cache/audio/song.mp3", "audio/mpeg", "audio", "song.mp3")
+        adapter, dispatched = self._adapter_with_attachments([voice, song])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(2))
+
+        assert dispatched[-1]["message_type"] is MessageType.AUDIO
+
+    @pytest.mark.asyncio
+    async def test_voice_note_beside_document_uses_document(self):
+        voice = _buzz_mod._VoiceNoteMedia.of(CachedMedia("/cache/audio/note.mp3", "audio/mpeg", "audio", "voice-note-1.mp3"))
+        report = CachedMedia("/cache/documents/report.pdf", "application/pdf", "document", "report.pdf")
+        adapter, dispatched = self._adapter_with_attachments([voice, report])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], self._audio_event(2))
+
+        assert dispatched[-1]["message_type"] is MessageType.DOCUMENT
+
+    def _localizing_adapter(self, tmp_path, url_payload: bytes):
+        """Adapter whose ``buzz media get`` writes *url_payload*, plus the captured MessageEvents."""
+        adapter = _make_adapter()
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        async def cli(args, *, input_text=None):
+            assert args[:2] == ["media", "get"]
+            Path(args[args.index("-o") + 1]).write_bytes(url_payload)
+            return 0, "", ""
+
+        adapter.handle_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._run_cli = cli
+        adapter.send_reaction = AsyncMock(return_value=True)
+        return adapter, captured
+
+    @pytest.mark.asyncio
+    async def test_url_copy_of_the_same_voice_note_is_dropped_and_voice_is_kept(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        adapter, captured = self._localizing_adapter(tmp_path, self.MP3)
+        media_url = f"https://test.relay/media/{hashlib.sha256(self.MP3).hexdigest()}.mp3"
+
+        await adapter._dispatch_message(
+            text=f"[voice-note-1.mp3]({media_url})", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-dup", created_at=1004,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.VOICE
+        assert event.media_urls == [str(note)]
+        assert event.media_types == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_url_audio_beside_a_voice_note_uses_document(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        other = b"\xff\xfb\x90\x00a different recording"
+        adapter, captured = self._localizing_adapter(tmp_path, other)
+        media_url = f"https://test.relay/media/{hashlib.sha256(other).hexdigest()}.mp3"
+
+        await adapter._dispatch_message(
+            text=f"and this one {media_url}", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-plus-audio", created_at=1005,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.DOCUMENT
+        assert len(event.media_urls) == 2 and event.media_urls[0] == str(note)
+
+    @pytest.mark.asyncio
+    async def test_no_attachment_is_hashed_when_the_text_carries_no_media(self, monkeypatch, tmp_path):
+        """Nothing to compare against on the common path, so do not read every attachment back off disk."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        note = tmp_path / "note.mp3"
+        note.write_bytes(self.MP3)
+        adapter, captured = self._localizing_adapter(tmp_path, self.MP3)
+        adapter._run_cli = AsyncMock(side_effect=AssertionError("no URL refs to localize"))
+        monkeypatch.setattr(_buzz_mod, "_content_digest", lambda path: pytest.fail(f"hashed {path}"))
+
+        await adapter._dispatch_message(
+            text="a plain caption", chat_id=CHANNEL, chat_type="dm", user_id=OTHER_PUBKEY,
+            user_name="Joel", message_id="voice-only", created_at=1006,
+            media_urls=[str(note)], media_types=["audio/mpeg"], message_type=MessageType.VOICE,
+        )
+
+        (event,) = captured
+        assert event.message_type is MessageType.VOICE and event.media_urls == [str(note)]
+
+
 class TestThreadAnchoring:
     """A reply must JOIN the thread it was triggered from, not nest a new one.
 
@@ -3020,10 +4137,12 @@ class TestInboundMediaAuthorizationGate:
         ],
     )
     async def test_live_media_capabilities_upload_local_file_with_caption_and_reply(
-        self, tmp_path, method_name, suffix
+        self, tmp_path, monkeypatch, method_name, suffix
     ):
         media = tmp_path / f"attachment{suffix}"
         media.write_bytes(b"media")
+        # Without ffmpeg send_voice cannot build a voice note and uses the plain --file path like the others.
+        monkeypatch.setattr(_buzz_mod, "_ffmpeg_path", lambda: None)
         adapter = _make_adapter()
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt-media"})

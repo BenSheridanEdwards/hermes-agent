@@ -1,4 +1,4 @@
-"""Dependency-free Nostr signing (secp256k1 / BIP-340) for Buzz WebSocket authentication."""
+"""Dependency-free Nostr signing (secp256k1 / BIP-340) for Buzz WebSocket and Blossom authentication."""
 
 from __future__ import annotations
 
@@ -160,18 +160,28 @@ def parse_auth_tag(raw: Any, label: str) -> list[str]:
     return raw
 
 
+def build_signed_event(
+    *, private_key: str, kind: int, tags: list[list[str]], content: str = "",
+    created_at: Optional[int] = None, auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build and sign a NIP-01 event of *kind* (id = sha256 of the canonical serialization, BIP-340 sig)."""
+    pubkey = public_key_hex(private_key)
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    serialized = json.dumps([0, pubkey, timestamp, kind, tags, content], separators=(",", ":"), ensure_ascii=False).encode()
+    event_id = hashlib.sha256(serialized).digest()
+    return {
+        "id": event_id.hex(), "pubkey": pubkey, "created_at": timestamp, "kind": kind, "tags": tags, "content": content,
+        "sig": schnorr_sign(event_id, private_key, auxiliary_randomness=auxiliary_randomness).hex(),
+    }
+
+
 def build_auth_event(
     *, private_key: str, challenge: str, relay_url: str, auth_tag_json: str = "",
     created_at: Optional[int] = None, auxiliary_randomness: Optional[bytes] = None,
 ) -> dict[str, Any]:
+    """NIP-42 kind-22242 AUTH response (plus the optional NIP-OA owner-attestation tag)."""
     tags: list[list[str]] = [["relay", relay_url], ["challenge", challenge]]
     if auth_tag_json.strip():
         tags.append(parse_auth_tag(auth_tag_json, "BUZZ_AUTH_TAG"))
-    pubkey = public_key_hex(private_key)
-    timestamp = int(time.time()) if created_at is None else int(created_at)
-    serialized = json.dumps([0, pubkey, timestamp, 22242, tags, ""], separators=(",", ":"), ensure_ascii=False).encode()
-    event_id = hashlib.sha256(serialized).digest()
-    return {
-        "id": event_id.hex(), "pubkey": pubkey, "created_at": timestamp, "kind": 22242, "tags": tags, "content": "",
-        "sig": schnorr_sign(event_id, private_key, auxiliary_randomness=auxiliary_randomness).hex(),
-    }
+    return build_signed_event(
+        private_key=private_key, kind=22242, tags=tags, created_at=created_at, auxiliary_randomness=auxiliary_randomness)
