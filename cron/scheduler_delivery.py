@@ -810,7 +810,7 @@ def canonical_deliver_token(token) -> str:
 
     The single place a lane keyword is folded. ``platform:chat_id`` and ``bot-chat:<profile>``
     keep their case: chat ids are opaque and profile names are normalized by the profile layer.
-    Every site that decides what a lane means routes through this — ``_normalize_deliver_value``
+    Every site that decides what a lane means routes through this: ``_normalize_deliver_value``
     (so the stored/normalized value the whole scheduler reads is already canonical), the three
     resolution sites in this module, and the run-classification consumers in ``cron/scheduler.py``
     and ``tools/cronjob_tools.py``, which must not assume their caller normalized."""
