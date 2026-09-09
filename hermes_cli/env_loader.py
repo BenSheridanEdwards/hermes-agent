@@ -76,11 +76,20 @@ _ACP_HOST_OWNED_ENV_PREFIXES: tuple[str, ...] = ("BUZZ_",)
 # ``BUZZ_PRIVATE_KEY`` signs (plugins/platforms/buzz/nostr_auth.py). Letting ``.env`` fill the members the
 # host left unset would pair the managed key with the profile's attestation and fail relay verification for
 # exactly the reason the unfixed override did. So the group is all-or-nothing: once the host claims the
-# identity, the profile may not complete the rest of the ``BUZZ_*`` group from any of its four supply
-# routes: ``.env``, the project ``.env``, ``.op.env``, an external secret source.
+# identity, the profile may not complete the three names in ``_BUZZ_IDENTITY_ENV_KEYS`` from any of its four
+# supply routes: ``.env``, the project ``.env``, ``.op.env``, an external secret source.
 _BUZZ_IDENTITY_ENV_KEYS: frozenset[str] = frozenset({
     "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL",
 })
+# What the restore DELETES when the host claims the identity: the identity, not the ``BUZZ_`` namespace.
+# The namespace is about thirty names and the rest of it is plugin configuration ``hermes setup`` writes
+# into the profile's own ``.env`` (``BUZZ_CLI_PATH``, ``BUZZ_CHANNELS``, ``BUZZ_HOME_CHANNEL``,
+# ``BUZZ_ALLOWED_USERS``, ``BUZZ_POLL_INTERVAL`` …). Dropping those leaves a managed agent that signs
+# correctly and cannot send: ``plugins/platforms/buzz/adapter.py`` fails ``_standalone_send`` on a missing
+# CLI path or target channel and watches nothing without channels. ``BUZZ_CREDENTIALS_FILE`` is the one
+# non-identity name in the set, because a credentials record is itself an identity source
+# (``adapter.py:_resolve_credentials_data``).
+_BUZZ_IDENTITY_DROP_KEYS: frozenset[str] = _BUZZ_IDENTITY_ENV_KEYS | {"BUZZ_CREDENTIALS_FILE"}
 # What COUNTS as the host claiming that identity. Only the signing credentials: ``BUZZ_RELAY_URL`` is a
 # non-secret endpoint that a custom harness or an ambient shell export can carry on its own, and treating
 # it as a claim would delete a working profile identity and replace it with nothing (see
@@ -96,9 +105,10 @@ _ACP_HOST_ENV: dict[str, str] = {}
 # Serializes the dotenv load + host-env restore window while ACP-hosted so a concurrent LOADER cannot
 # observe the .env value between the override load and the restore, and two loads cannot interleave their
 # override/delete passes. It buys nothing for non-loading readers, which take no lock and read os.environ
-# directly; that window is closed instead by restoring immediately after the user .env load, not by this.
+# directly; that window is closed instead by restoring after each profile source, not by this.
 _ACP_ENV_LOCK = threading.RLock()
 _ACP_RESTORE_LOGGED = False  # once-per-process guard, like _WARNED_KEYS / _SCOPED_SKIP_LOGGED
+_ACP_KEYLESS_CLAIM_LOGGED = False  # ditto, for the tag-without-key warning
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
@@ -177,16 +187,22 @@ def _host_owns_buzz_identity() -> bool:
 
 
 def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
-    """Re-assert the snapshot, and drop every ``BUZZ_*`` name that APPEARED DURING the load and that the
-    host did not pass (see ``_BUZZ_IDENTITY_ENV_KEYS``: a split identity fails relay auth).
+    """Re-assert the snapshot, and drop every ``_BUZZ_IDENTITY_DROP_KEYS`` name that APPEARED DURING the
+    load and that the host did not pass (a split identity fails relay auth).
 
-    "Appeared during the load", not "assigned by the loaded ``.env`` files": ``loaded`` covers only the user
-    and project ``.env``, while ``.op.env`` and every external secret source inject straight into
-    ``os.environ`` from the same profile. A host passing only the private key while the profile's ``.op.env``
-    or vault mapping supplies ``BUZZ_AUTH_TAG`` produces exactly the split identity this whole path exists
-    to prevent. Diffing against the pre-load names covers all four supply routes in one rule, and keeps the
-    runtime carve-out: a ``BUZZ_SESSION_ID`` set before the load is not the profile completing an identity,
-    so it survives.
+    The drop is the identity group, NOT the ``BUZZ_`` prefix. The prefix is what the host OWNS, so a
+    managed harness passing ``BUZZ_CHANNELS`` still beats the profile's; but deleting the prefix took the
+    profile's Buzz plugin configuration with the identity and left an agent that signs correctly and
+    cannot send. See ``_BUZZ_IDENTITY_DROP_KEYS``.
+
+    "Appeared during the load", not "assigned by the loaded ``.env`` files": the loaded-path list covers
+    only the user and project ``.env``, while ``.op.env`` and every external secret source inject straight
+    into ``os.environ`` from the same profile. A host passing only the private key while the profile's
+    ``.op.env`` or vault mapping supplies ``BUZZ_AUTH_TAG`` produces exactly the split identity this whole
+    path exists to prevent. ``buzz_before_load`` is the pre-load baseline, taken by
+    :func:`load_hermes_dotenv` before anything in the load runs, and diffing against it covers all four
+    supply routes in one rule while keeping the runtime carve-out: a ``BUZZ_RELAY_URL`` set before the
+    load is not the profile completing an identity, so it survives.
 
     Logs key names, never values, once per process."""
     global _ACP_RESTORE_LOGGED
@@ -201,12 +217,13 @@ def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
     if _host_owns_buzz_identity():
         dropped = sorted(
             k for k in os.environ
-            if k.startswith(_ACP_HOST_OWNED_ENV_PREFIXES)
+            if k in _BUZZ_IDENTITY_DROP_KEYS
             and k not in snapshot
             and k not in buzz_before_load
         )
         for key in dropped:
             del os.environ[key]
+        _warn_if_host_claim_has_no_key()
 
     if (replaced or dropped) and not _ACP_RESTORE_LOGGED:
         _ACP_RESTORE_LOGGED = True
@@ -215,9 +232,28 @@ def _restore_acp_host_env(buzz_before_load: frozenset[str]) -> None:
                      f"; dropped profile-supplied Buzz keys {', '.join(dropped)}" if dropped else "")
 
 
+def _warn_if_host_claim_has_no_key() -> None:
+    """A host that supplies ``BUZZ_AUTH_TAG`` and no ``BUZZ_PRIVATE_KEY`` claims the identity and cannot
+    sign it. Failing closed is right, an attestation belongs to one key; failing SILENTLY is not. The
+    profile's key has just been deleted, and the only thing the operator sees downstream is Buzz's generic
+    "must be configured" error with nothing pointing at the cause. Once per process, names only."""
+    global _ACP_KEYLESS_CLAIM_LOGGED
+    if _ACP_KEYLESS_CLAIM_LOGGED or "BUZZ_PRIVATE_KEY" in _ACP_HOST_ENV:
+        return
+    _ACP_KEYLESS_CLAIM_LOGGED = True
+    logger.warning(
+        "acp: the ACP host claimed the Buzz identity with BUZZ_AUTH_TAG but supplied no "
+        "BUZZ_PRIVATE_KEY, so the profile's key was dropped and not replaced. Buzz sends will fail "
+        "until the host passes the signing key that owns that attestation, or you unset BUZZ_AUTH_TAG "
+        "on the host (HERMES_ACP_HOST_ENV=0 restores the profile .env precedence entirely)."
+    )
+
+
 def _buzz_env_names() -> frozenset[str]:
-    """``BUZZ_*`` names currently in ``os.environ``; the baseline :func:`_restore_acp_host_env` diffs against."""
-    return frozenset(k for k in os.environ if k.startswith(_ACP_HOST_OWNED_ENV_PREFIXES))
+    """Identity-group names currently in ``os.environ``; the baseline :func:`_restore_acp_host_env` diffs
+    against. Scoped to ``_BUZZ_IDENTITY_DROP_KEYS`` because those are the only names the restore can
+    delete, so those are the only names a baseline has to protect."""
+    return frozenset(k for k in _BUZZ_IDENTITY_DROP_KEYS if k in os.environ)
 
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
@@ -583,13 +619,18 @@ def _load_hermes_dotenv(
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
-        # Restore IMMEDIATELY, not only at the end of the load. The lock below serializes loaders, but every
-        # consumer of the identity reads os.environ directly and takes no lock: the Buzz plugin signing a
-        # kind-22242 event, _sanitize_subprocess_env building a terminal child's env, hermes_subprocess_env.
-        # Between this override=True load and the tail restore sit the project .env, the config re-parse and
-        # a possible Bitwarden/1Password network round trip, and a reader landing in that window would see
-        # the profile's key. Closing the window at its source costs one dict pass.
-        _restore_acp_host_env(buzz_before_load)
+    # Restore IMMEDIATELY, not only at the end of the load. The lock below serializes loaders, but every
+    # consumer of the identity reads os.environ directly and takes no lock: the Buzz plugin signing a
+    # kind-22242 event, _sanitize_subprocess_env building a terminal child's env, hermes_subprocess_env.
+    # Between this override=True load and the tail restore sit the project .env, the config re-parse and
+    # a possible Bitwarden/1Password network round trip, and a reader landing in that window would see
+    # the profile's key. Closing the window at its source costs one dict pass.
+    #
+    # OUTSIDE the `if user_env.exists()` block on purpose: a bare profile home with no .env is a supported
+    # shape (#66930 / #67027 semantics, see _clear_known_keys_missing_from_dotenv), and main.py always
+    # passes project_env=PROJECT_ROOT/".env", which then loads with override=not loaded, i.e. True. Gating
+    # this call on the user .env left that case with no early restore at all.
+    _restore_acp_host_env(buzz_before_load)
 
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
     # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
@@ -601,6 +642,13 @@ def _load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    # Second restore, before the vault round trip. .op.env and the project .env are two more profile
+    # sources that can put an identity member into os.environ, and _apply_external_secret_sources below is
+    # the long call in this function: a Bitwarden or 1Password fetch is a network round trip, and that is
+    # the widest window a lock-free reader can land in. Same helper, idempotent, no-op when the host
+    # supplied nothing.
+    _restore_acp_host_env(buzz_before_load)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
     # import optional secret-manager libs (Bitwarden → cryptography → _rust.pyd) into the process replacing
