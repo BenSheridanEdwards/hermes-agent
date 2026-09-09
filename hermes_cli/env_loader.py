@@ -169,13 +169,30 @@ def _is_acp_host_owned_env_key(name: str) -> bool:
     return name.startswith(_ACP_HOST_OWNED_ENV_PREFIXES) and bool(os.environ.get("BUZZ_MANAGED_AGENT"))
 
 
+def _env_provides(name: str) -> bool:
+    """THE definition of "``name`` was supplied" for the whole ACP identity rule: present in
+    ``os.environ`` AND non-blank.
+
+    One function because two of them disagreed and that disagreement was a hole. :func:`_snapshot_acp_host_env`
+    read "provided" as non-blank and :func:`_buzz_env_names` read it as ``in os.environ``, so a host exporting
+    a blank ``BUZZ_AUTH_TAG`` beside a real ``BUZZ_PRIVATE_KEY`` was simultaneously not the owner of that name
+    (kept out of the snapshot) and the reason the drop rule spared it (counted into the pre-load baseline).
+    The profile's tag then survived the load beside the managed key: the exact mismatch this whole path
+    exists to prevent, reached without a credentials file, a vault or a ``.op.env``.
+
+    Blank, not merely empty: ``"   "`` and a trailing ``"\\n"`` are the classic artifact of a harness that
+    reads a value out of a file and exports it unconditionally, and both are truthy."""
+    return bool(os.environ.get(name, "").strip())
+
+
 def _snapshot_acp_host_env() -> dict[str, str]:
     """Host-owned keys currently in ``os.environ`` with a non-blank value (empty means "not provided").
 
     Blank, not just empty: ``"   "`` and a trailing ``"\\n"`` are the classic artifact of a harness that
     reads a key out of a file, and both are truthy. Treating one as provided would pin an unusable key AND
     claim the whole Buzz group with it, deleting the profile's working identity for a value that cannot
-    sign. ``_sanitize_credential_value`` does not catch it: whitespace is ASCII.
+    sign. ``_sanitize_credential_value`` does not catch it: whitespace is ASCII. The test is
+    :func:`_env_provides`, shared with :func:`_buzz_env_names` so the two cannot drift apart again.
 
     Values are ASCII-sanitized here, not on restore: ``BUZZ_PRIVATE_KEY`` ends in ``_KEY`` and so falls
     under ``_sanitize_loaded_credentials``, and re-installing the raw host value afterwards would undo that
@@ -184,9 +201,9 @@ def _snapshot_acp_host_env() -> dict[str, str]:
     if not _ACP_HOSTED:
         return {}
     return {
-        k: _sanitize_credential_value(k, v)
-        for k, v in os.environ.items()
-        if v.strip() and _is_acp_host_owned_env_key(k)
+        k: _sanitize_credential_value(k, os.environ[k])
+        for k in list(os.environ)
+        if _env_provides(k) and _is_acp_host_owned_env_key(k)
     }
 
 
@@ -266,10 +283,17 @@ def _warn_if_host_claim_has_no_key() -> None:
 
 
 def _buzz_env_names() -> frozenset[str]:
-    """Identity-group names currently in ``os.environ``; the baseline :func:`_restore_acp_host_env` diffs
-    against. Scoped to ``_BUZZ_IDENTITY_DROP_KEYS`` because those are the only names the restore can
-    delete, so those are the only names a baseline has to protect."""
-    return frozenset(k for k in _BUZZ_IDENTITY_DROP_KEYS if k in os.environ)
+    """Identity-group names the environment PROVIDES before the load; the baseline
+    :func:`_restore_acp_host_env` diffs against. Scoped to ``_BUZZ_IDENTITY_DROP_KEYS`` because those are the
+    only names the restore can delete, so those are the only names a baseline has to protect.
+
+    "Provides" is :func:`_env_provides`, the same test :func:`_snapshot_acp_host_env` applies, and they have
+    to agree: a name in the baseline is one the drop rule will spare, and a name in the snapshot is one the
+    host owns. Reading a blank value as present here while the snapshot read it as absent meant a host
+    exporting ``BUZZ_AUTH_TAG=""`` beside a real managed key both disclaimed that name and shielded the
+    profile's replacement for it, so the ``override=True`` load handed the managed key the profile owner's
+    attestation."""
+    return frozenset(k for k in _BUZZ_IDENTITY_DROP_KEYS if _env_provides(k))
 
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
