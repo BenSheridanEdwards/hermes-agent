@@ -144,9 +144,23 @@ def _get_scoped_secret(name, default=None):
         # (#59739) and the Matrix recovery key. A *scoped* miss still returns the default (no cross-profile
         # borrow).
         val = os.getenv(name)
-    if val is None and _current_secret_scope() is None:
+    if val is None and _current_secret_scope() is None and not _acp_host_owns_identity_name(name):
         val = _unscoped_profile_secrets().get(name)
     return val if val is not None else default
+
+
+def _acp_host_owns_identity_name(name: str) -> bool:
+    """Whether the unscoped fallback below must NOT answer for ``name``.
+
+    ``_unscoped_profile_secrets`` builds its mapping with ``build_profile_secret_scope``, which reads
+    ``<home>/.env`` off disk. Under an ACP host that claimed the Buzz identity, the loader has deliberately
+    deleted the profile's copies of those names from ``os.environ``; reading them back off the same profile's
+    ``.env`` here would undo that in the one place the environment rule cannot see, and hand
+    ``build_auth_event`` the host's managed key with the profile owner's attestation. Only the identity
+    names are affected: the rest of the profile's Buzz configuration still resolves through this fallback."""
+    from hermes_cli.env_loader import acp_host_owns_buzz_identity_key
+
+    return acp_host_owns_buzz_identity_key(name)
 
 
 _UNSCOPED_PROFILE_SECRETS: Optional[Dict[str, str]] = None

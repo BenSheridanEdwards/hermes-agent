@@ -4354,6 +4354,55 @@ class TestCredentialResolution:
         assert _resolve_private_key(extra) == "nsec1fromfile"
         assert json.loads(_resolve_auth_tag(extra)) == tag
 
+    def test_acp_managed_key_never_pairs_with_the_profile_env_attestation(
+        self, monkeypatch, tmp_path
+    ):
+        """The unscoped fallback reads the profile's .env off DISK.
+
+        `_unscoped_profile_secrets` builds its mapping with
+        `build_profile_secret_scope`, which loads `<home>/.env` directly, so a
+        name missing from os.environ is answered from the file anyway. Under a
+        managed ACP host that is precisely the set of names the env loader just
+        deleted, and handing them back pairs the host's managed key with the
+        profile owner's attestation again: the same mismatch as the config.yaml
+        route, through a door no environment rule can see.
+
+        The second half is the control. Off the ACP path the fallback is a
+        feature and still answers, so this pins the guard and not the fallback."""
+        import hermes_cli.env_loader as env_loader
+
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        home = tmp_path / "profile"
+        home.mkdir()
+        (home / ".env").write_text(
+            "BUZZ_PRIVATE_KEY=profile-key\n"
+            f"BUZZ_AUTH_TAG={json.dumps(tag)}\n"
+            "BUZZ_RELAY_URL=ws://profile.example\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", None)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "managed-key")
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.setattr(env_loader, "_ACP_RESTORE_LOGGED", False)
+        env_loader.mark_acp_hosted()
+
+        assert _resolve_private_key() == "managed-key"
+        assert _resolve_auth_tag() == ""
+
+        # Control: not ACP-hosted, so the profile's own .env is exactly what the
+        # fallback is for, and the pair it returns is internally consistent.
+        monkeypatch.setattr(env_loader, "_ACP_HOSTED", False)
+        monkeypatch.setattr(env_loader, "_ACP_HOST_ENV", {})
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        assert _resolve_private_key() == "profile-key"
+        assert json.loads(_resolve_auth_tag()) == tag
+
     def test_invalid_owner_auth_tag_fails_closed(self, monkeypatch, tmp_path):
         creds = tmp_path / "agent_credentials.json"
         creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": ["bad"]}), encoding="utf-8")

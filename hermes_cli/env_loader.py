@@ -145,6 +145,22 @@ def is_acp_hosted() -> bool:
     return _ACP_HOSTED
 
 
+def acp_host_owns_buzz_identity_key(name: str) -> bool:
+    """True when ``name`` belongs to the Buzz identity AND an ACP host has claimed that identity in this
+    process, i.e. the restore has already deleted the profile's value for it from ``os.environ``.
+
+    For consumers that can reach the profile's values by some route other than ``os.environ``. The Buzz
+    plugin's unscoped fallback is one: ``build_profile_secret_scope`` re-reads ``<home>/.env`` off disk, so
+    without this it hands back the very names the restore dropped and pairs the host's managed key with the
+    profile owner's attestation again. An env-level rule cannot see a file read, so the rule has to be
+    askable."""
+    return (
+        _ACP_HOSTED
+        and name in _BUZZ_IDENTITY_DROP_KEYS
+        and _host_owns_buzz_identity()
+    )
+
+
 def _is_acp_host_owned_env_key(name: str) -> bool:
     """``name`` is host-owned in THIS process: ``HERMES_HOME`` always, ``BUZZ_*`` only for a Buzz-managed
     agent (see ``BUZZ_MANAGED_AGENT`` in the module comment above)."""
