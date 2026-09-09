@@ -371,23 +371,38 @@ identity:
 | Variable | Who wins under an ACP host | Notes |
 |----------|---------------------------|-------|
 | `HERMES_HOME` | The value the process already resolved | Protected from `.env` only. `--profile`, and the sticky profile set by `hermes profile use`, still route the process first; the value they land on is the one `.env` cannot change. |
-| `BUZZ_*` | The host, **when `BUZZ_MANAGED_AGENT` is set** | Buzz Desktop's `buzz-acp` harness sets that marker and injects the managed identity. |
+| `BUZZ_*` | The host, **when `BUZZ_MANAGED_AGENT` is set** | Buzz Desktop's `buzz-acp` harness sets that marker and injects the managed identity. The host wins on every `BUZZ_*` name it passes; only the identity group is dropped from the profile when the host claims it. |
 
 Everything else, `OPENAI_API_KEY` and the other provider credentials included,
 keeps the normal rule: `.env` wins.
 
-The `BUZZ_*` variables are treated as **one credential, not three**.
+The Buzz **identity** is treated as **one credential, not three**.
 `BUZZ_AUTH_TAG` is an owner attestation bound to the key in `BUZZ_PRIVATE_KEY`,
 and `BUZZ_RELAY_URL` is carried in the same signed auth event. So when a managed
 host supplies `BUZZ_PRIVATE_KEY` or `BUZZ_AUTH_TAG`, the profile may not supply
-the others: its `BUZZ_*` values are dropped rather than merged, since an agent
+the others: those three names, plus `BUZZ_CREDENTIALS_FILE` (a credentials record
+is itself a key and attestation), are dropped rather than merged, since an agent
 that signs with one identity and presents another fails relay verification. That
 covers every route the profile has into the environment (`.env`, the project
 `.env`, `.op.env` and external secret sources), not just the `.env` file.
 
-`BUZZ_RELAY_URL` is a member of that group but does not by itself claim it: it
-is a non-secret endpoint, so a host passing only a relay URL leaves the
+The rest of the `BUZZ_*` namespace is **plugin configuration, not identity**, and
+is left alone. `BUZZ_CHANNELS`, `BUZZ_HOME_CHANNEL`, `BUZZ_ALLOWED_USERS`,
+`BUZZ_CLI_PATH` and `BUZZ_POLL_INTERVAL` are written into the profile's `.env` by
+`hermes setup`, and a managed agent that lost them would sign correctly and still
+be unable to send or watch anything. The host still *wins* on any of them it
+passes; it just does not delete the ones it did not.
+
+`BUZZ_RELAY_URL` is a member of the identity group but does not by itself claim
+it: it is a non-secret endpoint, so a host passing only a relay URL leaves the
 profile's own key and tag in place rather than deleting them.
+
+`BUZZ_AUTH_TAG` is not symmetric with that. It **does** claim the group, so a
+host that supplies an attestation and no `BUZZ_PRIVATE_KEY` drops the profile's
+key and supplies no replacement, and Buzz sends then fail with a generic
+"must be configured" error. Hermes logs a warning naming that case at load time.
+Pass the signing key that owns the attestation, unset `BUZZ_AUTH_TAG` on the
+host, or set `HERMES_ACP_HOST_ENV=0` to hand precedence back to the profile.
 
 Without `BUZZ_MANAGED_AGENT` the host is a plain editor (Zed, VS Code) and
 nothing changes: the shell-export flow documented above for `buzz-acp` keeps

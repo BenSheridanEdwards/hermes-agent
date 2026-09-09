@@ -594,7 +594,11 @@ def _argv_selects_acp(argv: list[str] | None = None) -> bool:
     """
     tokens = sys.argv[1:] if argv is None else argv
     if "acp" not in tokens:
-        return False  # fast reject: the common CLI path never builds the parser for this check
+        # Fast reject. It saves an lru_cache lookup and the import below, NOT the parser build:
+        # ``_apply_profile_override()`` above calls ``_scan_profile_flag``, which already called
+        # ``top_level_value_flag_sets()`` at import scope on every invocation, so by the time the gate
+        # runs the parser exists and this call would be a cache hit.
+        return False
     from hermes_cli._parser import top_level_value_flag_sets
 
     required_value_flags, optional_value_flags = top_level_value_flag_sets()
