@@ -120,6 +120,10 @@ class _ScriptedWebSocket(_FakeWebSocket):
         super().__init__()
         self._anext_behavior = anext_behavior
         self.exited = False
+        self.pings = 0
+        # None: no ping() at all (older test shape). Otherwise a coroutine
+        # factory whose result stands in for the pong future.
+        self.ping_behavior = None
 
     async def __aenter__(self):
         return self
@@ -132,6 +136,66 @@ class _ScriptedWebSocket(_FakeWebSocket):
 
     async def __anext__(self):
         return await self._anext_behavior()
+
+    def ping(self):
+        self.pings += 1
+        if self.ping_behavior is None:
+            raise AttributeError("ping")
+        return self.ping_behavior()
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_keeps_an_idle_connection_whose_pong_returns(monkeypatch, caplog):
+    """A quiet channel is not a dead relay.
+
+    The library keepalive exchanges pings and pongs as control frames, which
+    the read loop never sees, so on a channel with no traffic the idle bound
+    fired every _WS_READ_IDLE_TIMEOUT and every idle gateway reconnected on
+    a five minute cycle. On the idle bound the loop now probes with a ping
+    and keeps the connection when the pong returns; only a failed probe is
+    treated as silence.
+    """
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    caplog.set_level(logging.WARNING)
+
+    sockets = []
+
+    async def idle_anext():
+        await asyncio.Event().wait()  # a quiet channel: no data frames
+
+    async def pong():
+        return None  # the relay answers the probe
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(idle_anext)
+        ws.ping_behavior = pong
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        # Several idle bounds pass; each must be answered by a probe, not a reconnect.
+        await asyncio.sleep(0.4)
+        # Observed while the loop is still running: teardown below closes it.
+        still_open = bool(sockets) and not sockets[0].exited
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    assert not any("went silent" in record.message for record in caplog.records), "a healthy idle connection was declared silent"
+    assert sockets[0].pings >= 3, "the idle bound must probe the connection, not merely wait"
+    assert len(sockets) == 1, f"a healthy idle connection was reconnected {len(sockets) - 1} time(s)"
+    assert still_open, "the healthy connection was closed while the loop ran"
 
 
 @pytest.mark.asyncio
