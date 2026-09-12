@@ -294,6 +294,8 @@ _WS_AUTH_TIMEOUT = 20.0
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
 # leaves the gateway "connected" while inbound stops; this timeout forces the normal reconnect path instead.
 _WS_READ_IDLE_TIMEOUT = 300.0
+# How long an idle-bound ping may take to be answered before the transport is treated as dead.
+_WS_PROBE_TIMEOUT = 10.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -1859,7 +1861,15 @@ class BuzzAdapter(BasePlatformAdapter):
                 backoff = min(backoff * 2, 30.0)
 
     async def _ws_read_loop(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
-        """Read frames until the relay closes; an idle read raises ConnectionError to reconnect."""
+        """Read frames until the relay closes; a silent transport raises ConnectionError to reconnect.
+
+        The idle bound only says no *data* frame arrived, which is normal on a quiet
+        channel: the library keepalive exchanges pings and pongs as control frames the
+        iterator never yields. Treating that as silence reconnected every idle gateway on
+        a five minute cycle. So the bound is a prompt to probe, not a verdict: a ping the
+        relay answers keeps the connection; only an unanswered one is the dead transport
+        this guard exists for (#98097).
+        """
         frame_iter = websocket.__aiter__()
         while True:
             try:
@@ -1867,6 +1877,8 @@ class BuzzAdapter(BasePlatformAdapter):
             except StopAsyncIteration:
                 return
             except asyncio.TimeoutError:
+                if await self._ws_transport_alive(websocket):
+                    continue
                 raise ConnectionError(f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; assuming the connection went silent") from None
             try:
                 message = json.loads(raw)
@@ -1875,6 +1887,21 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             if isinstance(message, list) and message:
                 await self._handle_ws_message(websocket, subscriptions, message)
+
+    async def _ws_transport_alive(self, websocket) -> bool:
+        """Probe an idle transport with a ping; ``True`` when the relay answers in time.
+
+        Any failure to send or to hear back, including a transport without ``ping``,
+        reads as dead: the caller reconnects, which is the pre-probe behaviour.
+        """
+        try:
+            pong = websocket.ping()
+            await asyncio.wait_for(pong, timeout=_WS_PROBE_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return True
 
     async def _handle_ws_message(self, websocket, subscriptions: Dict[str, Optional[str]], message: list) -> None:
         """Route one parsed relay frame (EVENT / CLOSED / NOTICE)."""
