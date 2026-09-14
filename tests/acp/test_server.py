@@ -754,7 +754,7 @@ class TestProcessNotificationDrain:
         }
         pr.completion_queue.put(dict(completion))
 
-        text, claims = agent._drain_ready_process_notifications()
+        text, claims = agent._drain_ready_process_notifications("sess-self")
 
         assert "deleg-acp-1" in text
         assert "Access integration wired" in text
@@ -764,7 +764,7 @@ class TestProcessNotificationDrain:
         # prompt() marks delivered once the turn commits; a replay must then be a no-op.
         assert ad.mark_completion_delivered("deleg-acp-1") is True
         pr.completion_queue.put(dict(completion))
-        text2, claims2 = agent._drain_ready_process_notifications()
+        text2, claims2 = agent._drain_ready_process_notifications("sess-self")
         assert text2 == "", "a delivered completion must not surface again"
         assert claims2 == []
 
@@ -777,8 +777,42 @@ class TestProcessNotificationDrain:
         self._clear(pr)
         pr.completion_queue.put("not-a-dict")
 
-        text, claims = agent._drain_ready_process_notifications()
+        text, claims = agent._drain_ready_process_notifications("sess-self")
 
         assert text == ""
         assert claims == []
         assert pr.completion_queue.get_nowait() == "not-a-dict", "unknown items must not be dropped"
+
+    @pytest.mark.asyncio
+    async def test_drain_routes_result_to_its_own_threads_turn(self, agent, tmp_path, monkeypatch):
+        """A finished result is held for the turn of the session it was dispatched
+        from (the harness runs a delivery turn there, so the report lands in the
+        asker's thread); it never drains into some other live session's turn."""
+        from tools.process_registry import process_registry as pr
+        import tools.async_delegation as ad
+
+        monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+        # "sess-other" is live in this process; anything else is unknown.
+        monkeypatch.setattr(agent.session_manager, "get_session", lambda sid: object() if sid == "sess-other" else None)
+        self._clear(pr)
+        for_other = {"type": "async_delegation", "delegation_id": "d-other", "session_key": "sess-other",
+                     "status": "completed", "summary": "belongs to the other thread"}
+        for_self = {"type": "async_delegation", "delegation_id": "d-self", "session_key": "sess-self",
+                    "status": "completed", "summary": "belongs to this thread"}
+        pr.completion_queue.put(dict(for_other))
+        pr.completion_queue.put(dict(for_self))
+
+        text, claims = agent._drain_ready_process_notifications("sess-self")
+
+        assert "belongs to this thread" in text
+        assert "belongs to the other thread" not in text, "another live thread's result must wait for its own turn"
+        assert text.startswith("[BACKGROUND WORK FINISHED — REPORT IT]"), "the result must be framed as something to report"
+        assert [c[0] for c in claims] == ["d-self"]
+        # The other thread's result is still queued for its own delivery turn.
+        assert pr.completion_queue.get_nowait()["delegation_id"] == "d-other"
+
+        # On the other thread's own turn it drains normally.
+        pr.completion_queue.put(dict(for_other))
+        text2, claims2 = agent._drain_ready_process_notifications("sess-other")
+        assert "belongs to the other thread" in text2
+        assert [c[0] for c in claims2] == ["d-other"]
