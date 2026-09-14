@@ -109,10 +109,25 @@ def refresh_background_work_marker() -> None:
                 """SELECT COUNT(*) FROM async_delegations
                    WHERE state IN ('running','finalizing') OR delivery_state='pending'"""
             ).fetchone()[0]
+            # Finished results still awaiting delivery, with the session each was
+            # dispatched from: the harness uses these to run the delivery turn in
+            # the originating thread, so the report lands where the asker is.
+            pending = conn.execute(
+                """SELECT delegation_id, origin_session FROM async_delegations
+                   WHERE delivery_state='pending' AND state NOT IN ('running','finalizing')
+                   ORDER BY updated_at"""
+            ).fetchall()
         path = _background_work_marker_path()
         if outstanding > 0:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"{os.getpid()} {int(time.time())}\n")
+            path.write_text(json.dumps({
+                "pid": os.getpid(),
+                "ts": int(time.time()),
+                "pending": [
+                    {"delegation_id": delegation_id, "origin_session": origin_session or ""}
+                    for delegation_id, origin_session in pending
+                ],
+            }) + "\n")
         else:
             path.unlink(missing_ok=True)
     except Exception:

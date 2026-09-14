@@ -698,7 +698,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
         return user_text, user_content
 
-    def _drain_ready_process_notifications(self) -> tuple[str, list[tuple[str, str]]]:
+    def _drain_ready_process_notifications(self, session_id: str) -> tuple[str, list[tuple[str, str]]]:
         """Drain finished background-process and async-delegation completions from the
         shared registry queue, formatted for injection into the current turn.
 
@@ -734,6 +734,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             is_async = evt.get("type") == "async_delegation"
             claim_id: str | None = None
             if is_async:
+                # Route a finished result to the turn of the thread it was
+                # dispatched from. If that session is still live here, hold the
+                # result for its own turn (the harness runs a delivery turn there,
+                # so the report lands where the asker is); only a result whose
+                # origin is gone drains into whatever turn comes next.
+                origin = str(evt.get("session_key") or "")
+                if origin and origin != session_id and self.session_manager.get_session(origin) is not None:
+                    requeue.append(evt)
+                    continue
                 claim_id = claim_event_delivery(evt, "acp")
                 if claim_id is None:
                     # Claimed/delivered elsewhere (or already delivered on a prior turn
@@ -761,7 +770,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 queue.put(evt)
             except Exception:
                 pass
-        return ("\n\n".join(messages), claims)
+        if not messages:
+            return ("", claims)
+        # The harness runs this turn in the originating thread; the header makes
+        # the result an event to report, overriding a heartbeat's "stay silent".
+        header = (
+            "[BACKGROUND WORK FINISHED — REPORT IT]\n"
+            "A background task you dispatched earlier has finished; its result is below. "
+            "The person who asked is waiting on it. Report the outcome now, in this thread, "
+            "even if the rest of this turn says to stay silent: what finished, the result, "
+            "and what happens next. Keep it short."
+        )
+        return (header + "\n\n" + "\n\n".join(messages), claims)
 
     def _claim_turn_or_queue(
         self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
@@ -911,7 +931,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # on this turn. The ACP model has no idle watcher, so this drain is where
             # completions reach the agent — including on the periodic heartbeat turn,
             # which is what lets a delegated worker's result come back at all.
-            injected_text, delegation_claims = self._drain_ready_process_notifications()
+            injected_text, delegation_claims = self._drain_ready_process_notifications(session_id)
             if injected_text:
                 user_text = f"{injected_text}\n\n{user_text}".strip() if user_text else injected_text
                 if isinstance(user_content, str):
