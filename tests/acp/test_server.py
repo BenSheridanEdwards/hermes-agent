@@ -726,3 +726,59 @@ class TestRegisterSessionMcpServers:
         with patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=RuntimeError("boom")):
             # Should not raise
             await agent._register_session_mcp_servers(state, [server])
+
+
+class TestProcessNotificationDrain:
+    """The ACP turn model has no idle watcher (unlike the Telegram/CLI gateways),
+    so finished async-delegation completions must be drained into the next turn or
+    a delegated worker's result never comes back. Covers
+    ``_drain_ready_process_notifications`` — the fix for that gap."""
+
+    @staticmethod
+    def _clear(pr):
+        while not pr.completion_queue.empty():
+            pr.completion_queue.get_nowait()
+
+    @pytest.mark.asyncio
+    async def test_drain_surfaces_and_claims_async_delegation(self, agent, tmp_path, monkeypatch):
+        import time as _t
+        from tools.process_registry import process_registry as pr
+        import tools.async_delegation as ad
+
+        monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+        self._clear(pr)
+        ad._persist_dispatch({"delegation_id": "deleg-acp-1", "dispatched_at": _t.time()})
+        completion = {
+            "type": "async_delegation", "delegation_id": "deleg-acp-1",
+            "status": "completed", "summary": "Access integration wired and tested.",
+        }
+        pr.completion_queue.put(dict(completion))
+
+        text, claims = agent._drain_ready_process_notifications()
+
+        assert "deleg-acp-1" in text
+        assert "Access integration wired" in text
+        assert [c[0] for c in claims] == ["deleg-acp-1"]
+        assert pr.completion_queue.empty(), "the completion must be drained, not left pending"
+
+        # prompt() marks delivered once the turn commits; a replay must then be a no-op.
+        assert ad.mark_completion_delivered("deleg-acp-1") is True
+        pr.completion_queue.put(dict(completion))
+        text2, claims2 = agent._drain_ready_process_notifications()
+        assert text2 == "", "a delivered completion must not surface again"
+        assert claims2 == []
+
+    @pytest.mark.asyncio
+    async def test_drain_requeues_non_dict_events(self, agent, tmp_path, monkeypatch):
+        from tools.process_registry import process_registry as pr
+        import tools.async_delegation as ad
+
+        monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+        self._clear(pr)
+        pr.completion_queue.put("not-a-dict")
+
+        text, claims = agent._drain_ready_process_notifications()
+
+        assert text == ""
+        assert claims == []
+        assert pr.completion_queue.get_nowait() == "not-a-dict", "unknown items must not be dropped"
