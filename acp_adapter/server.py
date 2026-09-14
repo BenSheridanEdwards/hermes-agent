@@ -698,6 +698,71 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
         return user_text, user_content
 
+    def _drain_ready_process_notifications(self) -> tuple[str, list[tuple[str, str]]]:
+        """Drain finished background-process and async-delegation completions from the
+        shared registry queue, formatted for injection into the current turn.
+
+        The Telegram/CLI gateways drain this queue from a background watcher; the ACP
+        turn model has no such watcher, so completions used to sit undelivered forever
+        — a delegated worker would finish and the agent would never hear back. Draining
+        here surfaces them on the next turn (including the periodic heartbeat turn), so
+        the conversation continues.
+
+        Durable async-delegation completions are claimed (cross-process safe); the caller
+        marks them delivered once the turn commits, so a crash before delivery replays
+        them rather than losing them. Returns ``(injection_text, claims)`` where ``claims``
+        is the ``(delegation_id, claim_id)`` list to acknowledge after the turn commits.
+        """
+        from tools.process_registry import process_registry
+        from tools.process_registry_notifications import format_process_notification
+        from tools.async_delegation import claim_event_delivery, defer_completion_delivery
+
+        queue = process_registry.completion_queue
+        messages: list[str] = []
+        claims: list[tuple[str, str]] = []
+        requeue: list[Any] = []
+        # Snapshot the depth so a completion enqueued *during* the drain (a worker
+        # finishing right now) waits for the next turn instead of spinning this loop.
+        for _ in range(queue.qsize()):
+            try:
+                evt = queue.get_nowait()
+            except Exception:
+                break
+            if not isinstance(evt, dict):
+                requeue.append(evt)
+                continue
+            is_async = evt.get("type") == "async_delegation"
+            claim_id: str | None = None
+            if is_async:
+                claim_id = claim_event_delivery(evt, "acp")
+                if claim_id is None:
+                    # Claimed/delivered elsewhere (or already delivered on a prior turn
+                    # and replayed on restart) — drop without requeue.
+                    continue
+            text: str | None = None
+            try:
+                text = format_process_notification(evt)
+            except Exception:
+                logger.warning("Failed to format process notification; requeuing", exc_info=True)
+            if not text:
+                if is_async and claim_id:
+                    # Claimed but unformattable — release so it is not stuck claimed.
+                    defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+                else:
+                    requeue.append(evt)
+                continue
+            messages.append(text)
+            if is_async and claim_id:
+                did = str(evt.get("delegation_id") or "")
+                if did:
+                    claims.append((did, claim_id))
+        for evt in requeue:
+            try:
+                queue.put(evt)
+            except Exception:
+                pass
+        return ("\n\n".join(messages), claims)
+
     def _claim_turn_or_queue(
         self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
         voice: bool = False,
@@ -842,9 +907,34 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         await self._send_usage_update(state)
                     return PromptResponse(stop_reason="end_turn")
 
+            # Surface finished background work (delegated workers, watched processes)
+            # on this turn. The ACP model has no idle watcher, so this drain is where
+            # completions reach the agent — including on the periodic heartbeat turn,
+            # which is what lets a delegated worker's result come back at all.
+            injected_text, delegation_claims = self._drain_ready_process_notifications()
+            if injected_text:
+                user_text = f"{injected_text}\n\n{user_text}".strip() if user_text else injected_text
+                if isinstance(user_content, str):
+                    user_content = (
+                        f"{injected_text}\n\n{user_content}".strip() if user_content else injected_text
+                    )
+                elif isinstance(user_content, list):
+                    user_content = [{"type": "text", "text": injected_text}, *user_content]
+                else:
+                    user_content = injected_text
+
             absorbed = self._claim_turn_or_queue(
                 state, session_id, user_text, user_content, text_only_prompt,
                 voice=bool(voice_turn and voice_turn.voice_reply))
+            # The completion text is now committed to a turn (running or queued), so
+            # acknowledge the durable rows. A crash before this replays them on restart.
+            if delegation_claims:
+                from tools.async_delegation import mark_completion_delivered
+                for _did, _claim in delegation_claims:
+                    try:
+                        mark_completion_delivered(_did)
+                    except Exception:
+                        logger.warning("Failed to mark delegation %s delivered", _did, exc_info=True)
             if absorbed is not None:
                 handed_on = True  # the notes are in the queued text, to be replayed
                 if self._conn:
