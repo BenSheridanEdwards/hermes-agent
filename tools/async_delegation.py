@@ -82,6 +82,43 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
+_BACKGROUND_WORK_MARKER = ".buzz-background-work"
+
+
+def _background_work_marker_path():
+    """Sibling of the ledger, so a redirected ``_db_path`` (tests) redirects this too."""
+    return _db_path().parent / _BACKGROUND_WORK_MARKER
+
+
+def refresh_background_work_marker() -> None:
+    """Advertise to a supervising harness whether this process still has background
+    work: delegations running/finalizing, or completions awaiting delivery.
+
+    buzz-acp reads this marker to (a) refuse to tear an idle-looking engine down
+    while it is set — teardown kills the engine and every worker it owns — and
+    (b) wake a torn-down pool so the pending results get drained. Present = work
+    outstanding; absent = nothing to protect. Derived from the durable ledger, so
+    it is correct across restarts, and refreshed at every ledger transition.
+    Best-effort: a failure here must never affect the delegation itself.
+
+    Must be called OUTSIDE ``_DB_LOCK`` (it takes the non-reentrant lock itself).
+    """
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            outstanding = conn.execute(
+                """SELECT COUNT(*) FROM async_delegations
+                   WHERE state IN ('running','finalizing') OR delivery_state='pending'"""
+            ).fetchone()[0]
+        path = _background_work_marker_path()
+        if outstanding > 0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{os.getpid()} {int(time.time())}\n")
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("background-work marker refresh failed", exc_info=True)
+
+
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +218,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
              json.dumps(task_payload), record.get("origin_session_id", "")))
     _prune_durable_records()
+    refresh_background_work_marker()
 
 
 def _prune_durable_records() -> None:
@@ -216,6 +254,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]))
+    refresh_background_work_marker()
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -328,6 +367,9 @@ def restore_undelivered_completions(target_queue) -> int:
                 evt["restored"] = True
             target_queue.put(evt)
             restored += 1
+    # Process start: re-sync the marker from the ledger so a supervising harness
+    # sees outstanding work (and keeps this engine alive) after a restart.
+    refresh_background_work_marker()
     return restored
 
 
@@ -340,9 +382,11 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    return _update_delivery(
+    delivered = _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+    refresh_background_work_marker()
+    return delivered
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
