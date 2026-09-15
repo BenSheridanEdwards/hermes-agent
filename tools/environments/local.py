@@ -649,11 +649,18 @@ def _kill_process_group_posix(proc) -> None:
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
     grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller)."""
+    # The wrapper can exit between the caller's poll() and this lookup (a fast
+    # rg that hit its output bound, say). Then getpgid raises — ESRCH, or on
+    # macOS EPERM for a process that is already tearing down — and neither
+    # is an error for a teardown: fall back to the recorded group, and when
+    # there is none there is nothing left to kill. Letting the OSError escape
+    # turned a successful bounded search into "[Errno 1] Operation not
+    # permitted" / "[Errno 3] No such process" for the agent.
     try:
         pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
-            raise
+            return
     try:  # psutil children snapshot; empty on any failure (must never break the kill)
         import psutil
         descendants = psutil.Process(proc.pid).children(recursive=True)
@@ -666,8 +673,8 @@ def _kill_process_group_posix(proc) -> None:
             _wait_for_group_exit(proc, pgid, 2.0)
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 proc.wait(timeout=0.2)
-    except ProcessLookupError:
-        pass
+    except (ProcessLookupError, PermissionError):
+        pass  # gone already, or a group we may not signal: the caller reaps the wrapper
     _sweep_escaped_descendants(descendants, pgid)
 
 
