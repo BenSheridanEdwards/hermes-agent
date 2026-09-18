@@ -773,6 +773,10 @@ def _profile_owns_pool_provider(provider: str) -> bool:
     Named profiles with no local rows read the provider through the
     ``read_credential_pool`` global-root fallback ("borrowing").
     """
+    from agent.credential_policy import load_policy
+    policy = load_policy()
+    if policy is not None:
+        return policy.accounts.get(provider, {}).get("store") != "root"
     try:
         pool = _load_auth_store().get("credential_pool")
     except Exception:
@@ -851,6 +855,9 @@ def persist_pool_entries(
     ``invalid_grant`` (#100339). Such rows are written back to the root store
     (under the root lock); everything else goes to the active store.
     """
+    from agent.credential_policy import persist_managed
+    if persist_managed(provider, payloads, status_cleared_ids):
+        return
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         global_path = _borrowed_single_use_pool_root()
         if global_path is not None:
@@ -1004,6 +1011,8 @@ class CredentialPool(CredentialPoolAdminMixin):
         return self._find(lambda e: e.id == self._current_id)
 
     def current(self) -> Optional[PooledCredential]:
+        from agent.credential_policy import check_pool_revision
+        check_pool_revision(self)
         with self._lock:
             return self._current_unlocked()
 
@@ -1045,6 +1054,11 @@ class CredentialPool(CredentialPoolAdminMixin):
     ) -> None:
         # Self-locking: snapshotting self._entries must not race a rotation.
         with self._lock:
+            from agent.credential_policy import persist_assignment
+            policy = getattr(self, "_credential_policy", None)
+            if policy is not None:
+                persist_assignment(policy, self.provider, [entry.to_dict() for entry in self._entries], status_cleared_ids)
+                return
             persist_pool_entries(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
@@ -1182,6 +1196,10 @@ class CredentialPool(CredentialPoolAdminMixin):
         the pool store, is token authority for those sources; a row with no
         token material at all is refused for the same reason.
         """
+        from agent.credential_policy import sync_managed_entry
+        managed = sync_managed_entry(self, entry)
+        if managed is not None:
+            return managed
         if self.provider not in ("anthropic", "xai-oauth"):
             return entry
         is_anthropic = self.provider == "anthropic"
@@ -1223,6 +1241,10 @@ class CredentialPool(CredentialPoolAdminMixin):
         disk. Only singleton-seeded entries apply — env/API-key rows have no
         auth.json shadow.
         """
+        from agent.credential_policy import sync_managed_entry
+        managed = sync_managed_entry(self, entry)
+        if managed is not None:
+            return managed
         spec = _TOKENS_SINGLETON_PROVIDERS.get(self.provider)
         if spec is None:
             return entry
@@ -1328,6 +1350,9 @@ class CredentialPool(CredentialPoolAdminMixin):
         back to root ONLY and skip the profile store so it never accrues a
         shadowing key that blocks both the fallback and the write-through.
         """
+        from agent.credential_policy import sync_managed_singleton
+        if sync_managed_singleton(self, entry):
+            return
         # Only singleton-seeded entries sync back; ``manual:*`` entries are
         # independent credentials and must not write to the singleton.
         if entry.source != "device_code" or self.provider not in ("nous", *_TOKENS_SINGLETON_PROVIDERS):
@@ -1379,6 +1404,8 @@ class CredentialPool(CredentialPoolAdminMixin):
     # ---- refresh -----------------------------------------------------------
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        from agent.credential_policy import check_pool_revision
+        check_pool_revision(self)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1393,7 +1420,9 @@ class CredentialPool(CredentialPoolAdminMixin):
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
         # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+        policy = getattr(self, "_credential_policy", None)
+        target = policy.store_path(self.provider) if policy is not None else None
+        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout(), target_path=target):
             if self.provider == "openai-codex":
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
@@ -1781,6 +1810,8 @@ class CredentialPool(CredentialPoolAdminMixin):
     # ---- selection ---------------------------------------------------------
 
     def select(self) -> Optional[PooledCredential]:
+        from agent.credential_policy import check_pool_revision
+        check_pool_revision(self)
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -1832,6 +1863,8 @@ class CredentialPool(CredentialPoolAdminMixin):
         refreshes them outside the lock instead of stalling every pool
         consumer during cross-process flock acquisition + OAuth network I/O.
         """
+        from agent.credential_policy import check_pool_revision
+        check_pool_revision(self)
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
@@ -2592,6 +2625,12 @@ _ENV_BASE_URL_RESOLVERS = {
 }
 
 
+def _assigned_or_ambient_env(name: str) -> str:
+    from agent.credential_policy import assigned_env_value
+    value = assigned_env_value(name)
+    return get_env_prefer_dotenv(name) if value is None else value
+
+
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     seed = _Seeder(provider, entries)
     # Copilot's singleton branch exchanges the raw ghu_ OAuth token for the
@@ -2602,7 +2641,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         return seed.result
 
     if provider == "openrouter":
-        token = get_env_prefer_dotenv("OPENROUTER_API_KEY")
+        token = _assigned_or_ambient_env("OPENROUTER_API_KEY")
         if token and seed.upsert(
             "env:OPENROUTER_API_KEY",
             _env_payload(env_var="OPENROUTER_API_KEY", token=token, base_url=OPENROUTER_BASE_URL),
@@ -2616,7 +2655,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+        env_url = _assigned_or_ambient_env(pconfig.base_url_env_var).rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -2624,7 +2663,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
-        token = get_env_prefer_dotenv(env_var)
+        token = _assigned_or_ambient_env(env_var)
         if not token:
             continue
         base_url = env_url or pconfig.inference_base_url
@@ -2711,6 +2750,10 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    from agent.credential_policy import load_policy, managed_pool
+    policy = load_policy()
+    if policy is not None:
+        return managed_pool(provider, policy)
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS:
         # One-time heal for installs that forked this grant across profiles
         # before the clone-strip / root write-through existed (#100339).

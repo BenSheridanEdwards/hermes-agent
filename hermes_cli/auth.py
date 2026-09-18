@@ -855,6 +855,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
 
     In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
     when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+    from agent.credential_policy import load_policy
+    policy = load_policy()
+    if policy is not None:
+        if provider_id is not None:
+            return policy.rows(provider_id)
+        return {provider: policy.rows(provider) for provider in policy.accounts}
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
     global_pool = _load_global_auth_store().get("credential_pool")

@@ -386,8 +386,16 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     env = environ if environ is not None else os.environ
     report = ApplyReport()
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
+    from agent.credential_policy import load_policy, finish_environment
+    policy = load_policy(home_path)
+    if policy is not None:
+        for name in policy.managed_environment:
+            env.pop(name, None)
     enabled = _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path))
+    if policy is not None:
+        enabled = [source for source in enabled if source.name in policy.environment.values()]
     if not enabled:
+        finish_environment(home_path, env, report, policy)
         return report
 
     preserve_raw = secrets_cfg.get("preserve_existing")
@@ -402,7 +410,12 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     protected: Dict[str, str] = {}  # var → source that protects it
     for source in ordered:
         cfg = _section(secrets_cfg, source.name)
+        if policy is not None and source.name in policy.source_bindings:
+            cfg = {**cfg, "credential_bindings": dict(policy.source_bindings[source.name])}
         result = _fetch_with_timeout(source, cfg, home_path, env)
+        if policy is not None:
+            result.secrets = {name: value for name, value in result.secrets.items()
+                              if policy.environment.get(name) == source.name}
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):
@@ -415,5 +428,6 @@ def apply_all(secrets_cfg: dict, home_path: Path,
 
     applier = _Applier(env, report, protected, preserve)
     for source, cfg, result in fetches:
-        applier.apply_source(source, cfg, result, profile, supplied_directly)
+        applier.apply_source(source, cfg, result, "" if policy else profile, supplied_directly)
+    finish_environment(home_path, env, report, policy)
     return report

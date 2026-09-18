@@ -788,6 +788,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Sanitized child env; PYTHONUNBUFFERED so tqdm/datasets-style buffering
         doesn't hide progress from process(action="poll")."""
         env = _sanitize_subprocess_env(os.environ, env_vars)
+        from agent.credential_policy import terminal_credentials
+        env.update(terminal_credentials())
         env["PYTHONUNBUFFERED"] = "1"
         return env
 

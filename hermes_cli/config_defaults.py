@@ -19,6 +19,7 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
+    "credential_policy": {"file": ""},  # Optional external assignment manifest; no token values.
     "model": "",
     "providers": {},
     "fallback_providers": [],

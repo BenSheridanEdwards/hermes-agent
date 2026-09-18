@@ -760,6 +760,8 @@ def _load_hermes_dotenv(
     # cron standalone runs) call load_hermes_dotenv() repeatedly and used to flip the effective backend back
     # to the stale .env value mid-session (#29186, #67323).
     _reapply_terminal_config_bridge(home_path)
+    from agent.credential_policy import restore_assigned_environment
+    restore_assigned_environment(home_path, os.environ)
 
     return loaded
 
