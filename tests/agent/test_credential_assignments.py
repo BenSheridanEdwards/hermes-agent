@@ -204,3 +204,17 @@ def test_reassignment_during_vault_fetch_cannot_label_old_value_as_new_assignmen
         apply_all({"fixture_vault": {"enabled": True}}, home, environ=env)
     assert "OPENROUTER_API_KEY" not in env
     assert not (home / "credential-policy-receipt.json").exists()
+
+
+def test_pre_plugin_bootstrap_preserves_evidence_and_cannot_use_ambient_github_login(assigned, monkeypatch):
+    _, profile = assigned
+    home, _, _ = profile("jarvis", {"GITHUB_TOKEN": "fixture_vault"})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    receipt = home / "credential-policy-receipt.json"
+    receipt.write_text(json.dumps({"phase": "terminal", "pid": 123, "terminal_names": ["GITHUB_TOKEN"]}))
+    from agent.secret_sources.registry import apply_all
+    apply_all({"fixture_vault": {"enabled": True}}, home, environ={})
+    assert json.loads(receipt.read_text())["pid"] == 123
+    from agent.credential_policy import terminal_credentials, CredentialPolicyError
+    with pytest.raises(CredentialPolicyError, match="not delivered"):
+        terminal_credentials()

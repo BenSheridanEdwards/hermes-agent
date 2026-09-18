@@ -148,8 +148,11 @@ def finish_environment(home: Path, environ, report, policy: CredentialPolicy | N
         if name not in applied:
             environ.pop(name, None)
     _environment_revisions[str(policy.home.resolve())] = policy.revision
-    record_receipt(policy, phase="environment", applied=applied,
-                   missing=sorted(set(policy.environment) - set(applied)))
+    # CLI imports hydrate before plugin discovery. That is not a delivery attempt
+    # and must not overwrite a running agent's successful evidence with "missing".
+    if report.sources or not policy.environment:
+        record_receipt(policy, phase="environment", applied=applied,
+                       missing=sorted(set(policy.environment) - set(applied)))
 
 
 def managed_pool(provider: str, policy: CredentialPolicy):
@@ -280,6 +283,8 @@ def terminal_credentials() -> dict[str, str]:
         raise CredentialPolicyError("Credential assignments changed; reload the agent to load terminal credentials")
     granted = {name: values[name] for name in TERMINAL_CREDENTIAL_NAMES
                if name in policy.environment and values.get(name)}
+    if TERMINAL_CREDENTIAL_NAMES.intersection(policy.environment) and not granted:
+        raise CredentialPolicyError("Assigned GitHub credential was not delivered; reload the agent or reconnect its secret source")
     # gh gives GH_TOKEN precedence. An ambient GH_TOKEN must never select another account.
     if "GITHUB_TOKEN" in granted and "GH_TOKEN" not in granted:
         granted["GH_TOKEN"] = granted["GITHUB_TOKEN"]
