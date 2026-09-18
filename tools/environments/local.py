@@ -541,8 +541,11 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
-    return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
+    result = _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
                          lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    from agent.credential_policy import terminal_credentials
+    result.update(terminal_credentials())
+    return result
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
@@ -691,6 +694,13 @@ class LocalEnvironment(BaseEnvironment):
     # Commands run on the Hermes host itself — controller-side platform behavior
     # (macOS TCC pruning, etc.) legitimately applies here.
     is_local = True
+
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        from agent.credential_policy import load_policy, TERMINAL_CREDENTIAL_NAMES
+        inherited = super()._snapshot_excluded_passthrough_names()
+        if load_policy() is not None:
+            self._snapshot_passthrough_names.update(TERMINAL_CREDENTIAL_NAMES)
+        return tuple(sorted(set(inherited) | self._snapshot_passthrough_names))
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """First-party ``BUZZ_*`` names present in the env, excluded from the shared

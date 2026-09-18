@@ -756,7 +756,11 @@ def _interactive_strategy() -> None:
     print(f"Set {provider} strategy to: {strategy}")
 
 
+from agent.credential_policy import capabilities_command
+
+
 _AUTH_ACTIONS = {
+    "policy-capabilities": capabilities_command,
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
     "logout": auth_logout_command,

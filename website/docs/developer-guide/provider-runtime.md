@@ -220,3 +220,8 @@ Fallback behavior is exercised across several suites:
 - [Agent Loop Internals](./agent-loop.md)
 - [ACP Internals](./acp-internals.md)
 - [Context Compression & Prompt Caching](./context-compression-and-caching.md)
+
+
+Profiles can opt into [external credential assignments](./credential-assignments.md).
+Managed resolution accepts only assigned source values and account references, while
+Hermes remains responsible for refresh.

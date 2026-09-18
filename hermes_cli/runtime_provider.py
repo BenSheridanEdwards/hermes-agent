@@ -827,6 +827,10 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     OpenCode Zen/Go where different models route through different API surfaces)."""
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
+    from agent.credential_policy import load_policy, resolve_managed_runtime
+    policy = load_policy()
+    if policy is not None:
+        return resolve_managed_runtime(policy, requested_provider, target_model)
     return next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
 
 

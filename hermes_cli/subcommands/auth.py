@@ -9,6 +9,7 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     """Attach the ``auth`` subcommand to ``subparsers``."""
     auth_parser = subparsers.add_parser("auth", help="Manage pooled provider credentials")
     auth_subparsers = auth_parser.add_subparsers(dest="auth_action")
+    auth_subparsers.add_parser("policy-capabilities", help="Print the supported credential assignment contract")
     auth_add = auth_subparsers.add_parser("add", help="Add a pooled credential")
     auth_add.add_argument(
         "provider", help="Provider id (for example: anthropic, openai-codex, openrouter)")
