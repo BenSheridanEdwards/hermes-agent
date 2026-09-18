@@ -54,7 +54,7 @@ class CredentialPolicy:
         if path is None:
             return []
         try:
-            store = json.loads(path.read_text())
+            store = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return []
         except (OSError, ValueError) as exc:
@@ -73,7 +73,7 @@ def load_policy(home: Path | None = None) -> CredentialPolicy | None:
     home = Path(home or get_hermes_home())
     config_path = home / "config.yaml"
     try:
-        config = yaml.safe_load(config_path.read_text()) or {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         return None
     except (OSError, yaml.YAMLError) as exc:
@@ -116,7 +116,7 @@ def record_receipt(policy: CredentialPolicy, **fields) -> None:
     target = policy.home / "credential-policy-receipt.json"
     previous = {}
     try:
-        candidate = json.loads(target.read_text())
+        candidate = json.loads(target.read_text(encoding="utf-8"))
         if candidate.get("revision") == policy.revision and candidate.get("pid") == os.getpid():
             previous = candidate
     except (OSError, ValueError):
@@ -126,7 +126,7 @@ def record_receipt(policy: CredentialPolicy, **fields) -> None:
     temporary = None
     try:
         fd, temporary = tempfile.mkstemp(dir=policy.home, prefix=".credential-receipt-")
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(receipt, stream)
         os.replace(temporary, target)
     except OSError:
