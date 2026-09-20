@@ -861,3 +861,141 @@ async def test_completion_ack_waits_for_finished_turn_and_retries_interrupt(agen
     assert ad.get_durable_delegation("result")["delivery_state"] == ("pending" if interrupted else "delivered")
     if interrupted:
         assert pr.completion_queue.get_nowait()["delegation_id"] == "result"
+
+
+@pytest.mark.asyncio
+async def test_failed_completion_delivery_exhausts_retry_budget(agent, tmp_path, monkeypatch):
+    import time
+    from tools.process_registry import process_registry as pr
+    import tools.async_delegation as ad
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model, state.agent.provider = "test-model", "openrouter"
+    ad._persist_dispatch({"delegation_id": "failed", "dispatched_at": time.time(), "session_key": sid})
+    event = {"type": "async_delegation", "delegation_id": "failed", "session_key": sid,
+             "status": "completed", "summary": "worker output", "completed_at": time.time()}
+    ad._persist_completion(event, {})
+    pr.completion_queue.put(event)
+    state.agent.run_conversation = lambda **kw: {"messages": [], "final_response": "Error: unavailable"}
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="continue")], session_id=sid)
+        assert ad.get_durable_delegation("failed")["delivery_attempts"] == attempt + 1
+    assert ad.get_durable_delegation("failed")["delivery_state"] == "dropped"
+    assert pr.completion_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_completion_settles_before_queued_followup(agent, tmp_path, monkeypatch):
+    import time
+    from acp_adapter.session import QueuedPrompt
+    from tools.process_registry import process_registry as pr
+    import tools.async_delegation as ad
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model, state.agent.provider = "test-model", "openrouter"
+    ad._persist_dispatch({"delegation_id": "queued", "dispatched_at": time.time(), "session_key": sid})
+    event = {"type": "async_delegation", "delegation_id": "queued", "session_key": sid,
+             "status": "completed", "summary": "worker output", "completed_at": time.time()}
+    ad._persist_completion(event, {})
+    pr.completion_queue.put(event)
+    state.queued_prompts.append(QueuedPrompt("unrelated followup"))
+    calls = []
+    def run(**kw):
+        calls.append(kw["user_message"])
+        if len(calls) == 2:
+            assert ad.get_durable_delegation("queued")["delivery_state"] == "delivered"
+        return {"messages": [{"role": "assistant", "content": "done"}], "final_response": "done"}
+    state.agent.run_conversation = run
+    await agent.prompt(prompt=[TextContentBlock(type="text", text="continue")], session_id=sid)
+    assert len(calls) == 2
+
+
+def test_long_delivery_lease_renewal_rejects_competing_and_lost_claims(tmp_path, monkeypatch):
+    import tools.async_delegation as ad
+    clock = [1000.0]
+    monkeypatch.setattr(ad, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    ad._persist_dispatch({"delegation_id": "lease", "dispatched_at": clock[0], "session_key": "s"})
+    assert ad.claim_completion_delivery("lease", "owner")
+    clock[0] += 240
+    assert ad.renew_completion_delivery("lease", "owner")
+    clock[0] += 120
+    assert not ad.claim_completion_delivery("lease", "competitor")
+    clock[0] += 301
+    assert ad.claim_completion_delivery("lease", "competitor")
+    assert not ad.renew_completion_delivery("lease", "owner")
+    assert not ad.complete_completion_delivery("lease", "owner")
+    assert ad.get_durable_delegation("lease")["delivery_state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_delivery_cancellation_keeps_claim_until_executor_stops(agent, tmp_path, monkeypatch):
+    import threading
+    import time
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry as pr
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model, state.agent.provider = "test-model", "openrouter"
+    ad._persist_dispatch({"delegation_id": "cancel", "dispatched_at": time.time(), "session_key": sid})
+    event = {"type": "async_delegation", "delegation_id": "cancel", "session_key": sid,
+             "status": "completed", "summary": "worker output", "completed_at": time.time()}
+    ad._persist_completion(event, {})
+    pr.completion_queue.put(event)
+    loop = asyncio.get_running_loop()
+    started, interrupted = asyncio.Event(), asyncio.Event()
+    stop = threading.Event()
+    def run(**kw):
+        loop.call_soon_threadsafe(started.set)
+        assert stop.wait(5)
+        return {"messages": [], "interrupted": True}
+    state.agent.run_conversation = run
+    monkeypatch.setattr("acp_adapter.server.request_hard_interrupt", lambda _: interrupted.set())
+    task = asyncio.create_task(agent.prompt(prompt=[TextContentBlock(type="text", text="continue")], session_id=sid))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.wait_for(interrupted.wait(), 5)
+        assert not task.done()
+        assert not ad.claim_completion_delivery("cancel", "competitor")
+        task.cancel()
+        # Let the repeated cancellation reach the shield while the executor
+        # remains held at the explicit stop event.
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert state.is_running
+        assert not ad.claim_completion_delivery("cancel", "second-competitor")
+    finally:
+        stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not state.is_running
+    assert ad.get_durable_delegation("cancel")["delivery_state"] == "pending"
+    assert pr.completion_queue.get_nowait()["delegation_id"] == "cancel"
+
+
+@pytest.mark.asyncio
+async def test_claim_renewal_stops_consumer_when_ownership_is_lost(agent, tmp_path, monkeypatch):
+    import time
+    import tools.async_delegation as ad
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    monkeypatch.setattr("acp_adapter.server._COMPLETION_CLAIM_RENEW_SECONDS", 0)
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    ad._persist_dispatch({"delegation_id": "stolen", "dispatched_at": time.time(), "session_key": sid})
+    assert ad.claim_completion_delivery("stolen", "other-owner")
+    interrupted = MagicMock()
+    monkeypatch.setattr("acp_adapter.server.request_hard_interrupt", interrupted)
+    await agent._renew_process_notification_claims([("stolen", "old-owner")], state)
+    assert state.cancel_event.is_set()
+    interrupted.assert_called_once_with(state.agent)
+    assert not ad.complete_completion_delivery("stolen", "old-owner")

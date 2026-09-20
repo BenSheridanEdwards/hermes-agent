@@ -420,6 +420,14 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def renew_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Keep an admitted long-running consumer's claim from being stolen."""
+    now = time.time()
+    return _update_delivery("""UPDATE async_delegations SET delivery_claimed_at=?, updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+        (now, now, delegation_id, claim_id))
+
+
 def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
     """An early per-task notice for a batch that is still running. It shares the batch's
     ``delegation_id`` but is NOT the durable completion: it must never claim, acknowledge or
