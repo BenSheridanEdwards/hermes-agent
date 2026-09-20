@@ -14,8 +14,6 @@ from pathlib import Path
 import re
 import tempfile
 
-import yaml
-
 from hermes_constants import get_hermes_home
 
 
@@ -71,13 +69,18 @@ class CredentialPolicy:
 
 def load_policy(home: Path | None = None) -> CredentialPolicy | None:
     home = Path(home or get_hermes_home())
-    config_path = home / "config.yaml"
+    from hermes_cli.config import load_config
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    token = set_hermes_home_override(home)
     try:
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        return None
-    except (OSError, yaml.YAMLError) as exc:
+        # Enforcement must not recover malformed config with defaults or stale
+        # state, which could silently drop an assignment and use ambient tokens.
+        config = load_config(strict=True)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
         raise CredentialPolicyError("Cannot read credential policy configuration") from exc
+    finally:
+        reset_hermes_home_override(token)
     setting = config.get("credential_policy")
     if not setting or setting == {"file": ""}:
         return None
