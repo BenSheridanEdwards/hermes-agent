@@ -1,0 +1,11 @@
+{
+  "hermes_cli/auth.py": "459e8155145992402f9f326bd57a001d5b30e825856304d8e8099fc316f2354d",
+  "agent/credential_pool.py": "e5274123a5cc1620e9d3c5ca1c6f5cd48330c5cc95d4d40ad430b277e0d17b62",
+  "hermes_cli/config_defaults.py": "8ef11ae75964a7c2606e22e302979c0c54307bcdc6e2b22e5b2c7ee2c80ef969",
+  "tests/agent/test_shared_codex_authority.py": "9c23c579f7fdeb1277753a1b11cff7f9d5a7415c19e1b4176c9a8a1556d59703",
+  "tests/agent/test_shared_codex_readers.py": "49b334f0416e055e421fa836642a4c1b80b24b83cd321f266c1f653f30bc7ccc",
+  "tests/agent/test_credential_pool_anthropic_refresh_race.py": "e027f73a45ddb0ecf32226afa1905e397ac2b27d870073006b74a0bb3cd53606",
+  ".github/workflows/ci.yaml": "0fd699d4629493b3d6b39af22c7531ee7d894f61912d3df8176d58dc0068582d",
+  ".github/workflows/label-rerun.yml": "f4ba9e6fc7cc766f04edae18636d4bef707d27f634e816ead5c1a98376084c7b",
+  "tests/scripts/test_ci_runtime_gates.py": "e8b536ccabafde7ff02c0625695efb18dad65212d063f042351cc672d868e63c"
+}

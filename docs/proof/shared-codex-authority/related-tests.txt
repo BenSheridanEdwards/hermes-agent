@@ -1,0 +1,89 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 64 test files (~678 tests) under ['tests/agent/test_account_usage.py', 'tests/agent/test_codex_app_server_event_bridge.py', 'tests/agent/test_codex_app_server_persist.py', 'tests/agent/test_codex_aux_no_progress_timeout.py', 'tests/agent/test_codex_cloudflare_headers.py', 'tests/agent/test_codex_gpt55_autoraise_notice.py', 'tests/agent/test_codex_happy_eyeballs.py', 'tests/agent/test_codex_model_entitlement.py', 'tests/agent/test_codex_request_transport_diagnostics.py', 'tests/agent/test_codex_responses_adapter.py', 'tests/agent/test_codex_responses_settle_pending_tool_calls.py', 'tests/agent/test_codex_runtime_live_events.py', 'tests/agent/test_codex_ttfb_watchdog.py', 'tests/agent/test_codex_usage_attribution.py', 'tests/agent/test_credential_pool.py', 'tests/agent/test_credential_pool_anthropic_refresh_race.py', 'tests/agent/test_credential_pool_deferred_refresh.py', 'tests/agent/test_credential_pool_key_rotation.py', 'tests/agent/test_credential_pool_lease_refresh_reselect.py', 'tests/agent/test_credential_pool_no_entries_log_throttle.py', 'tests/agent/test_credential_pool_oat_authtype.py', 'tests/agent/test_credential_pool_oauth_writethrough.py', 'tests/agent/test_credential_pool_provider_boundary.py', 'tests/agent/test_credential_pool_quarantine_locking.py', 'tests/agent/test_credential_pool_routing.py', 'tests/agent/test_credential_pool_sole_cooldown.py', 'tests/agent/test_credential_pool_unmatched_rotation_bound.py', 'tests/agent/test_shared_codex_authority.py', 'tests/agent/test_shared_codex_readers.py', 'tests/agent/transports/test_codex_app_server_runtime.py', 'tests/agent/transports/test_codex_app_server_session.py', 'tests/agent/transports/test_codex_event_projector.py', 'tests/agent/transports/test_codex_transport.py', 'tests/agent/transports/test_meta_codex_cache.py', 'tests/agent/transports/test_router_codex_efforts.py', 'tests/cli/test_cli_codex_context_reference.py', 'tests/cron/test_codex_execution_paths.py', 'tests/gateway/test_codex_hygiene_compaction.py', 'tests/gateway/test_session_model_override_credential_pool.py', 'tests/hermes_cli/test_auth_codex_oauth_ownership.py', 'tests/hermes_cli/test_auth_codex_provider.py', 'tests/hermes_cli/test_auth_codex_quota_probe.py', 'tests/hermes_cli/test_auth_codex_self_heal.py', 'tests/hermes_cli/test_codex_cli_model_picker.py', 'tests/hermes_cli/test_codex_models.py', 'tests/hermes_cli/test_codex_runtime_plugin_migration.py', 'tests/hermes_cli/test_codex_runtime_switch.py', 'tests/hermes_cli/test_openai_codex_model_validation_fallback.py', 'tests/plugins/image_gen/test_openai_codex_provider.py', 'tests/run_agent/test_63425_credential_pool_auto_detect.py', 'tests/run_agent/test_codex_app_server_compaction.py', 'tests/run_agent/test_codex_app_server_integration.py', 'tests/run_agent/test_codex_app_server_lifecycle.py', 'tests/run_agent/test_codex_multimodal_tool_result.py', 'tests/run_agent/test_codex_no_tools_nonetype.py', 'tests/run_agent/test_codex_sdk_transform_bypass.py', 'tests/run_agent/test_codex_silent_hang_hint.py', 'tests/run_agent/test_codex_xai_oauth_recovery.py', 'tests/run_agent/test_credential_pool_interrupt.py', 'tests/run_agent/test_run_agent_codex_responses.py', 'tests/test_account_usage.py', 'tests/tools/test_credential_pool_env_fallback.py', 'tests/tools/test_voice_credential_pool_resolution.py', 'tests/tui_gateway/test_codex_app_server_live_events.py']; running with -j 4
+[  0.6% |     4/~678 | ✓4 | ✗0] ✓ tests/agent/test_account_usage.py (4✓, 0.4s)
+[  3.2% |    22/~678 | ✓22 | ✗ 0] ✓ tests/agent/test_codex_app_server_event_bridge.py (18✓, 0.6s)
+[  4.1% |    28/~678 | ✓28 | ✗ 0] ✓ tests/agent/test_codex_app_server_persist.py (6✓, 1.4s)
+[  4.6% |    31/~678 | ✓31 | ✗ 0] ✓ tests/agent/test_codex_happy_eyeballs.py (3✓, 0.8s)
+[  5.6% |    38/~678 | ✓38 | ✗ 0] ✓ tests/agent/test_codex_cloudflare_headers.py (7✓, 2.1s)
+[  6.2% |    42/~678 | ✓42 | ✗ 0] ✓ tests/agent/test_codex_gpt55_autoraise_notice.py (4✓, 2.0s)
+[  8.0% |    54/~678 | ✓56 | ✗ 0] ✓ tests/agent/test_codex_model_entitlement.py (14✓, 0.8s)
+[  9.1% |    62/~678 | ✓64 | ✗ 0] ✓ tests/agent/test_codex_aux_no_progress_timeout.py (8✓, 3.0s)
+[  9.4% |    64/~678 | ✓66 | ✗ 0] ✓ tests/agent/test_codex_request_transport_diagnostics.py (2✓, 0.5s)
+[ 13.3% |    90/~678 | ✓92 | ✗ 0] ✓ tests/agent/test_codex_responses_adapter.py (26✓, 0.6s)
+[ 14.5% |    98/~678 | ✓100 | ✗  0] ✓ tests/agent/test_codex_responses_settle_pending_tool_calls.py (8✓, 0.4s)
+[ 14.7% |   100/~678 | ✓102 | ✗  0] ✓ tests/agent/test_codex_runtime_live_events.py (2✓, 0.3s)
+[ 15.2% |   103/~678 | ✓105 | ✗  0] ✓ tests/agent/test_credential_pool_anthropic_refresh_race.py (3✓, 0.6s)
+[ 15.5% |   105/~678 | ✓107 | ✗  0] ✓ tests/agent/test_credential_pool_deferred_refresh.py (2✓, 0.6s)
+[ 15.8% |   107/~678 | ✓109 | ✗  0] ✓ tests/agent/test_credential_pool_key_rotation.py (2✓, 0.3s)
+[ 16.2% |   110/~678 | ✓112 | ✗  0] ✓ tests/agent/test_credential_pool_lease_refresh_reselect.py (3✓, 0.3s)
+[ 16.7% |   113/~678 | ✓115 | ✗  0] ✓ tests/agent/test_credential_pool_no_entries_log_throttle.py (3✓, 0.3s)
+[ 17.0% |   115/~678 | ✓117 | ✗  0] ✓ tests/agent/test_credential_pool_oat_authtype.py (2✓, 0.3s)
+[ 17.7% |   120/~678 | ✓122 | ✗  0] ✓ tests/agent/test_credential_pool_oauth_writethrough.py (5✓, 0.4s)
+[ 18.7% |   127/~678 | ✓147 | ✗  0] ✓ tests/agent/test_codex_usage_attribution.py (25✓, 3.7s)
+[ 19.2% |   130/~678 | ✓150 | ✗  0] ✓ tests/agent/test_credential_pool_quarantine_locking.py (3✓, 0.5s)
+[ 20.2% |   137/~678 | ✓157 | ✗  0] ✓ tests/agent/test_credential_pool_provider_boundary.py (7✓, 1.4s)
+[ 21.8% |   148/~678 | ✓168 | ✗  0] ✓ tests/agent/test_credential_pool_sole_cooldown.py (11✓, 0.4s)
+[ 22.1% |   150/~678 | ✓170 | ✗  0] ✓ tests/agent/test_credential_pool_unmatched_rotation_bound.py (2✓, 0.3s)
+[ 24.6% |   167/~678 | ✓187 | ✗  0] ✓ tests/agent/test_credential_pool_routing.py (17✓, 1.1s)
+[ 26.4% |   179/~678 | ✓203 | ✗  0] ✓ tests/agent/test_shared_codex_readers.py (16✓, 0.5s)
+[ 29.4% |   199/~678 | ✓231 | ✗  0] ✓ tests/agent/test_shared_codex_authority.py (28✓, 1.0s)
+[ 36.0% |   244/~678 | ✓290 | ✗  0] ✓ tests/agent/test_credential_pool.py (59✓, 6.1s)
+[ 37.8% |   256/~678 | ✓313 | ✗  0] ✓ tests/agent/transports/test_codex_app_server_runtime.py (23✓, 0.6s)
+[ 40.3% |   273/~678 | ✓333 | ✗  0] ✓ tests/agent/transports/test_codex_event_projector.py (20✓, 0.5s)
+[ 41.6% |   282/~678 | ✓342 | ✗  0] ✓ tests/agent/transports/test_meta_codex_cache.py (9✓, 0.9s)
+[ 52.2% |   354/~678 | ✓450 | ✗  0] ✓ tests/agent/transports/test_codex_transport.py (108✓, 2.1s)
+[ 54.4% |   369/~678 | ✓465 | ✗  0] ✓ tests/agent/transports/test_router_codex_efforts.py (15✓, 0.9s)
+[ 54.6% |   370/~678 | ✓466 | ✗  0] ✓ tests/cli/test_cli_codex_context_reference.py (1✓, 0.3s)
+[ 54.9% |   372/~678 | ✓468 | ✗  0] ✓ tests/cron/test_codex_execution_paths.py (2✓, 1.9s)
+[ 55.0% |   373/~678 | ✓469 | ✗  0] ✓ tests/gateway/test_session_model_override_credential_pool.py (1✓, 0.4s)
+[ 55.9% |   379/~678 | ✓477 | ✗  0] ✓ tests/agent/test_codex_ttfb_watchdog.py (8✓, 11.1s)
+[ 57.5% |   390/~678 | ✓488 | ✗  0] ✓ tests/hermes_cli/test_auth_codex_oauth_ownership.py (11✓, 0.5s)
+[ 59.1% |   401/~678 | ✓499 | ✗  0] ✓ tests/hermes_cli/test_auth_codex_provider.py (11✓, 0.5s)
+[ 59.6% |   404/~678 | ✓502 | ✗  0] ✓ tests/hermes_cli/test_auth_codex_quota_probe.py (3✓, 0.4s)
+[ 59.9% |   406/~678 | ✓504 | ✗  0] ✓ tests/hermes_cli/test_auth_codex_self_heal.py (2✓, 0.3s)
+[ 61.2% |   415/~678 | ✓513 | ✗  0] ✓ tests/hermes_cli/test_codex_models.py (9✓, 0.6s)
+[ 62.5% |   424/~678 | ✓526 | ✗  0] ✓ tests/gateway/test_codex_hygiene_compaction.py (13✓, 3.7s)
+[ 67.0% |   454/~678 | ✓560 | ✗  0] ✓ tests/agent/transports/test_codex_app_server_session.py (34✓, 6.9s)
+[ 69.9% |   474/~678 | ✓580 | ✗  0] ✓ tests/hermes_cli/test_codex_runtime_plugin_migration.py (20✓, 0.7s)
+[ 71.2% |   483/~678 | ✓599 | ✗  0] ✓ tests/hermes_cli/test_codex_runtime_switch.py (19✓, 0.7s)
+[ 75.4% |   511/~678 | ✓627 | ✗  0] ✓ tests/plugins/image_gen/test_openai_codex_provider.py (28✓, 0.6s)
+[ 75.7% |   513/~678 | ✓629 | ✗  0] ✓ tests/hermes_cli/test_openai_codex_model_validation_fallback.py (2✓, 1.3s)
+[ 75.8% |   514/~678 | ✓630 | ✗  0] ✓ tests/run_agent/test_63425_credential_pool_auto_detect.py (1✓, 1.0s)
+[ 77.1% |   523/~678 | ✓639 | ✗  0] ✓ tests/run_agent/test_codex_app_server_compaction.py (9✓, 0.9s)
+[ 77.6% |   526/~678 | ✓642 | ✗  0] ✓ tests/run_agent/test_codex_app_server_lifecycle.py (3✓, 0.8s)
+[ 78.3% |   531/~678 | ✓647 | ✗  0] ✓ tests/run_agent/test_codex_multimodal_tool_result.py (5✓, 0.8s)
+[ 78.8% |   534/~678 | ✓650 | ✗  0] ✓ tests/run_agent/test_codex_no_tools_nonetype.py (3✓, 1.1s)
+[ 80.2% |   544/~678 | ✓660 | ✗  0] ✓ tests/run_agent/test_codex_sdk_transform_bypass.py (10✓, 1.6s)
+[ 80.5% |   546/~678 | ✓662 | ✗  0] ✓ tests/run_agent/test_codex_silent_hang_hint.py (2✓, 1.8s)
+[ 80.8% |   548/~678 | ✓664 | ✗  0] ✓ tests/run_agent/test_credential_pool_interrupt.py (2✓, 0.8s)
+[ 83.2% |   564/~678 | ✓683 | ✗  0] ✓ tests/run_agent/test_codex_xai_oauth_recovery.py (19✓, 1.9s)
+[ 83.6% |   567/~678 | ✓686 | ✗  0] ✓ tests/hermes_cli/test_codex_cli_model_picker.py (3✓, 7.5s)
+[ 84.2% |   571/~678 | ✓690 | ✗  0] ✓ tests/test_account_usage.py (4✓, 0.4s)
+[ 86.1% |   584/~678 | ✓703 | ✗  0] ✓ tests/tools/test_credential_pool_env_fallback.py (13✓, 0.8s)
+[ 87.5% |   593/~678 | ✓719 | ✗  0] ✓ tests/tools/test_voice_credential_pool_resolution.py (16✓, 0.9s)
+[ 91.7% |   622/~678 | ✓748 | ✗  0] ✓ tests/run_agent/test_codex_app_server_integration.py (29✓, 6.2s)
+[ 91.9% |   623/~678 | ✓749 | ✗  0] ✓ tests/tui_gateway/test_codex_app_server_live_events.py (1✓, 0.5s)
+[100.0% |   678/~678 | ✓809 | ✗  0] ✓ tests/run_agent/test_run_agent_codex_responses.py (60✓, 31.5s)
+
+=== Summary: 64 files, 809 tests passed, 0 failed (100% complete) in 53.3s (4 workers) ===
+  Durations cached to test_durations.json (64 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   64
+  Total subprocess CPU-wall: 123.8s  (runner wall: 53.3s, parallelism: 4x)
+  P50: 0.76s  P90: 3.67s  P95: 6.87s  P99: 31.49s  Max: 31.49s
+  <1s: 42 files (66%)  <2s: 52 files (81%)
+  Top 10 slowest:
+     31.49s  tests/run_agent/test_run_agent_codex_responses.py
+     11.14s  tests/agent/test_codex_ttfb_watchdog.py
+      7.48s  tests/hermes_cli/test_codex_cli_model_picker.py
+      6.87s  tests/agent/transports/test_codex_app_server_session.py
+      6.17s  tests/run_agent/test_codex_app_server_integration.py
+      6.14s  tests/agent/test_credential_pool.py
+      3.67s  tests/gateway/test_codex_hygiene_compaction.py
+      3.66s  tests/agent/test_codex_usage_attribution.py
+      3.01s  tests/agent/test_codex_aux_no_progress_timeout.py
+      2.15s  tests/agent/transports/test_codex_transport.py

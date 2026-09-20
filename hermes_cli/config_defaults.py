@@ -15,6 +15,9 @@ DEFAULT_CONFIG = {
         # for Codex (ChatGPT) and xAI Grok subscription OAuth
         # (oauth.refresh_owner=external).
         "refresh_owner": "runtime",
+        # Explicit opt-in for first-party profiles sharing one Codex pool.
+        # Other providers and profiles keep their existing credential stores.
+        "shared_codex_auth_path": None,
     },
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

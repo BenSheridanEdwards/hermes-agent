@@ -1,0 +1,19 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 2 test files (~3 tests) under ['tests/scripts/test_ci_runtime_gates.py', 'tests/scripts/test_windows_footguns_full_repo_scan.py']; running with -j 2
+[ 66.7% |     2/~3 | ✓14 | ✗ 0] ✓ tests/scripts/test_ci_runtime_gates.py (14✓, 2.0s)
+[100.0% |     3/~3 | ✓15 | ✗ 0] ✓ tests/scripts/test_windows_footguns_full_repo_scan.py (1✓, 4.4s)
+
+=== Summary: 2 files, 15 tests passed, 0 failed (100% complete) in 4.4s (2 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 6.4s  (runner wall: 4.4s, parallelism: 2x)
+  P50: 4.41s  P90: 4.41s  P95: 4.41s  P99: 4.41s  Max: 4.41s
+  <1s: 0 files (0%)  <2s: 1 files (50%)
+  Top 10 slowest:
+      4.41s  tests/scripts/test_windows_footguns_full_repo_scan.py
+      1.97s  tests/scripts/test_ci_runtime_gates.py
