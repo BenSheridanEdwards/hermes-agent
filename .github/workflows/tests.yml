@@ -23,7 +23,8 @@ jobs:
     # adds a second setup.
     # Forks cannot use the upstream organization's larger runner pool.
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # Four-worker fork runs need a cold full-suite budget, unlike the 96-core pool.
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 30 || 60 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
