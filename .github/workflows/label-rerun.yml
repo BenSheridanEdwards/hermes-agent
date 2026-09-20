@@ -37,6 +37,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
 
@@ -80,6 +81,15 @@ jobs:
               echo "Run is still $STATUS after wait — giving up."
               exit 0
             fi
+          fi
+
+          # A new commit may have replaced this run while the label job waited.
+          # Never restart an obsolete run and cancel the new head's CI.
+          CURRENT_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null || true)
+          CONCLUSION=$(gh run view "$RUN_ID" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)
+          if [ "$CURRENT_HEAD" != "$HEAD_SHA" ] || [ "$CONCLUSION" != "failure" ]; then
+            echo "Head changed or run is not a confirmed failure — nothing to rerun."
+            exit 0
           fi
 
           echo "Run completed. Rerunning all failed jobs..."

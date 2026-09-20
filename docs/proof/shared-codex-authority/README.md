@@ -12,7 +12,8 @@ scripts/run_tests.sh tests/agent/test_shared_codex_authority.py tests/agent/test
 ```
 
 Result: 59 passed. The final related-provider run passed 809 tests across 64
-files; its raw output is in `related-tests.txt`. Ruff and `git diff --check` passed.
+files; its raw output is in `related-tests.txt`. The workflow cancellation and
+rerun gate tests plus Windows scan passed 15 checks (`ci-gate-tests.txt`). Ruff and `git diff --check` passed.
 
 An earlier complete run on the same worktree, before the final review fixes,
 reported 42,126 passed, 96 failed, 417 skipped and one flaky file. It is not an
