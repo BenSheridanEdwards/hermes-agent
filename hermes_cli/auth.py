@@ -1433,9 +1433,13 @@ def resolve_provider(
     if cfg_provider:
         return cfg_provider
 
+    # Refuse before probing: credential-policy enforcement can reject a corrupt
+    # config during pool loading, and the best-effort probe treats that as an
+    # empty pool. Preserve the actionable error instead of falling through to
+    # another ambient provider (or reporting that no credentials exist).
+    _refuse_env_adoption_if_config_corrupt()
     _scoped_key_env = _scoped_key_env_reader()
     if _openrouter_auto_detected(_scoped_key_env):
-        _refuse_env_adoption_if_config_corrupt()
         return "openrouter"
 
     # Determined up front so the env-key tier can warn when an exported key preempts it; the actual
