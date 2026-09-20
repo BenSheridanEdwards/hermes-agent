@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.credential_pool import load_pool
+import agent.credential_pool as pool_module
 from hermes_cli import auth
 
 
@@ -150,3 +151,88 @@ def test_quota_status_cannot_report_uncertain_pair_as_only_rate_limited(shared_s
     _write_store(root, [personal])
     auth.begin_shared_codex_refresh(root, personal["id"], personal["refresh_token"])
     assert auth._codex_pool_rate_limit_status() is None
+
+
+def _configure_authority(profile, path):
+    (profile / "config.yaml").write_text(json.dumps({"oauth": {
+        "refresh_owner": "runtime", "shared_codex_auth_path": str(path) if path else None,
+    }}))
+
+
+@pytest.mark.parametrize("disable_sharing", [False, True])
+def test_stale_pool_cannot_copy_credentials_after_authority_change(shared_stores, disable_sharing):
+    root, profile = shared_stores
+    other = root.with_name("other-authority.json")
+    _write_store(other, [_entry("work")])
+    before = root.read_bytes(), other.read_bytes()
+    pool = load_pool("openai-codex")
+    cached = pool.entries()[0]
+    _configure_authority(profile, None if disable_sharing else other)
+    operations = [pool.select, pool._persist,
+                  lambda: pool._mark_exhausted(cached, 429),
+                  lambda: pool._refresh_entry(cached, force=True),
+                  lambda: pool._sync_codex_entry_from_auth_store(cached),
+                  lambda: pool._sync_device_code_entry_to_auth_store(cached)]
+    with patch.object(auth, "refresh_codex_oauth_pure") as refresh:
+        for operation in operations:
+            with pytest.raises(auth.AuthError) as failure:
+                operation()
+            assert failure.value.code == "shared_codex_authority_changed"
+        refresh.assert_not_called()
+    assert (root.read_bytes(), other.read_bytes()) == before
+    assert not (profile / "auth.json").exists()
+    assert pool.entries() == [cached]
+
+
+def test_load_cannot_bind_original_rows_to_changed_authority(shared_stores):
+    root, profile = shared_stores
+    other = root.with_name("other-authority.json")
+    _write_store(other, [_entry("work")])
+    original_read = pool_module.read_credential_pool
+
+    def read_then_change(provider):
+        rows = original_read(provider)
+        _configure_authority(profile, other)
+        return rows
+
+    with patch.object(pool_module, "read_credential_pool", side_effect=read_then_change):
+        pool = load_pool("openai-codex")
+    with pytest.raises(auth.AuthError, match="authority changed"):
+        pool.select()
+    _configure_authority(profile, root)
+    assert pool.select().id == "personal"
+    pool._mark_exhausted(pool.entries()[0], 429)
+    assert json.loads(root.read_text())["credential_pool"]["openai-codex"][0]["last_status"] == "exhausted"
+    assert json.loads(other.read_text())["credential_pool"]["openai-codex"][0]["id"] == "work"
+
+
+def test_local_pool_cannot_copy_into_new_shared_authority(shared_stores):
+    root, profile = shared_stores
+    _configure_authority(profile, None)
+    _write_store(profile / "auth.json", [_entry("local")])
+    pool = load_pool("openai-codex")
+    before = root.read_bytes(), (profile / "auth.json").read_bytes()
+    _configure_authority(profile, root)
+    with pytest.raises(auth.AuthError, match="authority changed"):
+        pool._mark_exhausted(pool.entries()[0], 429)
+    assert (root.read_bytes(), (profile / "auth.json").read_bytes()) == before
+
+
+@pytest.mark.parametrize("disable_sharing", [False, True])
+def test_health_write_pins_authority_between_check_and_persistence(shared_stores, disable_sharing):
+    root, profile = shared_stores
+    other = root.with_name("other-authority.json")
+    _write_store(other, [_entry("work")])
+    other_before = other.read_bytes()
+    pool = load_pool("openai-codex")
+    original_write = pool_module.write_credential_pool
+
+    def change_then_write(*args, **kwargs):
+        _configure_authority(profile, None if disable_sharing else other)
+        return original_write(*args, **kwargs)
+
+    with patch.object(pool_module, "write_credential_pool", side_effect=change_then_write):
+        pool._mark_exhausted(pool.entries()[0], 429)
+    assert json.loads(root.read_text())["credential_pool"]["openai-codex"][0]["last_status"] == "exhausted"
+    assert other.read_bytes() == other_before
+    assert not (profile / "auth.json").exists()

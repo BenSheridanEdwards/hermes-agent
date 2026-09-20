@@ -23,7 +23,10 @@ calls are refused; use the pool's account operations instead.
 
 Selection, health updates, and refresh persist to the shared store. Refresh holds
 that store's lock across re-read, token exchange, and commit. The transaction
-keeps that authority even if profile configuration changes during the exchange. A waiting process
+keeps that authority and its completion rights even if profile configuration
+changes during the exchange. Existing pool instances reject an authority change
+between operations; reload the pool before using the new authority. A stale
+health update cannot copy credentials into a different root or local profile. A waiting process
 adopts a committed rotation rather than spending it again. Only the account being
 refreshed can replace its token pair; stale snapshots cannot restore an old pair
 for another account. A stale failure from an old access token cannot poison its

@@ -11,6 +11,7 @@ import uuid
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -719,9 +720,26 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def _pin_pool_authority(operation):
+    """Reject stale pool instances and keep each operation on its original authority."""
+    @wraps(operation)
+    def guarded(self, *args, **kwargs):
+        if self.provider != "openai-codex":
+            return operation(self, *args, **kwargs)
+        if auth_mod.shared_codex_auth_path(self.provider) != self._codex_authority_path:
+            raise auth_mod.AuthError(
+                "Codex pool authority changed; reload the credential pool before use",
+                provider="openai-codex", code="shared_codex_authority_changed",
+            )
+        with auth_mod.shared_codex_authority_transaction(self._codex_authority_path):
+            return operation(self, *args, **kwargs)
+    return guarded
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
+        self._codex_authority_path = auth_mod.shared_codex_auth_path(provider)
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
@@ -902,6 +920,7 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
+    @_pin_pool_authority
     def _persist(
         self,
         *,
@@ -948,6 +967,7 @@ class CredentialPool:
             return False
         return reason in _TERMINAL_AUTH_REASONS
 
+    @_pin_pool_authority
     def _mark_exhausted(
         self,
         entry: PooledCredential,
@@ -1110,6 +1130,7 @@ class CredentialPool:
             logger.debug("Failed to sync Anthropic OAuth entry from credential pool: %s", exc)
         return entry
 
+    @_pin_pool_authority
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Codex device_code pool entry from auth.json if tokens differ.
 
@@ -1388,6 +1409,7 @@ class CredentialPool:
             logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
         return entry
 
+    @_pin_pool_authority
     def _sync_device_code_entry_to_auth_store(self, entry: PooledCredential) -> None:
         """Write refreshed pool entry tokens back to auth.json providers.
 
@@ -1594,6 +1616,7 @@ class CredentialPool:
             )
             return None
 
+    @_pin_pool_authority
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if not auth_mod.runtime_owns_oauth_refresh(self.provider):
             synced = self._sync_external_entry_from_pool(entry)
@@ -2350,6 +2373,7 @@ class CredentialPool:
             # call site runs OUTSIDE the pool lock.
             self._refresh_entry(entry, force=False)
 
+    @_pin_pool_authority
     def _available_entries(
         self, *, clear_expired: bool = False, refresh: bool = False,
     ) -> Tuple[List[PooledCredential], List[tuple]]:
@@ -3707,6 +3731,14 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    if provider == "openai-codex":
+        path = auth_mod.shared_codex_auth_path(provider)
+        with auth_mod.shared_codex_authority_transaction(path):
+            return _load_pool_from_authority(provider)
+    return _load_pool_from_authority(provider)
+
+
+def _load_pool_from_authority(provider: str) -> CredentialPool:
     raw_entries = read_credential_pool(provider)
     if auth_mod.shared_codex_auth_path(provider) is not None:
         return CredentialPool(provider, [PooledCredential.from_dict(provider, row)

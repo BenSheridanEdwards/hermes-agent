@@ -11,7 +11,7 @@ The source hashes bind the raw focused output to the tested files.
 scripts/run_tests.sh tests/agent/test_shared_codex_authority.py tests/agent/test_shared_codex_readers.py tests/hermes_cli/test_auth_codex_oauth_ownership.py tests/agent/test_credential_pool_anthropic_refresh_race.py tests/scripts/test_windows_footguns_full_repo_scan.py -j 4
 ```
 
-Result: 53 passed. The final related-provider run passed 803 tests across 64
+Result: 59 passed. The final related-provider run passed 809 tests across 64
 files; its raw output is in `related-tests.txt`. Ruff and `git diff --check` passed.
 
 An earlier complete run on the same worktree, before the final review fixes,

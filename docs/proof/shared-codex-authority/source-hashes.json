@@ -1,8 +1,8 @@
 {
   "hermes_cli/auth.py": "459e8155145992402f9f326bd57a001d5b30e825856304d8e8099fc316f2354d",
-  "agent/credential_pool.py": "e0cb2b68299af50248e0511577a71768d698cbe6ad7046fc5e61ceeb25370cd5",
+  "agent/credential_pool.py": "e5274123a5cc1620e9d3c5ca1c6f5cd48330c5cc95d4d40ad430b277e0d17b62",
   "hermes_cli/config_defaults.py": "8ef11ae75964a7c2606e22e302979c0c54307bcdc6e2b22e5b2c7ee2c80ef969",
   "tests/agent/test_shared_codex_authority.py": "9c23c579f7fdeb1277753a1b11cff7f9d5a7415c19e1b4176c9a8a1556d59703",
-  "tests/agent/test_shared_codex_readers.py": "3a22c0e02f8bf192e2c5460123f2c07935e72643b45d9bbd57c3c3f74328cfd4",
+  "tests/agent/test_shared_codex_readers.py": "49b334f0416e055e421fa836642a4c1b80b24b83cd321f266c1f653f30bc7ccc",
   "tests/agent/test_credential_pool_anthropic_refresh_race.py": "e027f73a45ddb0ecf32226afa1905e397ac2b27d870073006b74a0bb3cd53606"
 }
