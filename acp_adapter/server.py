@@ -745,14 +745,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     # harness must load and prompt the originating session.
                     requeue.append(evt)
                     continue
-                claim_id = claim_event_delivery(evt, "acp")
-                if claim_id is None:
-                    # A competing/stale claim is not successful delivery. Keep
-                    # pending events available when that lease expires.
-                    from tools.async_delegation import get_durable_delegation
-                    row = get_durable_delegation(str(evt.get("delegation_id") or ""))
-                    if row and row.get("delivery_state") == "pending":
-                        requeue.append(evt)
+                try:
+                    claim_id = claim_event_delivery(evt, "acp")
+                    if claim_id is None:
+                        # A competing/stale claim is not successful delivery. Keep
+                        # pending events available when that lease expires.
+                        from tools.async_delegation import get_durable_delegation
+                        row = get_durable_delegation(str(evt.get("delegation_id") or ""))
+                        if row and row.get("delivery_state") == "pending":
+                            requeue.append(evt)
+                        continue
+                except Exception:
+                    logger.warning("Could not claim completion; retaining retry", exc_info=True)
+                    requeue.append(evt)
                     continue
             text: str | None = None
             try:
@@ -762,7 +767,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if not text:
                 if is_async and claim_id:
                     # Claimed but unformattable — release so it is not stuck claimed.
-                    defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+                    try:
+                        defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+                    except Exception:
+                        logger.warning("Could not release unformatted completion; retaining retry", exc_info=True)
                 requeue.append(evt)
                 continue
             messages.append(text)
@@ -802,17 +810,28 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         )
         from tools.process_registry import process_registry
         for did, claim in claims:
-            event = getattr(self, "_claimed_completion_events", {}).pop(claim, None)
-            if delivered:
-                complete_completion_delivery(did, claim)
-            else:
-                if attempted:
-                    release_completion_delivery(did, claim)
+            events = getattr(self, "_claimed_completion_events", {})
+            event = events.get(claim)
+            try:
+                if delivered:
+                    complete_completion_delivery(did, claim)
                 else:
-                    defer_completion_delivery(did, claim)
-                row = get_durable_delegation(did)
-                if event is not None and (row is None or row["delivery_state"] == "pending"):
+                    if attempted:
+                        release_completion_delivery(did, claim)
+                    else:
+                        defer_completion_delivery(did, claim)
+                    row = get_durable_delegation(did)
+                    if event is not None and (row is None or row["delivery_state"] == "pending"):
+                        process_registry.completion_queue.put(event)
+            except Exception:
+                # The durable row is still pending (or its commit is uncertain).
+                # Keep an in-process retry as well: do not require a restart to
+                # reconstruct a completion consumed by this turn. Its existing
+                # lease safely gates the retry until expiry if release also failed.
+                logger.warning("Could not settle completion %s; retaining retry", did, exc_info=True)
+                if event is not None:
                     process_registry.completion_queue.put(event)
+            events.pop(claim, None)
         if claims:
             refresh_background_work_marker()
 
@@ -1124,46 +1143,50 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         streamed_message: bool, *, completion_claims: list[tuple[str, str]] | None = None,
     ) -> PromptResponse:
         """Persist, emit provenance/final text, drain queued prompts, report usage."""
-        if result.get("messages"):
-            state.history = result["messages"]
-            self.session_manager.save_session(session_id)
+        try:
+            if result.get("messages"):
+                state.history = result["messages"]
+                self.session_manager.save_session(session_id)
 
-        # Head rotated (compression split): emit provenance so clients can render the boundary.
-        post_turn_hermes_id = getattr(state.agent, "session_id", None)
-        if conn and post_turn_hermes_id and pre_turn_hermes_id and post_turn_hermes_id != pre_turn_hermes_id:
-            try:
-                await self._send_session_info_update(
-                    session_id, current_hermes_session_id=post_turn_hermes_id,
-                    previous_hermes_session_id=pre_turn_hermes_id,
+            # Head rotated (compression split): emit provenance so clients can render the boundary.
+            post_turn_hermes_id = getattr(state.agent, "session_id", None)
+            if conn and post_turn_hermes_id and pre_turn_hermes_id and post_turn_hermes_id != pre_turn_hermes_id:
+                try:
+                    await self._send_session_info_update(
+                        session_id, current_hermes_session_id=post_turn_hermes_id,
+                        previous_hermes_session_id=pre_turn_hermes_id,
+                    )
+                except Exception:
+                    logger.debug("Could not emit ACP provenance update after rotation for %s", session_id, exc_info=True)
+
+            final_response = result.get("final_response", "")
+            cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+            # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
+            from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+            interrupted = bool(result.get("interrupted")) or cancelled
+            suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+            # Send the final text unless already streamed — or if a plugin hook transformed it after.
+            if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+                await conn.session_update(session_id, acp.update_agent_message_text(final_response))
+
+            # A later queued turn must not delay acknowledgement or turn an already
+            # reported result into a retry if that unrelated turn is cancelled.
+            if completion_claims:
+                delivered = (
+                    not interrupted and not result.get("error") and bool(result.get("messages"))
+                    and not str(final_response).startswith("Error:")
                 )
-            except Exception:
-                logger.debug("Could not emit ACP provenance update after rotation for %s", session_id, exc_info=True)
+                self._settle_process_notifications(completion_claims, delivered, attempted=True)
+                completion_claims.clear()
 
-        final_response = result.get("final_response", "")
-        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
-        # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
-        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
-        interrupted = bool(result.get("interrupted")) or cancelled
-        suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
-        # Send the final text unless already streamed — or if a plugin hook transformed it after.
-        if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            await conn.session_update(session_id, acp.update_agent_message_text(final_response))
-
-        # A later queued turn must not delay acknowledgement or turn an already
-        # reported result into a retry if that unrelated turn is cancelled.
-        if completion_claims:
-            delivered = (
-                not interrupted and not result.get("error") and bool(result.get("messages"))
-                and not str(final_response).startswith("Error:")
-            )
-            self._settle_process_notifications(completion_claims, delivered, attempted=True)
-            completion_claims.clear()
-
-        # Go idle before draining so recursive prompt() calls can acquire the session.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
+        finally:
+            # Release only this turn's finalization phase. Once idle, queued or
+            # concurrent prompts may own the session; later usage/cancel errors
+            # must not clear the newer turn's ownership.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:

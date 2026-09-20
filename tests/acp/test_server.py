@@ -999,3 +999,128 @@ async def test_claim_renewal_stops_consumer_when_ownership_is_lost(agent, tmp_pa
     assert state.cancel_event.is_set()
     interrupted.assert_called_once_with(state.agent)
     assert not ad.complete_completion_delivery("stolen", "old-owner")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_completion_settlement_database_failure_keeps_retry_and_session_usable(
+    agent, tmp_path, monkeypatch, interrupted,
+):
+    import sqlite3
+    import time
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry as pr
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model, state.agent.provider = "test-model", "openrouter"
+    ad._persist_dispatch({"delegation_id": "db-retry", "dispatched_at": time.time(), "session_key": sid})
+    event = {"type": "async_delegation", "delegation_id": "db-retry", "session_key": sid,
+             "status": "completed", "summary": "worker output", "completed_at": time.time()}
+    ad._persist_completion(event, {})
+    pr.completion_queue.put(event)
+    operation = "release_completion_delivery" if interrupted else "complete_completion_delivery"
+    original = getattr(ad, operation)
+    attempts = []
+    def fail_once(*args):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original(*args)
+    monkeypatch.setattr(ad, operation, fail_once)
+    calls = []
+    def run(**kw):
+        calls.append(kw["user_message"])
+        return {"messages": [{"role": "assistant", "content": "checked"}],
+                "final_response": "checked", "interrupted": interrupted and len(calls) == 1}
+    state.agent.run_conversation = run
+    await agent.prompt(prompt=[TextContentBlock(type="text", text="continue")], session_id=sid)
+    assert not state.is_running
+    assert ad.get_durable_delegation("db-retry")["delivery_state"] == "pending"
+    assert pr.completion_queue.qsize() == 1
+    assert not agent._claimed_completion_events
+    # Retry once the retained claim expires; no engine restart is necessary.
+    ad._update_delivery("UPDATE async_delegations SET delivery_claimed_at=0 WHERE delegation_id=?", ("db-retry",))
+    await agent.prompt(prompt=[TextContentBlock(type="text", text="retry")], session_id=sid)
+    assert len(calls) == 2
+    assert "worker output" in calls[1]
+    assert ad.get_durable_delegation("db-retry")["delivery_state"] == "delivered"
+    assert pr.completion_queue.empty()
+    assert not state.is_running
+
+
+@pytest.mark.asyncio
+async def test_late_finalization_cancel_does_not_release_newer_turn(agent, tmp_path, monkeypatch):
+    import threading
+    sid = (await agent.new_session(cwd=str(tmp_path))).session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model, state.agent.provider = "test-model", "openrouter"
+    old_usage_entered = asyncio.Event()
+    new_running = threading.Event()
+    release_new = threading.Event()
+    usage_calls = []
+    async def send_usage(_state):
+        usage_calls.append(None)
+        if len(usage_calls) == 1:
+            old_usage_entered.set()
+            await asyncio.Event().wait()
+    monkeypatch.setattr(agent, "_send_usage_update", send_usage)
+    def run(**kw):
+        if kw["user_message"] == "new":
+            new_running.set()
+            assert release_new.wait(5)
+        return {"messages": [{"role": "assistant", "content": "done"}], "final_response": "done"}
+    state.agent.run_conversation = run
+    old = asyncio.create_task(agent.prompt(prompt=[TextContentBlock(type="text", text="old")], session_id=sid))
+    await asyncio.wait_for(old_usage_entered.wait(), 3)
+    new = asyncio.create_task(agent.prompt(prompt=[TextContentBlock(type="text", text="new")], session_id=sid))
+    try:
+        assert await asyncio.to_thread(new_running.wait, 3)
+        old.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await old
+        assert state.is_running
+        assert state.current_prompt_text == "new"
+    finally:
+        release_new.set()
+        await asyncio.wait_for(new, 3)
+    assert not state.is_running
+
+
+def test_completion_drain_database_error_preserves_all_events(agent, tmp_path, monkeypatch):
+    import sqlite3
+    import time
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry as pr
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    events = []
+    for did, sid in [("other", "other-session"), ("accepted", "origin"), ("blocked", "origin")]:
+        ad._persist_dispatch({"delegation_id": did, "dispatched_at": time.time(), "session_key": sid})
+        event = {"type": "async_delegation", "delegation_id": did, "session_key": sid,
+                 "status": "completed", "summary": did, "completed_at": time.time()}
+        ad._persist_completion(event, {})
+        events.append(event)
+        pr.completion_queue.put(event)
+    original = ad.claim_event_delivery
+    def claim(event, consumer):
+        if event["delegation_id"] == "blocked":
+            raise sqlite3.OperationalError("database is locked")
+        return original(event, consumer)
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    text, claims = agent._drain_ready_process_notifications("origin")
+    assert "accepted" in text
+    assert len(claims) == 1
+    assert {pr.completion_queue.get_nowait()["delegation_id"] for _ in range(2)} == {"other", "blocked"}
+    agent._settle_process_notifications(claims, True)
+    assert ad.get_durable_delegation("accepted")["delivery_state"] == "delivered"
+    assert ad.get_durable_delegation("blocked")["delivery_state"] == "pending"
+    monkeypatch.setattr(ad, "claim_event_delivery", original)
+    pr.completion_queue.put(events[-1])
+    text, claims = agent._drain_ready_process_notifications("origin")
+    assert "blocked" in text
+    agent._settle_process_notifications(claims, True)
+    assert ad.get_durable_delegation("blocked")["delivery_state"] == "delivered"
