@@ -1993,7 +1993,8 @@ def load_config(*, strict: bool = False) -> Dict[str, Any]:
     Cached on the file signature; returns a deepcopy since most call sites mutate the result.
     Read-only hot paths should use ``load_config_readonly()`` to skip the deepcopy.
     ``strict=True`` re-reads user and managed config and raises on invalid input instead
-    of serving defaults or last-known-good state; intended for credential enforcement."""
+    of serving defaults or last-known-good state. It performs no home initialization
+    or diagnostic backup writes; intended for credential enforcement."""
     return _load_config_impl(want_deepcopy=True, strict=strict)
 
 
@@ -2167,7 +2168,7 @@ def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) ->
     (docs/design/managed-scope.md §4.1)."""
     if strict:
         managed_dir = managed_scope.get_managed_dir()
-        managed_config = (require_readable_config_before_write(managed_dir / "config.yaml")
+        managed_config = (_read_config_mapping_strict(managed_dir / "config.yaml")
                           if managed_dir is not None else {})
     else:
         managed_config = managed_scope.load_managed_config()
@@ -2182,9 +2183,24 @@ def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) ->
     return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
 
 
+def _read_config_mapping_strict(config_path: Path) -> Dict[str, Any]:
+    """Read enforcement input without creating homes, backups, or recovery state."""
+    try:
+        with open(config_path, encoding="utf-8") as stream:
+            data = fast_safe_load(stream)
+        if data is not None and not isinstance(data, dict):
+            raise TypeError("top-level YAML must be a mapping")
+        return data or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise InvalidUserConfigError("Cannot read credential enforcement configuration") from exc
+
+
 def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
+        if not strict:
+            ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 

@@ -271,3 +271,31 @@ def test_policy_strict_load_rejects_cached_recovery(assigned, monkeypatch):
     assert load_config()["credential_policy"] == {"file": ""}  # Interactive recovery.
     with pytest.raises(CredentialPolicyError, match="Cannot read"):
         load_policy(home)
+
+
+def test_policy_lookup_does_not_initialize_absent_home(tmp_path, monkeypatch):
+    from agent.credential_policy import load_policy
+    from hermes_cli import managed_scope
+
+    home = tmp_path / "not-created" / "profile"
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+    assert load_policy(home) is None
+    assert not home.parent.exists()
+
+
+def test_policy_strict_reads_never_write_backups_or_skeleton(assigned, monkeypatch, tmp_path):
+    from agent.credential_policy import CredentialPolicyError, load_policy
+    from hermes_cli import managed_scope
+
+    _, profile = assigned
+    home, _, _ = profile("read-only")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("credential_policy: [")
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    before_home = set(home.iterdir())
+    before_managed = set(managed.iterdir())
+    with pytest.raises(CredentialPolicyError, match="Cannot read"):
+        load_policy(home)
+    assert set(home.iterdir()) == before_home
+    assert set(managed.iterdir()) == before_managed
