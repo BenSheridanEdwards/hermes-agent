@@ -37,6 +37,18 @@ def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
     raise AssertionError(f"job {job_id} still running after {timeout}s")
 
 
+@pytest.fixture
+def capable_hardware(monkeypatch):
+    """Exercise real catalog selection independently of the runner's GPU/RAM."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    budget = HardwareBudget(usable_vram_bytes=64 << 30,
+                            total_device_bytes=64 << 30,
+                            ram_available_bytes=64 << 30)
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **kwargs: budget)
+
+
 def test_quickstart_unknown_model_404s(client):
     r = client.post("/api/local-models/quickstart", json={"model_id": "no-such"})
     assert r.status_code == 404
@@ -45,14 +57,18 @@ def test_quickstart_unknown_model_404s(client):
 def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     """Preflight is synchronous: a machine no catalog entry fits gets a 409
     with guidance, not a doomed background job."""
-    monkeypatch.setattr(
-        "hermes_cli.local_runtime.catalog.select_variant", lambda *a, **k: None)
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    budget = HardwareBudget(usable_vram_bytes=0, total_device_bytes=0,
+                            ram_available_bytes=0)
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **kwargs: budget)
     r = client.post("/api/local-models/quickstart", json={})
     assert r.status_code == 409
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, capable_hardware, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -93,7 +109,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is True
     assert body["needs_download"] is True
@@ -113,7 +129,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, capable_hardware, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -144,7 +160,7 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is False
     assert body["needs_download"] is False
