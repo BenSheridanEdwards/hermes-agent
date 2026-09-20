@@ -74,6 +74,7 @@ else:
 
     httpx = _LazyHttpx()
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -121,6 +122,9 @@ def runtime_owns_oauth_refresh(provider: str) -> bool:
     """
     if provider not in {"openai-codex", "xai-oauth"}:
         return True
+    transaction = _shared_codex_transaction_path.get()
+    if provider == "openai-codex" and transaction is not None:
+        return transaction[1]
     config_path = get_config_path()
     if not config_path.exists():
         return True
@@ -196,6 +200,7 @@ def _selected_usable_oauth_pool_entry(
     provider_id: str,
 ) -> Optional[Dict[str, Any]]:
     """Read the scheduler-owned, lowest-priority usable OAuth pool entry."""
+    shared_path = shared_codex_auth_path(provider_id)
     entries = read_credential_pool(provider_id)
     if not isinstance(entries, list) or not entries:
         return None
@@ -204,6 +209,9 @@ def _selected_usable_oauth_pool_entry(
         for index, entry in enumerate(entries)
         if isinstance(entry, dict)
         and _persisted_pool_entry_is_usable(entry)
+        and (shared_path is None or not shared_codex_refresh_pending(
+            shared_path, entry["id"], entry["refresh_token"]
+        ))
     ]
     if not indexed_entries:
         return None
@@ -1812,6 +1820,135 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
+_shared_codex_transaction_path: ContextVar[Optional[tuple[Optional[Path], bool]]] = ContextVar(
+    "shared_codex_transaction_path", default=None,
+)
+
+
+@contextmanager
+def shared_codex_authority_transaction(path: Optional[Path]):
+    """Keep refresh reads and writes on the authority whose lock is held."""
+    owner = runtime_owns_oauth_refresh("openai-codex")
+    token = _shared_codex_transaction_path.set((path, owner))
+    try:
+        yield
+    finally:
+        _shared_codex_transaction_path.reset(token)
+
+
+def shared_codex_auth_path(provider_id: str) -> Optional[Path]:
+    """Return the explicitly configured Codex pool authority, without fallback."""
+    if provider_id != "openai-codex":
+        return None
+    pinned_path = _shared_codex_transaction_path.get()
+    if pinned_path:
+        return pinned_path[0]
+    config = read_raw_config()
+    if not config:
+        try:
+            config = require_readable_config_before_write()
+        except RuntimeError:
+            raise AuthError("Cannot determine Codex authority from invalid configuration",
+                            code="shared_codex_config_invalid") from None
+    oauth = config.get("oauth", {})
+    if not isinstance(oauth, dict):
+        raise AuthError("Invalid OAuth configuration", code="shared_codex_config_invalid")
+    configured = oauth.get("shared_codex_auth_path")
+    if configured is None:
+        return None
+    if not isinstance(configured, str) or not configured.strip():
+        raise AuthError("Shared Codex auth path must be an absolute file path",
+                        code="shared_codex_config_invalid")
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise AuthError("Shared Codex auth path must be absolute",
+                        code="shared_codex_config_invalid")
+    return path.resolve()
+
+
+def _read_shared_codex_store(path: Path) -> Dict[str, Any]:
+    """Refuse missing or malformed shared authority; never replace it with empty data."""
+    try:
+        store = json.loads(path.read_text(encoding="utf-8-sig"))
+        entries = store["credential_pool"]["openai-codex"]
+        if not isinstance(store, dict) or not isinstance(entries, list) or not entries:
+            raise ValueError("missing pool")
+        identifiers = set()
+        for entry in entries:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("id"), str) or not entry["id"]
+                    or entry["id"] in identifiers
+                    or not str(entry.get("source", "")).startswith("manual:")
+                    or entry.get("auth_type") != "oauth"
+                    or not isinstance(entry.get("access_token"), str)
+                    or not entry["access_token"]
+                    or not isinstance(entry.get("refresh_token"), str)
+                    or not entry["refresh_token"]):
+                raise ValueError("invalid pool entry")
+            identifiers.add(entry["id"])
+        return store
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        raise AuthError("Shared Codex store is missing or invalid; repair its authority before use",
+                        provider="openai-codex", code="shared_codex_store_invalid") from None
+
+
+def _shared_codex_refresh_marker(path: Path, entry_id: str) -> Path:
+    identifier = hashlib.sha256(entry_id.encode()).hexdigest()[:24]
+    return path.with_name(f"{path.name}.codex-{identifier}.refresh-pending")
+
+
+def shared_codex_refresh_pending(path: Path, entry_id: str, refresh_token: str) -> bool:
+    """Keep an uncertain token pair out of selection until a new pair is committed."""
+    try:
+        previous = _shared_codex_refresh_marker(path, entry_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        return True
+    digest = hashlib.sha256(refresh_token.encode()).hexdigest()
+    return previous == digest or len(previous) != 64 or any(
+        character not in "0123456789abcdef" for character in previous
+    )
+
+
+def begin_shared_codex_refresh(path: Path, entry_id: str, refresh_token: str) -> None:
+    """Record refresh intent under the authority lock before spending a token.
+
+    A crash or lost response must not let another process replay an uncertain
+    single-use token. A new login/token pair supersedes that intent. Only a
+    digest is persisted; this marker contains no credentials.
+    """
+    marker = _shared_codex_refresh_marker(path, entry_id)
+    digest = hashlib.sha256(refresh_token.encode()).hexdigest()
+    if marker.exists():
+        if shared_codex_refresh_pending(path, entry_id, refresh_token):
+            raise AuthError("Shared Codex refresh has an unresolved attempt; re-authenticate this account",
+                            provider="openai-codex", code="shared_codex_refresh_uncertain",
+                            relogin_required=True)
+        marker.unlink()
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(digest)
+        stream.flush()
+        os.fsync(stream.fileno())
+    # Persist the directory entry as well as the marker contents before POST.
+    # Windows does not support opening a directory for fsync.
+    try:
+        directory = os.open(str(marker.parent), os.O_RDONLY)
+    except OSError:
+        directory = None
+    if directory is not None:
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def finish_shared_codex_refresh(path: Path, entry_id: str) -> None:
+    """Clear intent after a committed rotation or explicit quota refusal."""
+    _shared_codex_refresh_marker(path, entry_id).unlink(missing_ok=True)
+
+
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
@@ -1825,9 +1962,13 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    Explicit shared Codex configuration overrides this fallback and routes
+    Codex reads and writes to its authority. Other providers remain local.
     See issue #18594 follow-up.
     """
+    shared_path = shared_codex_auth_path(provider_id or "openai-codex")
+    if shared_path is not None and provider_id is not None:
+        return list(_read_shared_codex_store(shared_path)["credential_pool"][provider_id])
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1849,6 +1990,10 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             if isinstance(existing, list) and existing:
                 continue
             merged[gp_key] = list(gp_entries)
+        if shared_path is not None:
+            merged["openai-codex"] = list(
+                _read_shared_codex_store(shared_path)["credential_pool"]["openai-codex"]
+            )
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1962,8 +2107,10 @@ def write_credential_pool(
       ``removed_ids``.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    shared_path = shared_codex_auth_path(provider_id)
+    with _auth_store_lock(**({"target_path": shared_path} if shared_path is not None else {})):
+        auth_store = (_read_shared_codex_store(shared_path)
+                      if shared_path is not None else _load_auth_store())
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1975,6 +2122,26 @@ def write_credential_pool(
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
+        if shared_path is not None:
+            # A stale process recording a quota failure must not overwrite a
+            # token pair another profile has already rotated under this lock.
+            existing_by_id = {entry["id"]: entry for entry in existing_list}
+            rotated_ids = (set(authorized_oauth_entry_ids or ())
+                           if oauth_token_write_authority in {"runtime-refresh", "interactive-login"}
+                           else set())
+            if oauth_token_write_authority == "external-scheduler":
+                rotated_ids = {entry.get("id") for entry in sanitized_entries}
+            for incoming in sanitized_entries:
+                if incoming.get("id") in rotated_ids:
+                    continue
+                persisted = existing_by_id.get(incoming.get("id"))
+                if persisted is not None:
+                    if incoming.get("access_token") != persisted.get("access_token"):
+                        for field in _POOL_STATUS_FIELDS:
+                            incoming[field] = persisted.get(field)
+                    for field in ("access_token", "refresh_token", "last_refresh"):
+                        if field in persisted:
+                            incoming[field] = persisted[field]
         if (
             oauth_token_write_authority != "external-scheduler"
             and not runtime_owns_oauth_refresh(provider_id)
@@ -2074,7 +2241,12 @@ def write_credential_pool(
             if not disk_id or disk_id in new_ids or disk_id in removed:
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+        if shared_path is not None and not merged:
+            raise AuthError("Cannot remove the last shared Codex account; re-authenticate it instead",
+                            provider="openai-codex", code="shared_codex_store_invalid")
         pool[provider_id] = merged
+        if shared_path is not None:
+            return _save_auth_store(auth_store, target_path=shared_path)
         return _save_auth_store(auth_store)
 
 
@@ -4037,6 +4209,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
+    if shared_codex_auth_path("openai-codex") is not None:
+        tokens = _selected_oauth_pool_tokens("openai-codex")
+        if tokens is None:
+            raise AuthError("Shared Codex pool has no usable account",
+                            provider="openai-codex", code="shared_codex_pool_unavailable")
+        return {"tokens": tokens, "last_refresh": tokens.get("last_refresh")}
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()
@@ -4201,6 +4379,9 @@ def _sync_codex_pool_entries(
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    if shared_codex_auth_path("openai-codex") is not None:
+        raise AuthError("Use hermes auth add to manage shared Codex accounts explicitly",
+                        code="shared_codex_singleton_write_forbidden")
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
@@ -4394,6 +4575,9 @@ def _refresh_codex_auth_tokens(
 
     Saves the new tokens to Hermes auth store automatically.
     """
+    if shared_codex_auth_path("openai-codex") is not None:
+        raise AuthError("Shared Codex refresh must use its credential pool and authority lock",
+                        code="shared_codex_singleton_refresh_forbidden")
     if not runtime_owns_oauth_refresh("openai-codex"):
         raise AuthError(
             "Codex OAuth refresh is owned externally; this runtime must not spend the refresh token.",
@@ -4471,6 +4655,25 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _resolve_shared_codex_credentials(force_refresh: bool, refresh_if_expiring: bool) -> Dict[str, Any]:
+    from agent.credential_pool import PooledCredential, load_pool
+
+    pool = load_pool("openai-codex")
+    if force_refresh or not refresh_if_expiring:
+        row = _selected_usable_oauth_pool_entry("openai-codex")
+        selected = PooledCredential.from_dict("openai-codex", row) if row else None
+        if force_refresh and selected is not None:
+            selected = pool._refresh_entry(selected, force=True)
+    else:
+        selected = pool.select()
+    if selected is None:
+        raise AuthError("Shared Codex pool has no usable account",
+                        provider="openai-codex", code="shared_codex_pool_unavailable")
+    return {"provider": "openai-codex", "base_url": selected.base_url or DEFAULT_CODEX_BASE_URL,
+            "api_key": selected.access_token, "source": "shared-credential-pool",
+            "last_refresh": selected.last_refresh, "auth_mode": "chatgpt"}
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -4488,6 +4691,8 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    if shared_codex_auth_path("openai-codex") is not None:
+        return _resolve_shared_codex_credentials(force_refresh, refresh_if_expiring)
     runtime_refresh_allowed = runtime_owns_oauth_refresh("openai-codex")
     externally_managed_tokens = (
         None if runtime_refresh_allowed else _selected_oauth_pool_tokens("openai-codex")
@@ -4791,9 +4996,11 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     Returns the number of entries cleared.
     """
     cleared = 0
+    shared_path = shared_codex_auth_path("openai-codex")
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(**({"target_path": shared_path} if shared_path is not None else {})):
+            auth_store = (_read_shared_codex_store(shared_path)
+                          if shared_path is not None else _load_auth_store())
             pool = auth_store.get("credential_pool")
             entries = pool.get("openai-codex") if isinstance(pool, dict) else None
             if not isinstance(entries, list):
@@ -4819,14 +5026,20 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                 entry["last_error_reset_at"] = None
                 cleared += 1
             if cleared:
-                _save_auth_store(auth_store)
+                if shared_path is not None:
+                    _save_auth_store(auth_store, target_path=shared_path)
+                else:
+                    _save_auth_store(auth_store)
     except Exception:
+        if shared_path is not None:
+            raise
         logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
     return cleared
 
 
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     """Return metadata for a pool-only Codex credential in quota cooldown."""
+    shared_path = shared_codex_auth_path("openai-codex")
     def _parse_reset_at(value: Any) -> Optional[float]:
         if value is None or value == "":
             return None
@@ -4852,8 +5065,9 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(**({"target_path": shared_path} if shared_path is not None else {})):
+            auth_store = (_read_shared_codex_store(shared_path)
+                          if shared_path is not None else _load_auth_store())
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return None
@@ -4863,6 +5077,10 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         now = time.time()
         for entry in entries:
             if not isinstance(entry, dict):
+                continue
+            if shared_path is not None and shared_codex_refresh_pending(
+                shared_path, entry["id"], entry["refresh_token"]
+            ):
                 continue
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
@@ -4896,6 +5114,8 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
                 "base_url": entry.get("base_url"),
             }
     except Exception:
+        if shared_path is not None:
+            raise
         logger.debug("Codex pool rate-limit lookup failed", exc_info=True)
     return None
 
@@ -4910,6 +5130,9 @@ def _pool_codex_access_token() -> str:
     Returns ``""`` when no usable entry is found (caller handles by raising
     the original AuthError).
     """
+    if shared_codex_auth_path("openai-codex") is not None:
+        tokens = _selected_oauth_pool_tokens("openai-codex")
+        return tokens["access_token"] if tokens else ""
     try:
         with _auth_store_lock():
             auth_store = _load_auth_store()

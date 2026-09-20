@@ -1129,6 +1129,17 @@ class CredentialPool:
         pool row is scheduler-owned and authoritative — adopting singleton
         tokens here would fight the scheduler's rotation.
         """
+        if auth_mod.shared_codex_auth_path(self.provider) is not None:
+            persisted = next((row for row in read_credential_pool(self.provider)
+                              if row["id"] == entry.id), None)
+            if persisted is None:
+                raise auth_mod.AuthError("Shared Codex credential was removed",
+                                         code="shared_codex_entry_missing")
+            updated = PooledCredential.from_dict(self.provider, persisted)
+            if updated == entry:
+                return entry
+            self._replace_entry(entry, updated)
+            return updated
         if (
             self.provider != "openai-codex"
             or entry.source not in ("device_code", "manual:device_code")
@@ -1403,7 +1414,8 @@ class CredentialPool:
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.  All singleton-seeded
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        if (auth_mod.shared_codex_auth_path(self.provider) is not None
+                or entry.source != "device_code"):
             return
         try:
             with _auth_store_lock():
@@ -1621,14 +1633,22 @@ class CredentialPool:
                 if self.provider == "xai-oauth"
                 else self._sync_anthropic_entry_from_pool_store
             )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+            shared_path = auth_mod.shared_codex_auth_path(self.provider)
+            with auth_mod.shared_codex_authority_transaction(shared_path), _auth_store_lock(
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                **({"target_path": shared_path} if shared_path is not None else {}),
             ):
                 synced = sync_entry(entry)
+                if shared_path is not None and auth_mod.shared_codex_refresh_pending(
+                    shared_path, synced.id, synced.refresh_token
+                ):
+                    return None
                 if self.provider == "openai-codex":
                     if synced is not entry:
+                        shared_rotation = (auth_mod.shared_codex_auth_path(self.provider) is not None
+                                           and synced.refresh_token != entry.refresh_token)
                         entry = synced
-                        if not force and not self._entry_needs_refresh(entry):
+                        if (shared_rotation or not force) and not self._entry_needs_refresh(entry):
                             return entry
                     return self._refresh_entry_impl(entry, force=force)
                 # claude_code first: the shared credentials file - not the
@@ -1771,6 +1791,7 @@ class CredentialPool:
     def _refresh_entry_impl(
         self, entry: PooledCredential, *, force: bool
     ) -> Optional[PooledCredential]:
+        shared_path = auth_mod.shared_codex_auth_path(self.provider)
         try:
             if self.provider == "anthropic":
                 from agent.anthropic_credentials import (
@@ -1859,6 +1880,8 @@ class CredentialPool:
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
+                if shared_path is not None:
+                    auth_mod.begin_shared_codex_refresh(shared_path, entry.id, entry.refresh_token)
                 refreshed = auth_mod.refresh_codex_oauth_pure(
                     entry.access_token,
                     entry.refresh_token,
@@ -1900,6 +1923,8 @@ class CredentialPool:
                 return entry
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            if shared_path is not None and getattr(exc, "code", None) == auth_mod.CODEX_RATE_LIMITED_CODE:
+                auth_mod.finish_shared_codex_refresh(shared_path, entry.id)
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -2077,6 +2102,9 @@ class CredentialPool:
                 # remove all singleton-seeded (device_code) entries from the
                 # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                    if shared_path is not None:
+                        self._mark_exhausted(entry, 401, {"reason": "invalid_grant"})
+                        return None
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
@@ -2206,7 +2234,17 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        try:
+            if shared_path is not None:
+                self._persist(oauth_token_write_authority="runtime-refresh",
+                              authorized_oauth_entry_ids=[entry.id])
+            else:
+                self._persist()
+        except Exception:
+            self._replace_entry(updated, entry)
+            raise
+        if shared_path is not None:
+            auth_mod.finish_shared_codex_refresh(shared_path, entry.id)
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
@@ -2326,6 +2364,10 @@ class CredentialPool:
         lock, avoiding stalling all pool consumers during cross-process flock
         acquisition + OAuth network I/O.
         """
+        shared_path = auth_mod.shared_codex_auth_path(self.provider)
+        if shared_path is not None:
+            self._entries = [PooledCredential.from_dict(self.provider, row)
+                             for row in read_credential_pool(self.provider)]
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
@@ -2343,6 +2385,10 @@ class CredentialPool:
         ) <= 1
         active_model = self._active_model
         for entry in self._entries:
+            if shared_path is not None and auth_mod.shared_codex_refresh_pending(
+                shared_path, entry.id, entry.refresh_token
+            ):
+                continue
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
             # can remain unhydrated; never lease or select it as an empty key.
@@ -2404,7 +2450,7 @@ class CredentialPool:
                 # last_error_reason, timestamps) stays visible — pruning them
                 # would just be undone by ``_seed_from_singletons`` on the
                 # next load anyway.
-                if _is_manual_source(entry.source):
+                if shared_path is None and _is_manual_source(entry.source):
                     dead_at = entry.last_status_at or 0
                     if dead_at and now - dead_at > DEAD_MANUAL_PRUNE_TTL_SECONDS:
                         _label = entry.label or entry.id[:8]
@@ -3662,6 +3708,9 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    if auth_mod.shared_codex_auth_path(provider) is not None:
+        return CredentialPool(provider, [PooledCredential.from_dict(provider, row)
+                                         for row in raw_entries])
     disk_ids = {
         entry.get("id")
         for entry in raw_entries

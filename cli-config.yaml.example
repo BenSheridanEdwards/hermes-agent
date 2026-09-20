@@ -2039,3 +2039,11 @@ updates:
 #   # This runs ONCE per process at startup, so it cannot replace a credential
 #   # that expires mid-session. For a single provider whose token needs
 #   # re-minting during a session, use `providers.<name>.key_cmd` instead.
+
+# Optional shared Codex authority for explicitly enrolled first-party profiles.
+# Keep tenants unconfigured. The target must already contain self-contained
+# manual OAuth pool entries created with `hermes auth add openai-codex`.
+# oauth:
+#   refresh_owner: runtime
+#   shared_codex_auth_path: /absolute/path/to/shared/auth.json
+# This affects Codex only. Other providers retain their existing stores.
