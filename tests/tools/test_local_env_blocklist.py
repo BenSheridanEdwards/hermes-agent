@@ -1614,7 +1614,7 @@ class TestSanePathIncludesHomebrew:
 
 
     @pytest.mark.windows_only
-    def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch):
+    def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch, tmp_path):
         """Windows-only: ``_path_env_key`` looks for a case-insensitive PATH
         key only on Windows, so the mixed-case ``Path`` preservation this
         asserts is a genuinely Windows-native behaviour.
@@ -1624,7 +1624,10 @@ class TestSanePathIncludesHomebrew:
         """
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
-        windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
+        windows_env = {
+            "Path": r"C:\Windows\System32;C:\Program Files\Git\bin",
+            "HERMES_HOME": str(tmp_path),
+        }
         monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
         with patch.object(local_mod.os, "environ", windows_env):
             result = _make_run_env({})

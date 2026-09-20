@@ -83,7 +83,31 @@ def make_tool_progress_cb(
     name so parallel same-name calls complete against the right ACP tool call.
     Other event types (``tool.completed``, ``reasoning.available``) are ignored."""
 
+    subagent_calls: dict[str, str] = {}
+
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        if event_type.startswith("subagent."):
+            # Delegates keep this callback after the parent turn ends. Use one
+            # native ACP tool row per child so progress and failure stay visible.
+            child_id = str(kwargs.get("subagent_id") or "")
+            if not child_id or event_type in {"subagent.text", "subagent.thinking"}:
+                return
+            tc_id = subagent_calls.get(child_id)
+            if tc_id is None:
+                tc_id = subagent_calls[child_id] = f"subagent-{child_id}"
+                _send_update(conn, session_id, loop, acp.start_tool_call(
+                    tc_id, f"Worker: {kwargs.get('goal') or preview or child_id}",
+                    kind="execute", status="in_progress",
+                ))
+            status = "in_progress"
+            if event_type == "subagent.complete":
+                status = "completed" if kwargs.get("status") in {"completed", "success"} else "failed"
+            detail = str(kwargs.get("summary") or preview or name or "Worker running")
+            _send_update(conn, session_id, loop, acp.update_tool_call(
+                tc_id, status=status,
+                content=[acp.tool_content(acp.text_block(detail[:4000]))],
+            ))
+            return
         if event_type != "tool.started":
             return
         args = coerce_tool_args(args)

@@ -2608,7 +2608,8 @@ def _fake_ffmpeg(monkeypatch, output: bytes = b"ID3fake-mp3", returncode: int = 
 
     calls = []
 
-    def run(cmd, capture_output=True, timeout=None):
+    def run(cmd, capture_output=True, timeout=None, stdin=None):
+        assert stdin == subprocess.DEVNULL
         calls.append(list(cmd))
         if returncode == 0:
             Path(cmd[-1]).write_bytes(output)

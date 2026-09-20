@@ -2485,6 +2485,13 @@ class TestBuildSchemaFromConfig:
 
 
 
+    def test_credential_assignment_manifest_is_in_security_settings(self):
+        from hermes_cli.web_server_config import CONFIG_SCHEMA
+
+        entry = CONFIG_SCHEMA["credential_policy.file"]
+        assert entry["category"] == "security"
+        assert entry["type"] == "string"
+
     def test_no_single_field_categories(self):
         """After merging, no category should have just 1 field."""
         from hermes_cli.web_server_config import CONFIG_SCHEMA

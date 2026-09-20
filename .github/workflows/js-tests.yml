@@ -14,7 +14,7 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,8 +62,8 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
+      # Checks run concurrently on the upstream large runner. The step fails
+      # only after all of them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
       #     run then reports one failure, where the matrix this replaced
@@ -80,4 +80,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Each check already parallelizes internally. On a standard fork runner,
+        # overlapping full Vitest/tsc/eslint pools starves short UI test deadlines.
+        # Serialize check units there while retaining all checks and their workers.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency ${{ github.repository_owner == 'NousResearch' && 32 || 1 }}

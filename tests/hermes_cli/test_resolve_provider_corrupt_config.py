@@ -99,8 +99,9 @@ class TestResolveProviderCorruptConfig:
 
     def test_corrupt_config_blocks_pool_probe_adoption(self, tmp_path, monkeypatch):
         """Corrupt config + pool-only credential must NOT resolve to openrouter."""
-        _setup_home(tmp_path, monkeypatch, CORRUPT_YAML)
-        _load_config_fresh()
+        # Credentials existed before the configuration became corrupt. Pool
+        # loading itself now refuses unreadable credential policy config.
+        _home, cfg = _setup_home(tmp_path, monkeypatch, VALID_YAML)
 
         from agent.credential_pool import (
             AUTH_TYPE_API_KEY,
@@ -123,6 +124,9 @@ class TestResolveProviderCorruptConfig:
             )
         )
 
+        cfg.write_text(CORRUPT_YAML)
+        _load_config_fresh()
+
         from hermes_cli.auth import AuthError, resolve_provider
 
         with pytest.raises(AuthError) as excinfo:
@@ -138,6 +142,21 @@ class TestResolveProviderCorruptConfig:
         from hermes_cli.auth import resolve_provider
 
         assert resolve_provider("auto") == "openrouter"
+
+    @pytest.mark.parametrize("ambient_key", [None, "ANTHROPIC_API_KEY"])
+    def test_corrupt_config_refuses_before_other_ambient_fallbacks(
+        self, tmp_path, monkeypatch, ambient_key
+    ):
+        _setup_home(tmp_path, monkeypatch, CORRUPT_YAML)
+        if ambient_key:
+            monkeypatch.setenv(ambient_key, "sk-ant-FAKE1234567890")
+        _load_config_fresh()
+
+        from hermes_cli.auth import AuthError, resolve_provider
+
+        with pytest.raises(AuthError) as excinfo:
+            resolve_provider("auto")
+        assert excinfo.value.code == "corrupt_config"
 
     def test_fixed_config_clears_block(self, tmp_path, monkeypatch):
         """Rewriting the corrupt file valid clears the refusal immediately."""
