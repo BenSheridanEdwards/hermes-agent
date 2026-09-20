@@ -253,3 +253,20 @@ class TestSendUpdate:
             and "_session_update" in str(w.message)
         ]
         assert runtime_warnings == []
+
+
+def test_background_child_progress_and_failure_are_native_acp_rows(monkeypatch):
+    from acp_adapter import events
+    updates = []
+    monkeypatch.setattr(events, "_send_update", lambda conn, sid, loop, update: updates.append((sid, update)))
+    cb = events.make_tool_progress_cb(None, "origin", None, {}, {})
+    cb("subagent.start", preview="repair", subagent_id="child", goal="repair")
+    # The parent turn can be over; its captured callback must still work.
+    cb("subagent.tool", "terminal", "running tests", subagent_id="child")
+    cb("subagent.complete", subagent_id="child", status="failed", summary="worker lost")
+    assert all(sid == "origin" for sid, _ in updates)
+    rows = [u.model_dump(by_alias=True) for _, u in updates]
+    assert rows[0]["sessionUpdate"] == "tool_call"
+    assert {row["toolCallId"] for row in rows} == {"subagent-child"}
+    assert rows[-1]["status"] == "failed"
+    assert "worker lost" in str(rows[-1]["content"])

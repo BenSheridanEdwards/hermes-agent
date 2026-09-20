@@ -734,19 +734,23 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             is_async = evt.get("type") == "async_delegation"
             claim_id: str | None = None
             if is_async:
-                # Route a finished result to the turn of the thread it was
-                # dispatched from. If that session is still live here, hold the
-                # result for its own turn (the harness runs a delivery turn there,
-                # so the report lands where the asker is); only a result whose
-                # origin is gone drains into whatever turn comes next.
+                # Only the originating session may consume its result, including
+                # after restart. The harness restores that session for delivery.
                 origin = str(evt.get("session_key") or "")
-                if origin and origin != session_id and self.session_manager.get_session(origin) is not None:
+                if origin and origin != session_id:
+                    # Never restore an old session merely to test liveness, or
+                    # inject its result into an unrelated conversation. The
+                    # harness must load and prompt the originating session.
                     requeue.append(evt)
                     continue
                 claim_id = claim_event_delivery(evt, "acp")
                 if claim_id is None:
-                    # Claimed/delivered elsewhere (or already delivered on a prior turn
-                    # and replayed on restart) — drop without requeue.
+                    # A competing/stale claim is not successful delivery. Keep
+                    # pending events available when that lease expires.
+                    from tools.async_delegation import get_durable_delegation
+                    row = get_durable_delegation(str(evt.get("delegation_id") or ""))
+                    if row and row.get("delivery_state") == "pending":
+                        requeue.append(evt)
                     continue
             text: str | None = None
             try:
@@ -757,14 +761,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 if is_async and claim_id:
                     # Claimed but unformattable — release so it is not stuck claimed.
                     defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
-                else:
-                    requeue.append(evt)
+                requeue.append(evt)
                 continue
             messages.append(text)
             if is_async and claim_id:
                 did = str(evt.get("delegation_id") or "")
                 if did:
                     claims.append((did, claim_id))
+                    if not hasattr(self, "_claimed_completion_events"):
+                        self._claimed_completion_events = {}
+                    self._claimed_completion_events[claim_id] = evt
         for evt in requeue:
             try:
                 queue.put(evt)
@@ -778,10 +784,28 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             "[BACKGROUND WORK FINISHED — REPORT IT]\n"
             "A background task you dispatched earlier has finished; its result is below. "
             "The person who asked is waiting on it. Report the outcome now, in this thread, "
-            "even if the rest of this turn says to stay silent: what finished, the result, "
-            "and what happens next. Keep it short."
+            "even if the rest of this turn says to stay silent. Inspect the result, "
+            "continue any unfinished authorized work, and verify the overall outcome. "
+            "A worker finishing is not proof that the user's task is complete. "
+            "Give a concise progress update or verified completion report."
         )
         return (header + "\n\n" + "\n\n".join(messages), claims)
+
+    def _settle_process_notifications(self, claims: list[tuple[str, str]], delivered: bool) -> None:
+        from tools.async_delegation import (
+            complete_completion_delivery, defer_completion_delivery, refresh_background_work_marker,
+        )
+        from tools.process_registry import process_registry
+        for did, claim in claims:
+            event = getattr(self, "_claimed_completion_events", {}).pop(claim, None)
+            if delivered:
+                complete_completion_delivery(did, claim)
+            else:
+                defer_completion_delivery(did, claim)
+                if event is not None:
+                    process_registry.completion_queue.put(event)
+        if claims:
+            refresh_background_work_marker()
 
     def _claim_turn_or_queue(
         self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
@@ -904,6 +928,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # marks the paths a note has actually promised the agent or the queue; short of that,
         # nothing will ever read the note, so even a kept-on-failure clip goes.
         handed_on = False
+        delegation_claims: list[tuple[str, str]] = []
+        completion_delivered = False
         try:
             user_text = _extract_text(prompt).strip()
             user_content = _content_blocks_to_openai_user_content(
@@ -931,7 +957,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # on this turn. The ACP model has no idle watcher, so this drain is where
             # completions reach the agent — including on the periodic heartbeat turn,
             # which is what lets a delegated worker's result come back at all.
-            injected_text, delegation_claims = self._drain_ready_process_notifications(session_id)
+            # A queued prompt is not a durable completion delivery. Let the
+            # eventual admitted turn claim its results instead.
+            if state.is_running:
+                injected_text = ""
+            else:
+                injected_text, delegation_claims = self._drain_ready_process_notifications(session_id)
             if injected_text:
                 user_text = f"{injected_text}\n\n{user_text}".strip() if user_text else injected_text
                 if isinstance(user_content, str):
@@ -946,15 +977,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             absorbed = self._claim_turn_or_queue(
                 state, session_id, user_text, user_content, text_only_prompt,
                 voice=bool(voice_turn and voice_turn.voice_reply))
-            # The completion text is now committed to a turn (running or queued), so
-            # acknowledge the durable rows. A crash before this replays them on restart.
-            if delegation_claims:
-                from tools.async_delegation import mark_completion_delivered
-                for _did, _claim in delegation_claims:
-                    try:
-                        mark_completion_delivered(_did)
-                    except Exception:
-                        logger.warning("Failed to mark delegation %s delivered", _did, exc_info=True)
             if absorbed is not None:
                 handed_on = True  # the notes are in the queued text, to be replayed
                 if self._conn:
@@ -995,10 +1017,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     state.is_running = False
                     state.current_prompt_text = ""
                 return PromptResponse(stop_reason="end_turn")
+            response = await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
+            completion_delivered = (
+                response.stop_reason == "end_turn" and not result.get("interrupted")
+                and not result.get("error") and bool(result.get("messages"))
+                and not str(result.get("final_response", "")).startswith("Error:")
+            )
+            return response
         finally:
+            self._settle_process_notifications(delegation_claims, completion_delivered)
             cleanup_voice_turn(voice_turn, force=not handed_on)
-
-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 
     def _wire_turn_callbacks(
         self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop

@@ -816,3 +816,48 @@ class TestProcessNotificationDrain:
         text2, claims2 = agent._drain_ready_process_notifications("sess-other")
         assert "belongs to the other thread" in text2
         assert [c[0] for c in claims2] == ["d-other"]
+
+
+@pytest.mark.asyncio
+async def test_completed_worker_never_restores_or_leaks_into_unrelated_session(agent, monkeypatch):
+    from tools.process_registry import process_registry as pr
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    def forbidden_restore(sid):
+        pytest.fail("Liveness checks must not restore old sessions")
+    monkeypatch.setattr(agent.session_manager, "get_session", forbidden_restore)
+    event = {"type": "async_delegation", "delegation_id": "old-result", "session_key": "old-session",
+             "status": "completed", "summary": "private old conversation"}
+    pr.completion_queue.put(event)
+    text, claims = agent._drain_ready_process_notifications("new-session")
+    assert text == "" and claims == []
+    assert pr.completion_queue.get_nowait() == event
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_completion_ack_waits_for_finished_turn_and_retries_interrupt(agent, tmp_path, monkeypatch, interrupted):
+    import time
+    from tools.process_registry import process_registry as pr
+    import tools.async_delegation as ad
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "ledger.db")
+    while not pr.completion_queue.empty():
+        pr.completion_queue.get_nowait()
+    session = await agent.new_session(cwd=str(tmp_path))
+    sid = session.session_id
+    state = agent.session_manager.get_session(sid)
+    state.agent.model = "test-model"
+    state.agent.provider = "openrouter"
+    ad._persist_dispatch({"delegation_id": "result", "dispatched_at": time.time(), "session_key": sid})
+    event = {"type": "async_delegation", "delegation_id": "result", "session_key": sid,
+             "status": "completed", "summary": "worker output", "completed_at": time.time()}
+    ad._persist_completion(event, {"summary": "worker output"})
+    pr.completion_queue.put(event)
+    def run(*args, **kwargs):
+        assert ad.get_durable_delegation("result")["delivery_state"] == "pending"
+        return {"messages": [{"role": "assistant", "content": "checked"}],
+                "final_response": "checked", "interrupted": interrupted}
+    state.agent.run_conversation = run
+    await agent.prompt(prompt=[TextContentBlock(type="text", text="continue")], session_id=sid)
+    assert ad.get_durable_delegation("result")["delivery_state"] == ("pending" if interrupted else "delivered")
+    if interrupted:
+        assert pr.completion_queue.get_nowait()["delegation_id"] == "result"
