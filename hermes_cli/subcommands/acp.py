@@ -14,6 +14,8 @@ def build_acp_parser(subparsers, *, cmd_acp: Callable) -> None:
         description="Start Hermes Agent in ACP mode for editor integration (VS Code, Zed, JetBrains)",
     )
     add_accept_hooks_flag(acp_parser)
+    acp_parser.add_argument("--attach", action="store_true",
+                            help="Forward stdio to the running canonical gateway (Linux/macOS)")
     acp_parser.add_argument(
         "--version", action="store_true", dest="acp_version",
         help="Print Hermes ACP version and exit")

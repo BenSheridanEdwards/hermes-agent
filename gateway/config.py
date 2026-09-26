@@ -579,6 +579,7 @@ class GatewayConfig:
     loop_watchdog_probe_timeout_s: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    acp_enabled: bool = False
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
@@ -653,6 +654,7 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
+            "acp": {"enabled": self.acp_enabled},
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -740,6 +742,7 @@ class GatewayConfig:
             loop_watchdog_max_strikes=max_strikes,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), {"pair", "ignore"}, "pair"),
+            acp_enabled=_coerce_dict(pick("acp")).get("enabled") is True,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),

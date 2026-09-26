@@ -21,6 +21,85 @@ Hermes. ACP is a good fit when you want Hermes to keep its existing identity,
 provider setup, memory, skills, and tools while another application owns the
 conversation transport.
 
+## Attach to the running messaging gateway (Linux and macOS)
+
+`hermes acp` still starts the standalone ACP agent described below. To use the
+**existing gateway process**, opt in on the profile and restart that gateway:
+
+```sh
+hermes -p myprofile config set gateway.acp.enabled true
+# Restart the profile's gateway using its normal service manager.
+hermes -p myprofile acp --attach
+```
+
+Configure the ACP host to launch that last command. Attachment fails closed if
+the gateway is absent; it never starts an independent agent or falls back to
+standalone ACP. The stdio forwarder does not construct an agent, session database,
+or provider client. The gateway retains agent execution, session storage, native
+platform delivery, approvals, and cancellation ownership. Closing the host or
+forwarder does **not** stop the gateway or an admitted turn.
+
+Supported requests are `initialize`, `session/new`, `session/load`,
+`session/prompt` (text blocks), and `session/cancel`. New sessions use a generic
+local gateway route. Loading accepts only a **current gateway session ID** with
+an available canonical adapter, and does not replace its source, agent, toolset,
+or prompt cache. Prompts pass through both gateway guards and pin the route key
+and current session ID. A busy session is rejected rather than merged or silently
+queued. A prompt response is sent only after the canonical handler finishes, not
+when it admits the request. Model errors and incomplete turns are errors; canonical
+interruptions return `cancelled`.
+
+Text and ID-bearing tool start/progress/result callbacks are observed alongside
+native delivery, including with native streaming disabled. Local approval requests
+use the gateway's ordinary text prompt: send `/approve` or `/deny` as a text prompt
+for the same session. These are the only supported slash controls; dangerous-tool
+approval is never bypassed. Native-platform approval delivery remains on that
+platform. ACP mode/model mutations, client MCP servers, client file/terminal
+services, media prompts, and per-request working-directory changes are not
+supported. `cwd` does not change the gateway's configured working directory.
+
+Attachment clients can negotiate **`hermesAttachment` version 1** in
+`clientCapabilities._meta`, with support advertised in
+`agentCapabilities._meta.hermesAttachment`. The extension adds durable
+`_hermes/turn/admit` / `_hermes/turn/status` identities, final/terminal delivery
+replay, active text/tool replacement snapshots, and history-free cursor pages.
+See the [complete client contract](https://github.com/NousResearch/hermes-agent/blob/main/docs/acp-gateway-attachment-v1.md)
+for exact request/response/event examples, pagination fences, limits, and the
+Buzz integration checklist. Clients must implement that contract before cutover;
+initialization alone does not prove recovery support.
+
+`session/load` can restore up to 64 canonical text rows / 512 KiB and reports
+`_meta.historyTruncated` when incomplete. Use `_meta.history:false` and
+`_meta.afterDeliveryId` for delivery-only pages, continuing until
+`hasMoreDeliveries:false`. Reconnect while work is active to replace the observer
+snapshot and follow the canonical turn. Do not send synthetic background-result
+prompts: the gateway owns asynchronous wakes. Native `session/prompt` remains
+blocking and is **not** safely retryable; use the negotiated admission method for
+recoverable new work. Retained nonterminal admissions become explicit `unknown`
+after an owner restart, never automatic model re-execution. History, journal,
+admission and relay delivery are not one transaction: no exactly-once claim.
+
+The endpoint is `$HERMES_HOME/acp/gateway.sock`, in an owner-only directory (0700),
+with socket mode 0600 and same-UID peer checks on **both ends**. This is a trusted
+local-owner interface, not multi-user authorization or a remote TCP service.
+Linux uses `SO_PEERCRED`; macOS uses `getpeereid`. Windows is unsupported. The path
+must fit the host's Unix-socket path limit. A kernel-held lease and matching socket
+inode evidence allow recovery after a crash; live, unowned or replaced endpoints
+are not removed. Do not delete the persistent ownership lock file.
+
+There are at most eight clients, eight pending requests per client, 64 pending
+RPC requests globally (including disconnected native prompts), and 16 subscribed
+sessions per connection. Frames and queues are bounded. Replay yields to the
+writer and reserves snapshot/response capacity; disconnect removes subscriptions,
+not canonical work. The delivery journal retains at most 4096 rows / 16 MiB of
+serialized payload, with explicit `replay_gap` failure for expired cursors.
+Admission identities cap at 4096 and fail closed at capacity rather than silently
+forgetting old retries. Oversized notices fail before successful append; bounded
+final text is split into replayable Unicode-safe parts, never embedded unbounded
+in terminal metadata. The contract documents remaining storage/crash boundaries.
+
+The remaining sections describe **standalone** ACP unless stated otherwise.
+
 ## What Hermes exposes in ACP mode
 
 Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. It includes:

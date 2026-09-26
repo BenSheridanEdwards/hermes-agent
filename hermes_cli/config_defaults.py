@@ -1883,6 +1883,7 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        "acp": {"enabled": False},  # Same-user Linux/macOS attachment to this gateway.
         # Named-profile allowlist for multiplex mode. None = serve all; [] = default only.
         "multiplex_profile_allowlist": None,
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
