@@ -1347,6 +1347,9 @@ class GatewayStartupMixin:
         )
         if _aborted:
             return True
+        from gateway.acp_bridge import start_attachment
+        if await start_attachment(self) is not None:
+            connected_count += 1
         if self._start_handle_no_connections(
             connected_count, enabled_platform_count, startup_retryable_errors, startup_nonretryable_errors
         ):

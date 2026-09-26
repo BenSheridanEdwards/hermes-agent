@@ -78,6 +78,9 @@ _ACP_FLAGS = (
 
 def cmd_acp(args):
     """Launch Hermes Agent as an ACP server."""
+    if getattr(args, "attach", False):
+        from acp_adapter.attach import main
+        return main()
     try:
         from acp_adapter.entry import main as acp_main
         acp_main([flag for attr, flag in _ACP_FLAGS if getattr(args, attr, False)])
