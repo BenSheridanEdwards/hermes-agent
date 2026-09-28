@@ -593,11 +593,6 @@ def _print_nonretryable_auth_guidance(
         return
     if provider == "nous" and _print_nous_entitlement_guidance(agent, "Nous model access"):
         return
-    external_error = getattr(agent, "_external_credential_error", None)
-    if external_error is not None and status_code in (401, 403):
-        # Manager-owned grant: `hermes auth` / `codex` re-login advice would create a second writer.
-        _vlines(agent, f"   💡 {external_error}")
-        return
     if provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
         if provider == "openai-codex":
             _vlines(

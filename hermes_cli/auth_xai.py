@@ -355,9 +355,7 @@ def _refresh_xai_oauth_tokens(
     tokens: Dict[str, Any], *, token_endpoint: str, redirect_uri: str = "", timeout_seconds: float
 ) -> Dict[str, Any]:
     # Keep the stored auth_mode (legacy logins may carry ``oauth_pkce``): refresh must not relabel it.
-    from agent.credential_policy import refuse_external_refresh
     from hermes_cli.auth import _load_auth_store, _load_provider_state, refresh_xai_oauth_pure
-    refuse_external_refresh("xai-oauth")
     try:
         state = _load_provider_state(_load_auth_store(), "xai-oauth") or {}
         auth_mode = str(state.get("auth_mode") or "oauth_device_code")
@@ -435,8 +433,7 @@ def resolve_xai_oauth_runtime_credentials(
     data = _read_xai_oauth_tokens()
     tokens = dict(data["tokens"])
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
-    from agent.credential_policy import external_refresh_skipped
-    if _should_refresh(data) and not external_refresh_skipped("xai-oauth", force=force_refresh):
+    if _should_refresh(data):
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             # Re-read under the lock: a concurrent caller may already have rotated the grant.
             data = _read_xai_oauth_tokens(_lock=False)

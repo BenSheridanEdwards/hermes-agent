@@ -14,88 +14,11 @@ from pathlib import Path
 import re
 import tempfile
 
-from hermes_cli.auth_constants import AuthError
 from hermes_constants import get_hermes_home
-
-#: ``AuthError.code`` for a rejected credential whose refresh is owned externally.
-EXTERNAL_REFRESH_OWNER_CODE = "external_refresh_owner"
 
 
 class CredentialPolicyError(RuntimeError):
     pass
-
-
-class ExternalCredentialExpired(CredentialPolicyError, AuthError):
-    """An externally owned OAuth credential was rejected and its store holds nothing newer.
-
-    Hermes must not refresh it (the manager owns the grant), mark it exhausted for
-    every consumer, or rotate onto another pooled account. Subclasses ``AuthError``
-    so existing auth-error handling and formatting still apply.
-    """
-
-    code = EXTERNAL_REFRESH_OWNER_CODE
-
-    def __init__(self, provider: str, detail: str = "") -> None:
-        message = (
-            f"FLEET credential for {provider} expired or was rejected — refresh/renew the grant "
-            "in FLEET (Hermes does not refresh externally owned OAuth credentials)."
-        )
-        if detail:
-            message = f"{message} {detail}"
-        AuthError.__init__(self, message, provider=provider, code=EXTERNAL_REFRESH_OWNER_CODE,
-                           relogin_required=False)
-
-
-_UNSET = object()
-
-
-def refresh_externally_owned(provider: str, *, policy=_UNSET) -> bool:
-    """True when something other than this Hermes process owns *provider*'s OAuth refresh.
-
-    Either the profile's credential policy binds the provider (a FLEET assignment),
-    or config sets ``oauth.refresh_owner: external``. Externally owned credentials are
-    read-only here: Hermes re-reads the bound store but never POSTs a refresh token.
-    Pass *policy* (possibly ``None``) to reuse an already-loaded policy; an unreadable
-    policy raises ``CredentialPolicyError`` rather than permitting a refresh.
-    """
-    provider = (provider or "").strip().lower()
-    if policy is _UNSET:
-        policy = load_policy()
-    if policy is not None and provider in policy.accounts:
-        return True
-    from hermes_cli.auth import runtime_owns_oauth_refresh
-    return not runtime_owns_oauth_refresh(provider)
-
-
-def refuse_external_refresh(provider: str) -> None:
-    """Raise ``ExternalCredentialExpired`` before any code path spends an externally owned refresh token."""
-    if refresh_externally_owned(provider):
-        raise ExternalCredentialExpired(provider)
-
-
-def external_refresh_skipped(provider: str, *, force: bool) -> bool:
-    """Gate for singleton resolvers about to refresh *provider*.
-
-    Returns ``False`` when Hermes owns refresh (proceed). Under external
-    ownership a proactive refresh is skipped (``True``: serve the stored token,
-    the manager rotates it) and a forced one — the token was rejected — raises
-    ``ExternalCredentialExpired``.
-    """
-    if not refresh_externally_owned(provider):
-        return False
-    if force:
-        raise ExternalCredentialExpired(provider)
-    return True
-
-
-def refresh_owner(policy) -> str:
-    """``"external"`` when *policy* binds an OAuth account or config hands refresh away."""
-    if policy is not None and policy.accounts:
-        return "external"
-    from hermes_cli.auth import EXTERNALLY_SCHEDULABLE_OAUTH_PROVIDERS, runtime_owns_oauth_refresh
-    if any(not runtime_owns_oauth_refresh(p) for p in sorted(EXTERNALLY_SCHEDULABLE_OAUTH_PROVIDERS)):
-        return "external"
-    return "hermes"
 
 
 _environment_revisions: dict[str, str] = {}
@@ -344,15 +267,8 @@ def restore_assigned_environment(home: Path, environ) -> None:
 
 
 def capabilities_command(_args) -> None:
-    # ``refresh_owner`` reports THIS profile's effective owner; ``refresh_owner_modes`` lets a
-    # manager detect, before assigning anything, that this Hermes honours external ownership.
-    try:
-        owner = refresh_owner(load_policy())
-    except CredentialPolicyError:
-        owner = "external"  # A configured-but-unreadable policy is still manager-owned.
     print(json.dumps({"credential_policy": 1, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
-                      "refresh_owner": owner, "activation": "reload",
-                      "refresh_owner_modes": ["hermes", "external"]}))
+                      "refresh_owner": "hermes", "activation": "reload"}))
 
 
 # Operator-owned assignment, deliberately narrower than skill env_passthrough.
