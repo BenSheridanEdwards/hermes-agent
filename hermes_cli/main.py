@@ -462,6 +462,15 @@ def _resolve_sudo_user_profile_env(name: str) -> str | None:
         return None
 
 
+def _first_non_flag(argv: list) -> str | None:
+    """First token that is not a flag: the subcommand in the common ``hermes <cmd> ...`` shape.
+
+    Pre-parse heuristic (runs before argparse and before any hermes import), shared by the
+    supervisor and auth-store guards below.
+    """
+    return next((a for a in argv if not a.startswith("-")), None)
+
+
 def _under_gateway_supervisor(argv: list) -> bool:
     """A supervisor-launched gateway child must NOT follow the sticky active_profile.
 
@@ -484,7 +493,7 @@ def _under_gateway_supervisor(argv: list) -> bool:
     """
     if os.environ.get("HERMES_SUPERVISED_CHILD") or os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
         return True
-    is_gateway_cmd = next((a for a in argv if not a.startswith("-")), None) == "gateway"
+    is_gateway_cmd = _first_non_flag(argv) == "gateway"
     if is_gateway_cmd and os.environ.get("INVOCATION_ID"):
         return True
     return os.environ.get(
@@ -504,6 +513,12 @@ def _apply_profile_override() -> None:
     # `hermes profile use` and the gateway should honour it (#22502).
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env and Path(hermes_home_env).parent.name == "profiles":
+        return
+    # Credential writes must land in the store the caller named. `HERMES_HOME=~/.hermes hermes auth
+    # add ...` used to follow active_profile and write the login into that profile's auth.json, so
+    # an explicit HERMES_HOME (root included) is authoritative for `hermes auth`; `-p <name>` still
+    # wins, and without HERMES_HOME the sticky active profile still applies.
+    if profile_name is None and hermes_home_env and _first_non_flag(argv) == "auth":
         return
 
     if profile_name is None and not _under_gateway_supervisor(argv):

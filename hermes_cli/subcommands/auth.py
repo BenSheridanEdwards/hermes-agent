@@ -55,6 +55,14 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_refresh.add_argument(
         "target", nargs="?",
         help="Credential index, entry id, or exact label (required when the pool holds more than one)")
+    auth_reauth = auth_subparsers.add_parser(
+        "reauth",
+        help="Sign in again and renew an existing OAuth row in place (same id, label, priority)")
+    auth_reauth.add_argument("provider", help="Provider id (openai-codex, xai-oauth)")
+    auth_reauth.add_argument("target", help="Credential entry id or exact label to renew")
+    auth_reauth.add_argument(
+        "--no-browser", action="store_true", help="Do not auto-open a browser for OAuth login")
+    auth_reauth.add_argument("--timeout", type=float, help="OAuth/network timeout in seconds")
     auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
     auth_status.add_argument("provider", help="Provider id")
     auth_logout = auth_subparsers.add_parser(
