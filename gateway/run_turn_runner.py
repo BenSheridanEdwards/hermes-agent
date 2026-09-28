@@ -797,7 +797,11 @@ class TurnRunner:
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
         want_interim_messages = ctx.interim_assistant_messages_enabled
-        if want_stream_deltas or want_interim_messages:
+        from gateway.acp_observer import current_turn
+        # Local ACP owns its chunk stream. Native adapters still get their own
+        # consumer; local send() remains available for real operational notices.
+        local_observer = platform_key == "local" and current_turn.get() is not None
+        if (want_stream_deltas or want_interim_messages) and not local_observer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._adapter_for_source(ctx.source)
@@ -1644,9 +1648,15 @@ class TurnRunner:
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        from gateway.acp_observer import current_turn
+        attached = current_turn.get()
+        if attached is not None:
+            attached.bind(agent, ctx)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        if attached is not None:
+            attached.result = result
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.

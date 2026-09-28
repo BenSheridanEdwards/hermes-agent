@@ -1036,7 +1036,8 @@ class GatewayAdapterLifecycleMixin:
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
-        adapter.set_message_handler(message_handler or self._primary_message_handler())
+        from gateway.acp_observer import observed_handler
+        adapter.set_message_handler(observed_handler(message_handler or self._primary_message_handler(), self))
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._handle_active_session_busy_message)
