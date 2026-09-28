@@ -1,9 +1,8 @@
 """Pure stdio forwarding. Do not import agent, provider or session-store modules here."""
 import asyncio
-import os
 import sys
 
-from acp_adapter.local_transport import MAX_FRAME, check_private, endpoint, peer_uid
+from acp_adapter.local_transport import MAX_FRAME, _current_uid, check_private, endpoint, peer_uid
 from hermes_constants import get_hermes_home
 
 
@@ -12,7 +11,7 @@ async def forward():
     check_private(path.parent, directory=True)
     check_private(path)
     reader, writer = await asyncio.open_unix_connection(path, limit=MAX_FRAME)
-    if peer_uid(writer.get_extra_info("socket")) != os.getuid():
+    if peer_uid(writer.get_extra_info("socket")) != _current_uid():
         writer.close()
         raise PermissionError("ACP gateway peer is not the current user")
     loop = asyncio.get_running_loop()

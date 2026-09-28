@@ -22,6 +22,14 @@ MAX_REQUESTS = 64
 QUEUE_SIZE = 64
 
 
+def _current_uid() -> int:
+    """Owner identity for the same-user checks; POSIX-only by design."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise OSError(errno.ENOTSUP, "canonical ACP attachment requires a POSIX platform")
+    return getuid()
+
+
 def peer_uid(sock):
     if sys.platform == "linux":
         return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
@@ -41,7 +49,7 @@ def endpoint(home):
 def check_private(path, *, directory=False):
     info = path.lstat()
     expected = stat.S_ISDIR if directory else stat.S_ISSOCK
-    if not expected(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not expected(info.st_mode) or info.st_uid != _current_uid() or info.st_mode & 0o077:
         raise PermissionError(f"Unsafe ACP endpoint: {path}")
 
 
@@ -76,7 +84,7 @@ class ACPListener:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != _current_uid()
                     or info.st_mode & 0o077 or info.st_nlink != 1):
                 raise PermissionError("Unsafe ACP ownership lock")
             try:
@@ -138,7 +146,7 @@ class ACPListener:
         self._identity = None
 
     async def _accept(self, reader, writer):
-        if len(self.clients) >= MAX_CLIENTS or peer_uid(writer.get_extra_info("socket")) != os.getuid():
+        if len(self.clients) >= MAX_CLIENTS or peer_uid(writer.get_extra_info("socket")) != _current_uid():
             writer.close()
             return
         self.clients.add(writer)
