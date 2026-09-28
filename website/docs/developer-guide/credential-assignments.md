@@ -4,9 +4,12 @@ title: External credential assignments
 
 An operator can opt a profile into an external credential manager with
 `hermes --profile NAME config set credential_policy.file /absolute/assignments.json`.
-The manager owns assignment references; Hermes still owns OAuth tokens, refresh,
-locking, and the credential stores. FLEET Access is the first consumer.
-`hermes auth policy-capabilities` returns the supported contract without secrets.
+The manager owns assignment references **and the OAuth refresh of every account it
+binds**; Hermes only reads those credentials. FLEET Access is the first consumer.
+`hermes auth policy-capabilities` returns the supported contract without secrets:
+`refresh_owner` is this profile's effective owner (`external` when accounts are bound
+or `oauth.refresh_owner: external` is set, else `hermes`), and `refresh_owner_modes`
+lists the modes this Hermes understands.
 Unconfigured profiles retain normal resolution.
 
 ```json
@@ -44,11 +47,18 @@ route. Missing credentials fail with an assignment/sign-in error rather than usi
 another account. Adding an account is still Hermes's login operation, performed in
 the owning store before the manager assigns its ID.
 
-Refresh uses Hermes's provider code and the **owning store's lock**. Rotations update
-only assigned existing rows, preserve unrelated accounts, and keep device-code
-singleton state in that same store current. Environment credentials stay ephemeral;
-selection does not create a reusable profile-local copy. Managers should observe
-refresh rather than run a second periodic refresh service.
+A bound OAuth account is **read-only in Hermes**. Hermes never POSTs its refresh
+token — not proactively, not on selection or leasing, not after a 401, not from the
+auxiliary client or the singleton resolvers. Instead it re-reads the bound store and
+adopts tokens the manager wrote there. When a request is rejected and the store holds
+the same token, Hermes raises/logs `FLEET credential for <provider> expired or was
+rejected — refresh/renew the grant in FLEET`, does not mark the shared row exhausted,
+and does not rotate onto another pooled account of that provider (configured fallback
+providers still run). The manager is the sole refresh-token writer and should alert on
+expiring grants. Setting `oauth.refresh_owner: external` in `config.yaml` applies the
+same read-only behaviour to Codex and xAI OAuth without an assignment; unassigned
+profiles with no such setting keep refreshing their own credentials. Environment
+credentials stay ephemeral; selection does not create a reusable profile-local copy.
 
 Local foreground, background, and PTY terminals receive explicitly assigned
 `GITHUB_TOKEN`/`GH_TOKEN` values from the source snapshot. When only `GITHUB_TOKEN`

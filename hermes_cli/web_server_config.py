@@ -166,6 +166,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
 # nous, telegram) currently surface a single schema field each.
 _CATEGORY_MERGE: Dict[str, str] = {
     "privacy": "security",
+    # Refresh ownership controls which process may spend OAuth refresh tokens,
+    # so expose the single oauth setting alongside the existing security
+    # controls rather than creating a one-field dashboard tab.
+    "oauth": "security",
     "context": "agent",
     "skills": "agent",
     "cron": "agent",
