@@ -36,6 +36,7 @@ from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (
     QueuedPrompt, SessionManager, SessionState, _expand_acp_enabled_toolsets, default_acp_toolsets,
 )
+from acp_adapter.steering import STEERING_META, SteeringMixin, strip_event_queue_directives
 from acp_adapter.voice import (
     VoiceTurn, bind_voice_turn, cleanup_voice_turn, prepare_voice_turn, replay_voice_turn,
     sweep_audio_cache,
@@ -231,7 +232,7 @@ class _TurnCallbacks:
     streamed: bool = False
 
 
-class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+class HermesACPAgent(SteeringMixin, SlashCommandsMixin, acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
@@ -523,6 +524,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 ),
             ),
             auth_methods=auth_methods,
+            # Non-cancelling mid-turn steering (``_session/steering``), see acp_adapter.steering.
+            field_meta=dict(STEERING_META),
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
@@ -870,14 +873,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.is_running = True
                 state.current_prompt_text = user_text or "[Image attachment]"
                 return None
-            if text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
-                getattr(state.agent, "_supports_active_turn_redirect", False) is True
-            ):
-                try:
-                    if state.agent.redirect(user_content):
-                        return "Redirected the active turn with your correction."
-                except Exception:
-                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
+            if text_only and isinstance(user_content, str) and self._inject_into_active_turn(state, user_content):
+                return "Redirected the active turn with your correction."
             state.queued_prompts.append(QueuedPrompt(user_text or "[Image attachment]", voice=voice))
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
@@ -993,6 +990,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             user_text, user_content = self._rewrite_prompt_for_interrupt(
                 state, user_text, user_content, text_only_prompt)
+            # A host-rendered ``Content: /queue …`` on an ordinary prompt has nothing to wait
+            # for; drop the directive so the model never reads it as the user's words.
+            if text_only_prompt and isinstance(user_content, str):
+                user_text, user_content = strip_event_queue_directives(user_text), strip_event_queue_directives(user_content)
 
             # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
             if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
