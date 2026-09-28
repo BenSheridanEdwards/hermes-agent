@@ -343,6 +343,9 @@ class SearchMixin:
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
+        # start_new_session makes rg its own group leader; record the group so
+        # the teardown still has it once rg has exited on its own.
+        proc._hermes_pgid = proc.pid
 
         # Drain on a thread so a silent rg (huge tree, no hits yet) cannot pin the
         # caller past the deadline or past a /stop; the waiter below owns both.
