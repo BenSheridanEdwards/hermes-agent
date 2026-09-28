@@ -3334,6 +3334,15 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
         return True
 
     if _is_auth_error(exc):
+        if getattr(pool, "refresh_externally_owned", lambda: False)() is True:
+            # Manager-owned (FLEET) grant: adopt a newer stored token or give up —
+            # never refresh, never bench the shared entry, never rotate accounts.
+            if pool.adopt_external_credential(api_key_hint=failed_api_key or None) is not None:
+                _evict_cached_clients(normalized)
+                return True
+            from agent.credential_policy import ExternalCredentialExpired
+            logger.error("Auxiliary client: %s", ExternalCredentialExpired(normalized))
+            return False
         if pool.try_refresh_current() is not None:
             _evict_cached_clients(normalized)
             return True
@@ -3442,6 +3451,9 @@ def _refresh_anthropic_credentials(failed_api_key: str = "") -> bool:
     pool = load_pool("anthropic")
     if pool.entry_id_for_api_key(token):
         return pool.try_refresh_matching(api_key_hint=token) is not None
+    from agent.credential_policy import refresh_externally_owned
+    if refresh_externally_owned("anthropic"):
+        return False  # An assigned account never falls back to spending an ambient login's grant.
     creds = read_claude_code_credentials()
     # Never spend an ambient login's refresh rotation for another request's key.
     if isinstance(creds, dict) and creds.get("accessToken") == token and creds.get("refreshToken"):
@@ -3489,7 +3501,11 @@ def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") ->
         _evict_cached_clients(normalized)
         return True
     except Exception as exc:
-        logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
+        from agent.credential_policy import ExternalCredentialExpired
+        if isinstance(exc, ExternalCredentialExpired):
+            logger.error("Auxiliary client: %s", exc)
+        else:
+            logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
 
 

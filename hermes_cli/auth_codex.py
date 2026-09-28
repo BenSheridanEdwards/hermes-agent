@@ -329,7 +329,11 @@ def refresh_codex_oauth_pure(
 
 def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token."""
+    from agent.credential_policy import refuse_external_refresh
     from hermes_cli.auth import _save_codex_tokens, refresh_codex_oauth_pure
+    # Also blocks the Codex-CLI self-heal import below: under external ownership
+    # the manager's store is the only token authority.
+    refuse_external_refresh("openai-codex")
     try:
         refreshed = refresh_codex_oauth_pure(
             str(tokens.get("access_token", "") or ""), str(tokens.get("refresh_token", "") or ""),
@@ -405,7 +409,12 @@ def resolve_codex_runtime_credentials(
             imported = _recover_codex_tokens_from_cli(str(exc.code or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+    from agent.credential_policy import external_refresh_skipped
     if data is None:
+        if force_refresh:
+            # The pool fallback cannot refresh; under external ownership returning the
+            # same rejected token as "refreshed" would hide the expired grant.
+            external_refresh_skipped("openai-codex", force=True)
         pool_token = _pool_codex_access_token()
         if pool_token:
             return _codex_runtime_result(pool_token, source="credential_pool", last_refresh=None)
@@ -437,7 +446,7 @@ def resolve_codex_runtime_credentials(
         return bool(force_refresh) or (
             refresh_if_expiring and _codex_access_token_is_expiring(token, refresh_skew_seconds))
 
-    if _should_refresh(access_token):
+    if _should_refresh(access_token) and not external_refresh_skipped("openai-codex", force=force_refresh):
         # Re-read under lock to avoid racing with other Hermes processes
         lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
         with _auth_store_lock(timeout_seconds=lock_timeout):

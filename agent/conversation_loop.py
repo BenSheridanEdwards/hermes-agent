@@ -1465,6 +1465,7 @@ def run_conversation(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
+    agent._external_credential_error = None  # Per-turn: a renewed FLEET grant must not keep old advice.
     agent._last_turn_usage = None
 
     s = _LoopState(

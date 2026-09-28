@@ -1403,9 +1403,100 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     # ---- refresh -----------------------------------------------------------
 
+    def refresh_externally_owned(self) -> bool:
+        """True when a manager (FLEET assignment or ``oauth.refresh_owner: external``) owns refresh.
+
+        Reuses the policy this pool was loaded under, so a pool built without a
+        policy only consults config. Externally owned entries are read-only here.
+        """
+        from agent.credential_policy import refresh_externally_owned
+        return refresh_externally_owned(self.provider, policy=getattr(self, "_credential_policy", None))
+
+    def _reread_external_store(self, entry: PooledCredential) -> PooledCredential:
+        """Adopt tokens another writer put in the entry's bound store; never POSTs.
+
+        A policy-bound provider re-reads its assigned store (raising if the
+        assignment row vanished). Config-external ownership re-reads the
+        persisted pool row, then the provider's auth.json singleton.
+        """
+        from agent.credential_policy import sync_managed_entry
+        policy = getattr(self, "_credential_policy", None)
+        if policy is not None and self.provider in policy.accounts:
+            return sync_managed_entry(self, entry)
+        persisted = next(
+            (p for p in read_credential_pool(self.provider) if isinstance(p, dict) and p.get("id") == entry.id),
+            None,
+        )
+        if isinstance(persisted, dict):
+            stored = PooledCredential.from_dict(self.provider, persisted)
+            if (stored.access_token or "").strip() and (
+                stored.access_token != entry.access_token
+                or (stored.refresh_token and stored.refresh_token != entry.refresh_token)
+            ):
+                self._replace_entry(entry, stored)
+                return stored
+        if self.provider in _TOKENS_SINGLETON_PROVIDERS:
+            return self._sync_entry_from_auth_store(entry)
+        return entry
+
+    def _adopt_externally_refreshed(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        """External-owner replacement for a refresh: re-read the store, never spend a refresh token.
+
+        Proactive callers (``force=False``) keep the entry (fresh or not) so the
+        manager's refresher, not Hermes, decides when it rotates. A forced caller
+        (a rejected token) gets ``None`` when the store holds nothing newer —
+        without marking the entry exhausted, since the grant is shared state.
+        """
+        synced = self._reread_external_store(entry)
+        if synced is not entry:
+            logger.info(
+                "credential pool: adopted externally refreshed %s credential %s",
+                self.provider, synced.label or synced.id[:8],
+            )
+            return synced
+        if force:
+            logger.warning(
+                "credential pool: %s credential %s needs a refresh but its refresh is externally "
+                "owned and the store holds nothing newer; not refreshing",
+                self.provider, entry.label or entry.id[:8],
+            )
+            return None
+        return entry
+
+    def adopt_external_credential(
+        self, *, api_key_hint: Optional[str] = None, credential_id: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """After a rejected request on an externally owned credential, return a newer token or ``None``.
+
+        Re-reads the failed entry's bound store and returns it only when it now
+        carries a runtime key different from the one that was rejected. Never
+        refreshes, marks exhausted, or rotates to another pooled account.
+        """
+        with self._lock:
+            entry = self._identify_failed_entry(credential_id, api_key_hint)
+            if entry is None and credential_id:
+                entry = self._find(lambda e: e.id == credential_id)
+            if entry is None and not api_key_hint:
+                entry = self._current_unlocked()
+            if entry is None and api_key_hint and len(self._entries) == 1:
+                # A freshly loaded pool no longer holds the rejected key because the
+                # store was already rotated. Only a sole entry is unambiguously the
+                # same account; with several, adopting one would be a silent switch.
+                entry = self._entries[0]
+            if entry is None:
+                return None
+            synced = self._reread_external_store(entry)
+            key = (synced.runtime_api_key or "").strip()
+            if not key or (api_key_hint and key == api_key_hint) or (not api_key_hint and synced is entry):
+                return None
+            self._current_id = synced.id
+            return synced
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         from agent.credential_policy import check_pool_revision
         check_pool_revision(self)
+        if self.refresh_externally_owned():
+            return self._adopt_externally_refreshed(entry, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1871,6 +1962,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         available: List[PooledCredential] = []
         pending_refresh: List[PooledCredential] = []
         sole_credential = self._is_sole_credential()
+        external: Optional[bool] = None  # Resolved lazily: only an entry needing refresh reads config.
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
@@ -1914,7 +2006,13 @@ class CredentialPool(CredentialPoolAdminMixin):
                     entry = self._adopt(entry, persist=False, **_MARK_OK)
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
-                if self.provider in _TOKENS_SINGLETON_PROVIDERS:
+                if external is None:
+                    external = self.refresh_externally_owned()
+                if external:
+                    # Disk re-read only (no network): adopt the manager's rotation
+                    # inline and keep the entry selectable either way.
+                    entry = self._adopt_externally_refreshed(entry, force=False) or entry
+                elif self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)
                     continue
                 refreshed = self._refresh_entry(entry, force=False)
@@ -2070,6 +2168,16 @@ class CredentialPool(CredentialPoolAdminMixin):
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[PooledCredential]:
+        if (status_code in (401, 403) or failure_reason in ("auth", "auth_permanent")) and self.refresh_externally_owned():
+            # The grant is shared manager state: benching it here would take it
+            # offline for every consumer, and rotating would silently switch
+            # accounts. Surface the rejection instead (see adopt_external_credential).
+            logger.error(
+                "credential pool: %s credential rejected (status=%s) but its refresh is externally "
+                "owned; not marking it exhausted or rotating — renew the grant in FLEET",
+                self.provider, status_code,
+            )
+            return None
         with self._lock:
             identity_supplied = bool(credential_id or api_key_hint)
             entry = self._identify_failed_entry(credential_id, api_key_hint)

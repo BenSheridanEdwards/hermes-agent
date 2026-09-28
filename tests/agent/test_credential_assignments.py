@@ -72,7 +72,9 @@ def test_assign_use_revoke_never_falls_back_to_dotenv_or_saved_pool(assigned, mo
         resolve_runtime_provider(requested="openrouter")
 
 
-def test_shared_account_refresh_stays_in_owner_store_and_preserves_unassigned_rows(assigned, monkeypatch):
+def test_shared_assigned_account_is_read_only_and_adopts_owner_rotation(assigned, monkeypatch):
+    """The manager owns an assigned grant: Hermes never POSTs its refresh token, even when
+    expired, and every assigned profile adopts the rotation the owner writes to the store."""
     root, profile = assigned
     account = {"id": "shared", "label": "Work", "source": "manual:hermes_pkce", "auth_type": "oauth", "priority": 0,
                "access_token": "sk-ant-oat01-old", "refresh_token": "rt-old", "expires_at_ms": 1, "base_url": "https://api.anthropic.com"}
@@ -88,20 +90,21 @@ def test_shared_account_refresh_stays_in_owner_store_and_preserves_unassigned_ro
         monkeypatch.setenv("HERMES_HOME", str(home))
         pools.append(load_pool("anthropic"))
     calls = []
-    class Response(io.BytesIO):
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
     def refresh(request, timeout=None):
-        body = json.loads(request.data)
-        assert body["refresh_token"] == "rt-old" and not calls
-        calls.append(body["refresh_token"])
-        return Response(json.dumps({"access_token": "sk-ant-oat01-new", "refresh_token": "rt-new", "expires_in": 28800}).encode())
+        calls.append(request.full_url)
+        raise AssertionError("assigned grant must not be refreshed by Hermes")
     monkeypatch.setattr(urllib.request, "urlopen", refresh)
     for home, pool in zip(homes, pools):
         monkeypatch.setenv("HERMES_HOME", str(home))
         selected = pool.select()
+        assert selected.id == "shared" and selected.access_token == "sk-ant-oat01-old"
+    rotated = {**account, "access_token": "sk-ant-oat01-new", "refresh_token": "rt-new", "expires_at_ms": 4102444800000}
+    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [rotated, other]}}))
+    for home, pool in zip(homes, pools):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        selected = pool.select()
         assert selected.id == "shared" and selected.access_token == "sk-ant-oat01-new"
-    assert len(calls) == 1
+    assert calls == []
     rows = json.loads((root / "auth.json").read_text())["credential_pool"]["anthropic"]
     assert rows[0]["refresh_token"] == "rt-new" and rows[1] == other
     for home in homes:
@@ -146,14 +149,12 @@ def test_github_grant_reaches_local_terminal_but_not_other_children_or_later_pro
     assert result["returncode"] == 0
 
 
-def test_codex_rotation_updates_root_singleton_without_overwriting_profile_account(assigned, monkeypatch):
+def test_assigned_codex_is_never_refreshed_and_leaves_both_stores_untouched(assigned, monkeypatch):
     import base64
-    import time
-    import httpx
     root, profile = assigned
     def token(exp):
         return 'eyJhbGciOiJub25lIn0.' + base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip('=') + '.signature'
-    expired, fresh = token(1), token(int(time.time()) + 3600)
+    expired = token(1)
     account = {"id": "shared", "label": "Work", "source": "device_code", "auth_type": "oauth", "priority": 0,
                "access_token": expired, "refresh_token": "rt-old", "base_url": "https://chatgpt.com/backend-api/codex"}
     store = {"providers": {"openai-codex": {"tokens": {"access_token": expired, "refresh_token": "rt-old"}}},
@@ -164,18 +165,18 @@ def test_codex_rotation_updates_root_singleton_without_overwriting_profile_accou
     (home / "auth.json").write_text(json.dumps(local))
     monkeypatch.setenv("HERMES_HOME", str(home))
     from hermes_cli import auth_codex
+    posts = []
     class Client:
         def __enter__(self): return self
         def __exit__(self, *args): return False
         def post(self, url, **kwargs):
-            assert kwargs["data"]["refresh_token"] == "rt-old"
-            return httpx.Response(200, json={"access_token": fresh, "refresh_token": "rt-new"})
+            posts.append(url)
+            raise AssertionError("assigned Codex grant must not be refreshed by Hermes")
     monkeypatch.setattr(auth_codex, "_codex_http_client", lambda **kwargs: Client())
     from agent.credential_pool import load_pool
-    assert load_pool("openai-codex").select().access_token == fresh
-    saved = json.loads((root / "auth.json").read_text())
-    assert saved["providers"]["openai-codex"]["tokens"]["refresh_token"] == "rt-new"
-    assert saved["credential_pool"]["openai-codex"][0]["refresh_token"] == "rt-new"
+    assert load_pool("openai-codex").select().access_token == expired
+    assert posts == []
+    assert json.loads((root / "auth.json").read_text()) == store
     assert json.loads((home / "auth.json").read_text()) == local
 
 

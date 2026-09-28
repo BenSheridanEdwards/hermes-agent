@@ -857,6 +857,9 @@ class ClientLifecycleMixin:
         ):
             return False
         try:
+            from agent.credential_policy import refresh_externally_owned
+            if refresh_externally_owned("anthropic"):
+                return False  # Assigned grant: the pool re-reads its store; no ambient refresh.
             from agent.anthropic_credentials import resolve_anthropic_token
             new_token = resolve_anthropic_token()
         except Exception as exc:
