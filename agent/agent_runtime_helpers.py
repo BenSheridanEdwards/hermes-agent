@@ -711,39 +711,6 @@ def _is_entitlement_403(agent, status_code, error_context) -> bool:
     return False
 
 
-def _pool_refresh_externally_owned(pool) -> bool:
-    # Identity check, not truthiness: a mocked or foreign pool must not opt into read-only mode.
-    probe = getattr(pool, "refresh_externally_owned", None)
-    return callable(probe) and probe() is True
-
-
-def _recover_external_auth_failure(agent, pool, *, has_retried_429, api_key_hint, credential_id):
-    """401/403 on a manager-owned (FLEET) credential: adopt a newer stored token or surface the error.
-
-    Never refreshes, never marks the shared entry exhausted, never rotates onto
-    another pooled account of the provider. A newer token is retried once by
-    construction: the next rejection of that token finds the store unchanged.
-    Returning ``False`` lets the normal fallback-provider chain run.
-    """
-    adopted = pool.adopt_external_credential(api_key_hint=api_key_hint, credential_id=credential_id)
-    if adopted is not None:
-        _ra().logger.info(
-            "Credential auth failure — adopted externally refreshed pool entry %s; retrying once",
-            getattr(adopted, "id", "?"),
-        )
-        agent._external_credential_error = None
-        agent._swap_credential(adopted)
-        return True, has_retried_429
-    from agent.credential_policy import ExternalCredentialExpired
-    error = ExternalCredentialExpired(getattr(pool, "provider", "") or agent.provider or "provider")
-    agent._external_credential_error = error
-    _ra().logger.error("%s Not refreshing, exhausting, or rotating this credential.", error)
-    warn = getattr(agent, "_emit_warning", None)
-    if callable(warn):
-        warn(f"⚠️  {error}")
-    return False, has_retried_429
-
-
 def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
     if _is_entitlement_403(agent, status_code, error_context):
         _ra().logger.info(
@@ -753,11 +720,6 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
             agent.provider or "provider",
         )
         return False, has_retried_429
-    if _pool_refresh_externally_owned(pool):
-        return _recover_external_auth_failure(
-            agent, pool, has_retried_429=has_retried_429, api_key_hint=api_key_hint,
-            credential_id=credential_id,
-        )
     # Refresh the entry that supplied the failing key, not current(): refreshing a healthy entry
     # burns its single-use refresh token for a failure it never had.
     refresh_kwargs = {"api_key_hint": api_key_hint}

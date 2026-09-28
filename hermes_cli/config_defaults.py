@@ -24,10 +24,6 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
-    # refresh_owner: "runtime" (standalone Hermes refreshes its own Codex / xAI OAuth tokens) or
-    # "external" (a manager such as FLEET is the sole refresh-token writer; Hermes only re-reads
-    # the store). A credential_policy account binding makes that provider external regardless.
-    "oauth": {"refresh_owner": "runtime"},
     "toolsets": ["hermes-cli"],
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
     # weak-fsync/shared filesystems where WAL is not crash-safe (macOS virtiofs, NFS, SMB).

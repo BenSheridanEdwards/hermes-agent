@@ -117,61 +117,6 @@ try:
 except Exception:
     msvcrt = None
 
-#: Providers whose refresh ownership ``oauth.refresh_owner`` can hand to an
-#: external scheduler. Other providers stay runtime-owned under that key; a
-#: credential-policy binding (``agent.credential_policy``) makes ANY bound
-#: provider externally owned regardless of this set.
-EXTERNALLY_SCHEDULABLE_OAUTH_PROVIDERS = frozenset({"openai-codex", "xai-oauth"})
-
-
-def runtime_owns_oauth_refresh(provider: str) -> bool:
-    """Return whether config lets this process spend the provider's refresh token.
-
-    Ownership contract for the externally schedulable OAuth providers
-    (openai-codex, xai-oauth): missing ownership configuration preserves
-    standalone Hermes behavior. Once an ``oauth`` block is present, malformed
-    or unknown ownership fails closed so a typo cannot silently create a second
-    refresh-token writer. Other providers remain runtime-owned.
-
-    Ported from the fleet runtime branch (2b8570a28d, f46beee0a7). Callers
-    that also honour credential-policy bindings should use
-    ``agent.credential_policy.refresh_externally_owned`` instead.
-    """
-    if provider not in EXTERNALLY_SCHEDULABLE_OAUTH_PROVIDERS:
-        return True
-    config_path = get_config_path()
-    if not config_path.exists():
-        return True
-    try:
-        raw_config_text = config_path.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("OAuth refresh ownership unreadable; refusing runtime refresh")
-        return False
-    if not raw_config_text.strip() or all(
-        not line.strip() or line.lstrip().startswith("#")
-        for line in raw_config_text.splitlines()
-    ):
-        return True
-    config = read_raw_config()
-    if not config:
-        if raw_config_text.strip() in {"{}", "---", "---\n{}"}:
-            return True
-        logger.warning("OAuth refresh ownership unavailable; refusing runtime refresh")
-        return False
-    if "oauth" not in config:
-        return True
-    oauth_config = config.get("oauth")
-    if not isinstance(oauth_config, dict):
-        logger.warning("OAuth refresh ownership is invalid; refusing runtime refresh")
-        return False
-    refresh_owner = oauth_config.get("refresh_owner")
-    if refresh_owner == "runtime":
-        return True
-    if refresh_owner == "external":
-        return False
-    logger.warning("OAuth refresh owner must be runtime or external; refusing runtime refresh")
-    return False
-
 def is_actual_local_base_url(base_url: str) -> bool:
     """Return True for Actual's loopback local API endpoint."""
     try:
