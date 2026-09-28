@@ -47,6 +47,8 @@ from tools.approval_context import reset_hermes_interactive_context, set_hermes_
 
 logger = logging.getLogger(__name__)
 
+_COMPLETION_CLAIM_RENEW_SECONDS = 60
+
 # Runs the synchronous AIAgent off the event loop.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 
@@ -734,19 +736,28 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             is_async = evt.get("type") == "async_delegation"
             claim_id: str | None = None
             if is_async:
-                # Route a finished result to the turn of the thread it was
-                # dispatched from. If that session is still live here, hold the
-                # result for its own turn (the harness runs a delivery turn there,
-                # so the report lands where the asker is); only a result whose
-                # origin is gone drains into whatever turn comes next.
+                # Only the originating session may consume its result, including
+                # after restart. The harness restores that session for delivery.
                 origin = str(evt.get("session_key") or "")
-                if origin and origin != session_id and self.session_manager.get_session(origin) is not None:
+                if origin and origin != session_id:
+                    # Never restore an old session merely to test liveness, or
+                    # inject its result into an unrelated conversation. The
+                    # harness must load and prompt the originating session.
                     requeue.append(evt)
                     continue
-                claim_id = claim_event_delivery(evt, "acp")
-                if claim_id is None:
-                    # Claimed/delivered elsewhere (or already delivered on a prior turn
-                    # and replayed on restart) — drop without requeue.
+                try:
+                    claim_id = claim_event_delivery(evt, "acp")
+                    if claim_id is None:
+                        # A competing/stale claim is not successful delivery. Keep
+                        # pending events available when that lease expires.
+                        from tools.async_delegation import get_durable_delegation
+                        row = get_durable_delegation(str(evt.get("delegation_id") or ""))
+                        if row and row.get("delivery_state") == "pending":
+                            requeue.append(evt)
+                        continue
+                except Exception:
+                    logger.warning("Could not claim completion; retaining retry", exc_info=True)
+                    requeue.append(evt)
                     continue
             text: str | None = None
             try:
@@ -756,15 +767,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if not text:
                 if is_async and claim_id:
                     # Claimed but unformattable — release so it is not stuck claimed.
-                    defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
-                else:
-                    requeue.append(evt)
+                    try:
+                        defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+                    except Exception:
+                        logger.warning("Could not release unformatted completion; retaining retry", exc_info=True)
+                requeue.append(evt)
                 continue
             messages.append(text)
             if is_async and claim_id:
                 did = str(evt.get("delegation_id") or "")
                 if did:
                     claims.append((did, claim_id))
+                    if not hasattr(self, "_claimed_completion_events"):
+                        self._claimed_completion_events = {}
+                    self._claimed_completion_events[claim_id] = evt
         for evt in requeue:
             try:
                 queue.put(evt)
@@ -778,10 +794,67 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             "[BACKGROUND WORK FINISHED — REPORT IT]\n"
             "A background task you dispatched earlier has finished; its result is below. "
             "The person who asked is waiting on it. Report the outcome now, in this thread, "
-            "even if the rest of this turn says to stay silent: what finished, the result, "
-            "and what happens next. Keep it short."
+            "even if the rest of this turn says to stay silent. Inspect the result, "
+            "continue any unfinished authorized work, and verify the overall outcome. "
+            "A worker finishing is not proof that the user's task is complete. "
+            "Give a concise progress update or verified completion report."
         )
         return (header + "\n\n" + "\n\n".join(messages), claims)
+
+    def _settle_process_notifications(
+        self, claims: list[tuple[str, str]], delivered: bool, *, attempted: bool = False,
+    ) -> None:
+        from tools.async_delegation import (
+            complete_completion_delivery, defer_completion_delivery, get_durable_delegation,
+            refresh_background_work_marker, release_completion_delivery,
+        )
+        from tools.process_registry import process_registry
+        for did, claim in claims:
+            events = getattr(self, "_claimed_completion_events", {})
+            event = events.get(claim)
+            try:
+                if delivered:
+                    complete_completion_delivery(did, claim)
+                else:
+                    if attempted:
+                        release_completion_delivery(did, claim)
+                    else:
+                        defer_completion_delivery(did, claim)
+                    row = get_durable_delegation(did)
+                    if event is not None and (row is None or row["delivery_state"] == "pending"):
+                        process_registry.completion_queue.put(event)
+            except Exception:
+                # The durable row is still pending (or its commit is uncertain).
+                # Keep an in-process retry as well: do not require a restart to
+                # reconstruct a completion consumed by this turn. Its existing
+                # lease safely gates the retry until expiry if release also failed.
+                logger.warning("Could not settle completion %s; retaining retry", did, exc_info=True)
+                if event is not None:
+                    process_registry.completion_queue.put(event)
+            events.pop(claim, None)
+        if claims:
+            refresh_background_work_marker()
+
+    async def _renew_process_notification_claims(
+        self, claims: list[tuple[str, str]], state: SessionState,
+    ) -> None:
+        from tools.async_delegation import get_durable_delegation, renew_completion_delivery
+        while claims:
+            await asyncio.sleep(_COMPLETION_CLAIM_RENEW_SECONDS)
+            for did, claim in claims:
+                try:
+                    if renew_completion_delivery(did, claim):
+                        continue
+                    # Legacy in-memory events have no durable row or lease.
+                    if get_durable_delegation(did) is None:
+                        continue
+                except Exception:
+                    logger.exception("Could not renew completion delivery claim for %s", did)
+                logger.error("Lost completion delivery claim for %s; interrupting its consumer", did)
+                if state.cancel_event:
+                    state.cancel_event.set()
+                await self.cancel(state.session_id)
+                return
 
     def _claim_turn_or_queue(
         self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
@@ -904,6 +977,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # marks the paths a note has actually promised the agent or the queue; short of that,
         # nothing will ever read the note, so even a kept-on-failure clip goes.
         handed_on = False
+        delegation_claims: list[tuple[str, str]] = []
+        completion_attempted = False
+        claim_renewal: asyncio.Task | None = None
         try:
             user_text = _extract_text(prompt).strip()
             user_content = _content_blocks_to_openai_user_content(
@@ -931,7 +1007,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # on this turn. The ACP model has no idle watcher, so this drain is where
             # completions reach the agent — including on the periodic heartbeat turn,
             # which is what lets a delegated worker's result come back at all.
-            injected_text, delegation_claims = self._drain_ready_process_notifications(session_id)
+            # A queued prompt is not a durable completion delivery. Let the
+            # eventual admitted turn claim its results instead.
+            if state.is_running:
+                injected_text = ""
+            else:
+                injected_text, delegation_claims = self._drain_ready_process_notifications(session_id)
             if injected_text:
                 user_text = f"{injected_text}\n\n{user_text}".strip() if user_text else injected_text
                 if isinstance(user_content, str):
@@ -946,26 +1027,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             absorbed = self._claim_turn_or_queue(
                 state, session_id, user_text, user_content, text_only_prompt,
                 voice=bool(voice_turn and voice_turn.voice_reply))
-            # The completion text is now committed to a turn (running or queued), so
-            # acknowledge the durable rows. A crash before this replays them on restart.
-            if delegation_claims:
-                from tools.async_delegation import mark_completion_delivered
-                for _did, _claim in delegation_claims:
-                    try:
-                        mark_completion_delivered(_did)
-                    except Exception:
-                        logger.warning("Failed to mark delegation %s delivered", _did, exc_info=True)
             if absorbed is not None:
                 handed_on = True  # the notes are in the queued text, to be replayed
                 if self._conn:
                     await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
                 return PromptResponse(stop_reason="end_turn")
 
+            completion_attempted = True
             logger.info("Prompt on session %s: %s", session_id, user_text[:100])
             conn, loop = self._conn, asyncio.get_running_loop()
             if state.cancel_event:
                 state.cancel_event.clear()
             cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
+            if delegation_claims:
+                claim_renewal = asyncio.create_task(self._renew_process_notification_claims(delegation_claims, state))
 
             def _run_agent() -> dict:
                 return self._run_agent_turn(
@@ -988,17 +1063,41 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # clip goes with the turn rather than outliving a note no one ever received.
                 running = loop.run_in_executor(_executor, ctx.run, _run_agent)
                 handed_on = True
-                result = await running
+                result = await asyncio.shield(running)
+            except asyncio.CancelledError:
+                # Cancelling an await cannot stop an executor thread. Retain its
+                # lease until interruption has actually ended the consumer.
+                await self.cancel(session_id)
+                try:
+                    while not running.done():
+                        try:
+                            await asyncio.shield(running)
+                        except asyncio.CancelledError:
+                            # Disconnect/shutdown may cancel us repeatedly. The
+                            # executor still owns this claim until it exits.
+                            continue
+                finally:
+                    with state.runtime_lock:
+                        state.is_running = False
+                        state.current_prompt_text = ""
+                raise
             except Exception:
                 logger.exception("Executor error for session %s", session_id)
                 with state.runtime_lock:
                     state.is_running = False
                     state.current_prompt_text = ""
                 return PromptResponse(stop_reason="end_turn")
+            return await self._finish_turn(
+                state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed,
+                completion_claims=delegation_claims,
+            )
         finally:
+            if claim_renewal is not None:
+                claim_renewal.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await claim_renewal
+            self._settle_process_notifications(delegation_claims, False, attempted=completion_attempted)
             cleanup_voice_turn(voice_turn, force=not handed_on)
-
-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 
     def _wire_turn_callbacks(
         self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
@@ -1041,39 +1140,53 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def _finish_turn(
         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
-        streamed_message: bool,
+        streamed_message: bool, *, completion_claims: list[tuple[str, str]] | None = None,
     ) -> PromptResponse:
         """Persist, emit provenance/final text, drain queued prompts, report usage."""
-        if result.get("messages"):
-            state.history = result["messages"]
-            self.session_manager.save_session(session_id)
+        try:
+            if result.get("messages"):
+                state.history = result["messages"]
+                self.session_manager.save_session(session_id)
 
-        # Head rotated (compression split): emit provenance so clients can render the boundary.
-        post_turn_hermes_id = getattr(state.agent, "session_id", None)
-        if conn and post_turn_hermes_id and pre_turn_hermes_id and post_turn_hermes_id != pre_turn_hermes_id:
-            try:
-                await self._send_session_info_update(
-                    session_id, current_hermes_session_id=post_turn_hermes_id,
-                    previous_hermes_session_id=pre_turn_hermes_id,
+            # Head rotated (compression split): emit provenance so clients can render the boundary.
+            post_turn_hermes_id = getattr(state.agent, "session_id", None)
+            if conn and post_turn_hermes_id and pre_turn_hermes_id and post_turn_hermes_id != pre_turn_hermes_id:
+                try:
+                    await self._send_session_info_update(
+                        session_id, current_hermes_session_id=post_turn_hermes_id,
+                        previous_hermes_session_id=pre_turn_hermes_id,
+                    )
+                except Exception:
+                    logger.debug("Could not emit ACP provenance update after rotation for %s", session_id, exc_info=True)
+
+            final_response = result.get("final_response", "")
+            cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+            # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
+            from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+            interrupted = bool(result.get("interrupted")) or cancelled
+            suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+            # Send the final text unless already streamed — or if a plugin hook transformed it after.
+            if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+                await conn.session_update(session_id, acp.update_agent_message_text(final_response))
+
+            # A later queued turn must not delay acknowledgement or turn an already
+            # reported result into a retry if that unrelated turn is cancelled.
+            if completion_claims:
+                delivered = (
+                    not interrupted and not result.get("error") and bool(result.get("messages"))
+                    and not str(final_response).startswith("Error:")
                 )
-            except Exception:
-                logger.debug("Could not emit ACP provenance update after rotation for %s", session_id, exc_info=True)
+                self._settle_process_notifications(completion_claims, delivered, attempted=True)
+                completion_claims.clear()
 
-        final_response = result.get("final_response", "")
-        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
-        # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
-        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
-        interrupted = bool(result.get("interrupted")) or cancelled
-        suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
-        # Send the final text unless already streamed — or if a plugin hook transformed it after.
-        if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            await conn.session_update(session_id, acp.update_agent_message_text(final_response))
-
-        # Go idle before draining so recursive prompt() calls can acquire the session.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
+        finally:
+            # Release only this turn's finalization phase. Once idle, queued or
+            # concurrent prompts may own the session; later usage/cancel errors
+            # must not clear the newer turn's ownership.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:

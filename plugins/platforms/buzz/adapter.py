@@ -832,7 +832,7 @@ def _run_ffmpeg(args: List[str], out: Path, what: str) -> bool:
         return False
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin", *args, str(out)]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT)
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=_FFMPEG_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("Buzz audio: could not %s: %s", what, exc)
         return False
