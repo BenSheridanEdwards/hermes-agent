@@ -554,6 +554,11 @@ def auth_refresh_command(args) -> None:
               f"status still: {status}")
 
 
+def _auth_reauth_command(args) -> None:
+    from hermes_cli.auth_reauth import auth_reauth_command
+    auth_reauth_command(args)
+
+
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
     if not provider:
@@ -762,7 +767,8 @@ from agent.credential_policy import capabilities_command
 _AUTH_ACTIONS = {
     "policy-capabilities": capabilities_command,
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
-    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
+    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command,
+    "reauth": _auth_reauth_command, "status": auth_status_command,
     "logout": auth_logout_command,
     "spotify": auth_spotify_command}
 

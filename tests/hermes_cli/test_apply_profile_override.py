@@ -30,7 +30,7 @@ def _run_apply_profile_override(
     hermes_root.mkdir(parents=True, exist_ok=True)
 
     if active_profile is not None:
-        (hermes_root / "active_profile").write_text(active_profile)
+        (hermes_root / "active_profile").write_text(active_profile, encoding="utf-8")
 
     if active_profile and active_profile != "default":
         (hermes_root / "profiles" / active_profile).mkdir(parents=True, exist_ok=True)
@@ -161,7 +161,7 @@ class TestSupervisedChildIgnoresStickyProfile:
         active_profile fallback, never an explicit flag)."""
         hermes_root = tmp_path / ".hermes"
         hermes_root.mkdir(parents=True, exist_ok=True)
-        (hermes_root / "active_profile").write_text("briefer")
+        (hermes_root / "active_profile").write_text("briefer", encoding="utf-8")
         (hermes_root / "profiles" / "briefer").mkdir(parents=True, exist_ok=True)
         (hermes_root / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
 
@@ -286,3 +286,57 @@ class TestGeneralizedSupervisorMarkers:
 
         plist = generate_launchd_plist()
         assert "<key>HERMES_SUPERVISED_CHILD</key>" in plist
+
+
+class TestAuthCommandsHonourExplicitHermesHome:
+    """`HERMES_HOME=~/.hermes hermes auth add ...` wrote into the sticky active profile's store.
+
+    Credential writes must land exactly where the caller pointed: an explicit HERMES_HOME (root or
+    profile) is authoritative for `hermes auth`, and `-p default` explicitly targets the root.
+    """
+
+    def test_explicit_root_hermes_home_is_not_redirected_to_active_profile(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_root = tmp_path / ".hermes"
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(hermes_root), active_profile="sky",
+            argv=["hermes", "auth", "add", "openai-codex", "--type", "oauth"],
+        )
+        assert result == str(hermes_root)
+
+    def test_explicit_root_hermes_home_reauth_stays_on_root(self, tmp_path, monkeypatch):
+        hermes_root = tmp_path / ".hermes"
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(hermes_root), active_profile="sky",
+            argv=["hermes", "auth", "reauth", "openai-codex", "16a4f9", "--no-browser"],
+        )
+        assert result == str(hermes_root)
+
+    def test_explicit_default_profile_flag_targets_root(self, tmp_path, monkeypatch):
+        hermes_root = tmp_path / ".hermes"
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(hermes_root), active_profile="sky",
+            argv=["hermes", "-p", "default", "auth", "reauth", "openai-codex", "16a4f9"],
+        )
+        assert result == str(hermes_root)
+        assert sys.argv == ["hermes", "auth", "reauth", "openai-codex", "16a4f9"]
+
+    def test_auth_without_hermes_home_still_follows_active_profile(self, tmp_path, monkeypatch):
+        """No explicit HERMES_HOME: the sticky default keeps working for interactive users."""
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile="sky",
+            argv=["hermes", "auth", "list"],
+        )
+        assert result is not None and result.endswith("sky")
+
+    def test_non_auth_commands_with_root_hermes_home_still_follow_active_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """The #22502 contract (systemd root HERMES_HOME honours `profile use`) is unchanged."""
+        hermes_root = tmp_path / ".hermes"
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(hermes_root), active_profile="sky",
+            argv=["hermes", "chat"],
+        )
+        assert result is not None and result.endswith("sky")

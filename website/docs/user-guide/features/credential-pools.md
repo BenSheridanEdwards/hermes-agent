@@ -122,12 +122,30 @@ Type [1/2]:
 | `hermes auth reset <provider>` | Clear all cooldowns/exhaustion status |
 | `hermes auth reset <provider> <target>` | Clear the cooldown on one credential by index, id, or label |
 | `hermes auth refresh <provider> [target]` | Refresh one OAuth credential's tokens and return it to rotation (proves the grant is alive; the next request re-checks quota) |
+| `hermes auth reauth <provider> <id-or-label>` | Run the device-code sign-in again and replace that row's tokens in place (openai-codex, xai-oauth) |
 
 For Nous, `auth refresh` supports only the login's `device_code` singleton.
 Independent Nous pool accounts are rejected before refresh; their tokens and
 cooldowns are preserved. Reauthenticate with `hermes auth add nous --type oauth`
 to update the singleton; this does not refresh an independent account. Other
 providers retain their existing source-specific refresh support.
+
+### Renewing a shared login in place
+
+`hermes auth add` always creates a new pool row with a new id. When other tooling
+binds a login by row id (for example a credential assignment naming
+`{store, ids}`), renew it with `hermes auth reauth <provider> <id-or-label>`
+instead: it signs in with the provider's device-code flow and replaces the
+tokens of that exact row, keeping its id, label, priority and source and
+clearing its error status. It never creates a row and fails if the target is
+missing or ambiguous. Rows holding the same old refresh token (copies of one
+login) and a `device_code` row's `providers.<provider>` singleton are renewed
+with it.
+
+`hermes auth` writes to the store the caller names: an explicit `HERMES_HOME`
+is not redirected by `~/.hermes/active_profile`, and `-p default` targets the
+root store explicitly. Automation should pass both, for example
+`HERMES_HOME=~/.hermes hermes -p default auth reauth openai-codex 16a4f9 --no-browser`.
 
 ## Rotation Strategies
 
