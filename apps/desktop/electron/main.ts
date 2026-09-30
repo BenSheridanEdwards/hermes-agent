@@ -12980,14 +12980,11 @@ async function startHermes() {
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI.
+    // A null preference is the default route, not permission to follow a
+    // different sticky CLI profile (which would disagree with primaryProfileKey).
+    const activeProfile = readActiveDesktopProfile() ?? 'default'
+    backendArgs.unshift('--profile', activeProfile)
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,
