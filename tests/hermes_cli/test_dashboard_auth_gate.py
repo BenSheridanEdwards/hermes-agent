@@ -88,6 +88,8 @@ def test_empty_provider_login_page_shows_supported_auth_paths():
 
 
 def _stub_uvicorn_run(monkeypatch):
+    # Auth-gate unit fixture: uvicorn is fake; host port occupancy is irrelevant.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda *_: False)
     """Replace uvicorn.Config/Server with no-op fakes so start_server
     returns immediately (rather than blocking on the event loop). Returns the dict
     that will capture the keyword args.

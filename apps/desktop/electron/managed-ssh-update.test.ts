@@ -282,13 +282,16 @@ test('POSIX managed launcher is detached, correlation-scoped, and never publishe
 
 test('POSIX managed launcher executes the updater command and atomically publishes its status', async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-launch-'))
+  const updater = path.join(home, 'fixture-updater')
+  // /bin/true is Linux-specific; exercise a real portable executable fixture.
+  await writeFile(updater, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
 
   try {
     const command = buildPosixManagedUpdateLaunch(
       {
         ssh: { exec: async () => '' },
         platform: 'Linux',
-        hermesPath: '/bin/true',
+        hermesPath: updater,
         hermesHome: home
       },
       CORRELATION

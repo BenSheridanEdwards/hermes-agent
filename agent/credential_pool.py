@@ -1423,6 +1423,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         policy = getattr(self, "_credential_policy", None)
         target = policy.store_path(self.provider) if policy is not None else None
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout(), target_path=target):
+            check_pool_revision(self)  # A grant may have been revoked while waiting.
             if self.provider == "openai-codex":
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
@@ -1597,6 +1598,8 @@ class CredentialPool(CredentialPoolAdminMixin):
         # Single-use-token providers adopt fresher tokens from their store
         # BEFORE spending the refresh_token; ``entry`` is rebound to the synced
         # row so the failure path below recovers against the pair we POSTed.
+        from agent import credential_rotation
+        intent = credential_rotation.begin(self, entry)
         try:
             if self.provider == "anthropic":
                 updated = self._refresh_anthropic(entry)
@@ -1621,6 +1624,8 @@ class CredentialPool(CredentialPoolAdminMixin):
             return done.result
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            if credential_rotation.definite_rejection(exc):
+                credential_rotation.finish(intent)
             return self._recover_failed_refresh(entry, exc)
 
         updated = replace(updated, **_MARK_OK)
@@ -1628,10 +1633,18 @@ class CredentialPool(CredentialPoolAdminMixin):
         # Declare the cleared id: a borrowed row carries no access_token on disk, so
         # the merge's token-change bypass cannot apply and a plain persist would copy
         # the still-binding cooldown back over this success.
-        self._persist(status_cleared_ids=[updated.id])
+        try:
+            self._persist(status_cleared_ids=[updated.id])
+        except Exception as exc:
+            if intent is None:
+                raise
+            self._replace_entry(updated, entry)
+            from agent.credential_policy import CredentialPolicyError
+            raise CredentialPolicyError("Rotated credential was not persisted; reconnect in the credential manager") from exc
         # Sync back so _seed_from_singletons() on the next load_pool() sees
         # fresh state instead of re-seeding consumed tokens.
         self._sync_device_code_entry_to_auth_store(updated)
+        credential_rotation.finish(intent)
         return updated
 
     def _recover_failed_refresh(self, entry: PooledCredential, exc: Exception) -> Optional[PooledCredential]:

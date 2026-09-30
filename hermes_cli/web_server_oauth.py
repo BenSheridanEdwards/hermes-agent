@@ -241,6 +241,8 @@ def _nous_poller(session_id: str, sess: Dict[str, Any]) -> None:
         "expires_in": token_ttl,
     }
     with _profile_scope(_oauth_session_profile(session_id)):
+        from hermes_cli.credential_authority import require_local_credential_authority
+        require_local_credential_authority()
         full_state = refresh_nous_oauth_from_state(auth_state, timeout_seconds=15.0, force_refresh=False)
         persist_nous_credentials(full_state)
 
@@ -284,6 +286,8 @@ def _minimax_poller(session_id: str, sess: Dict[str, Any]) -> None:
         "expires_in": max(0, int(expires_at_ts - now.timestamp())),
     }
     with _profile_scope(_oauth_session_profile(session_id)):
+        from hermes_cli.credential_authority import require_local_credential_authority
+        require_local_credential_authority()
         _minimax_save_auth_state(auth_state)
 
 
@@ -311,6 +315,8 @@ def _xai_device_poller(session_id: str, sess: Dict[str, Any]) -> None:
         "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
     }
     with _profile_scope(_oauth_session_profile(session_id)):
+        from hermes_cli.credential_authority import require_local_credential_authority
+        require_local_credential_authority()
         # set_active=False: persist without hijacking an existing active chat provider.
         _save_xai_oauth_tokens(
             tokens, discovery=discovery, auth_mode="oauth_device_code", set_active=False,
