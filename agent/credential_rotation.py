@@ -1,17 +1,27 @@
-"""Durable pre-POST intent for assigned, single-use refresh grants.
+"""Durable pre-POST intent for owner-scoped single-use refresh grants.
 
 The caller holds the owner auth-store lock across begin -> transport -> token
 commit -> finish. Only generation fingerprints are stored, never tokens. An
 unresolved intent refuses replay after restart. A newly authorized generation
-can replace that intent; deleting this file is not a recovery procedure.
+can advance without erasing predecessor fences; deleting this file is not recovery.
 """
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+from datetime import datetime, timezone
 
 from agent.credential_policy import CredentialPolicyError
+
+
+class RefreshGenerationFenced(CredentialPolicyError):
+    """One interpreted entry is unusable; other explicitly eligible entries may work."""
+
+
+def _contains_generation(data, provider, generation):
+    return any(key.startswith(provider + ':') and (value if isinstance(value, str) else value['generation']) == generation
+               for key, value in data.items())
 
 
 def _read(path):
@@ -21,7 +31,12 @@ def _read(path):
         return {}
     except (OSError, ValueError) as exc:
         raise CredentialPolicyError('Refresh intent is unreadable; contact the credential manager') from exc
-    if not isinstance(data, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in data.items()):
+    def valid(value):
+        if isinstance(value, str):
+            return len(value) == 64
+        return (isinstance(value, dict) and isinstance(value.get('generation'), str)
+                and len(value['generation']) == 64 and value.get('state') in {'pending', 'committed'})
+    if not isinstance(data, dict) or any(not isinstance(k, str) or not valid(v) for k, v in data.items()):
         raise CredentialPolicyError('Refresh intent is invalid; contact the credential manager')
     return data
 
@@ -67,16 +82,32 @@ def owner_path(pool, entry):
 
 
 def begin(pool, entry):
-    if pool.provider not in {'anthropic', 'openai-codex', 'xai-oauth'}:
+    if pool.provider not in {'anthropic', 'openai-codex', 'xai-oauth'} or not entry.refresh_token:
         return None
     owner = owner_path(pool, entry)
+    generation = hashlib.sha256(entry.refresh_token.encode()).hexdigest()
+    # Refuse known local copies of the root authority; never heal/delete them
+    # or elect a new owner during a consumer read. No global lineage daemon.
+    from hermes_constants import get_default_hermes_root
+    from agent.credential_store_schema import read_store
+    root = (get_default_hermes_root() / 'auth.json').resolve()
+    if owner != root:
+        root_store = read_store(root)
+        if root_store is not None:
+            holders = list(root_store.get('credential_pool', {}).get(pool.provider, []))
+            holders.append(root_store.get('providers', {}).get(pool.provider, {}).get('tokens', {}))
+            if any(row.get('refresh_token') == entry.refresh_token for row in holders):
+                raise CredentialPolicyError('Copied rotating credential; use the canonical owner reference before refresh')
+        root_history = _read(root.with_name(root.name + '.rotation-intent.json'))
+        if _contains_generation(root_history, pool.provider, generation):
+            raise CredentialPolicyError('Copied predecessor is fenced by its canonical owner; owner reconciliation required')
     path = owner.with_name(owner.name + '.rotation-intent.json')
     data = _read(path)
-    key = pool.provider + ':' + entry.id
-    generation = hashlib.sha256(entry.refresh_token.encode()).hexdigest()
-    if data.get(key) == generation:
-        raise CredentialPolicyError('Previous refresh outcome is uncertain; reconnect this account in the credential manager')
-    data[key] = generation
+    key = pool.provider + ':' + generation
+    if _contains_generation(data, pool.provider, generation):
+        raise RefreshGenerationFenced('Refresh generation is spent or uncertain; owner recovery required')
+    data[key] = {'generation': generation, 'entry': entry.id, 'state': 'pending',
+                 'started_at': datetime.now(timezone.utc).isoformat()}
     _write(path, data)  # Must succeed before the first provider call.
     return path, key, generation
 
@@ -86,8 +117,9 @@ def finish(intent):
         return
     path, key, generation = intent
     data = _read(path)
-    if data.get(key) == generation:
-        data.pop(key)
+    record = data.get(key)
+    if isinstance(record, dict) and record['generation'] == generation:
+        data[key] = {**record, 'state': 'committed', 'committed_at': datetime.now(timezone.utc).isoformat()}
         _write(path, data)
 
 

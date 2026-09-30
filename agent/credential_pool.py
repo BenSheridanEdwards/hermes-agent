@@ -1838,12 +1838,17 @@ class CredentialPool(CredentialPoolAdminMixin):
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
         """Refresh deferred single-use-token entries OUTSIDE the pool lock.
 
-        Each refresh takes the cross-process ``_auth_store_lock`` (20+ s
-        possible) and merges into the pool through the self-locking mutation
-        primitives; failures are silently skipped.
+        Each refresh takes the owner lock. A known fenced generation is not
+        eligible; it must not prevent an independent, explicitly eligible
+        account from serving. Policy drift and unreadable owner state still
+        propagate and fail the entire operation closed.
         """
+        from agent.credential_rotation import RefreshGenerationFenced
         for entry in pending:
-            self._refresh_entry(entry, force=False)
+            try:
+                self._refresh_entry(entry, force=False)
+            except RefreshGenerationFenced:
+                logger.warning("Fenced refresh generation is ineligible; owner recovery required")
 
     def _resync_stale_entry(self, entry: PooledCredential) -> PooledCredential:
         """Re-read an exhausted/DEAD singleton-seeded entry from its token authority.
@@ -1926,7 +1931,12 @@ class CredentialPool(CredentialPoolAdminMixin):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)
                     continue
-                refreshed = self._refresh_entry(entry, force=False)
+                from agent.credential_rotation import RefreshGenerationFenced
+                try:
+                    refreshed = self._refresh_entry(entry, force=False)
+                except RefreshGenerationFenced:
+                    logger.warning("Fenced refresh generation is ineligible; owner recovery required")
+                    continue
                 if refreshed is None:
                     continue
                 entry = refreshed
@@ -2763,10 +2773,8 @@ def load_pool(provider: str) -> CredentialPool:
     policy = load_policy()
     if policy is not None:
         return managed_pool(provider, policy)
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS:
-        # One-time heal for installs that forked this grant across profiles
-        # before the clone-strip / root write-through existed (#100339).
-        auth_mod.heal_forked_single_use_oauth_grants(provider)
+    # Loading a consumer is not authorization to delete copied credentials.
+    # Known copies are refused at refresh; owner reconciliation is explicit.
     raw_entries = read_credential_pool(provider)
     disk_ids = {e.get("id") for e in raw_entries if isinstance(e, dict) and e.get("id")}
     changed = any(

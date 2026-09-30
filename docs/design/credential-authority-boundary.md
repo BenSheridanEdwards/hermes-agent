@@ -31,25 +31,52 @@ the existing owner-store write-through contract.
 ## Refresh durability and recovery
 
 Within the existing owner auth-store process lock, the selected policy revision
-is checked again, the newest root row is adopted, and a private 0600,
-fsynced `.auth.json.rotation-intent` file records the provider, row ID and a
-SHA-256 fingerprint of the pre-refresh generation. It contains no token values.
-The intent is durable before the synthetic/provider POST. Once the new auth
-row and required singleton write-through succeed, the intent is cleared.
+is checked again and the newest owner row is adopted. The lock and durable
+intent follow the canonical owner, including an unmanaged/root-fallback caller;
+consumer policy presence is not the fence. A private 0600
+`auth.json.rotation-intent.json` records generation fingerprints, never tokens,
+before the POST. Successful commits retain predecessor fences rather than
+forgetting that a generation was used. Row renames cannot authorize replay.
 
-A crash, ambiguous timeout or post-POST persistence failure leaves the intent.
-A fresh process refuses to replay that same generation. Explicit HTTP rejection
-clears it, so a definite outage can recover through the existing cooldown path.
-Anthropic refresh does not try its alternate endpoint after an ambiguous timeout.
-An explicitly reauthenticated replacement generation is not confused with the
-old consumed generation. Consumers must not delete an unresolved intent to
-force a retry. Restore/recovery must retain coherent owner-store and intent
-state, never blindly restore and reuse an old single-use refresh grant.
+A crash, reset, truncation, timeout, generic 503 or any other unsupported HTTP
+classification leaves uncertainty fenced. No provider-specific nonconsumption
+guarantee has been established, including for all 4xx responses. Anthropic does
+not try a second endpoint with the same refresh generation after an exception.
+Owner-store write-through failures propagate; they cannot silently clear intent.
 
-This is fail-closed loss prevention, not recovery of a token that the provider
-returned but the machine could not persist. That event requires the owner's
-existing reauthentication flow. No automatic refresh was exercised against a
-real provider while developing this patch.
+A newly authorized replacement generation can recover without erasing its
+predecessor. A known fenced entry is not eligible, but another explicitly
+eligible independent account can serve. This narrow distinction does not catch
+or ignore policy drift, malformed stores or unknown recovery metadata.
+Known root copies and renamed predecessors are refused, not elected or deleted.
+Canonical file references are not turned into separate credential copies.
+
+Present invalid owner stores are not empty stores: malformed JSON, container
+shapes, identifiers/duplicates, token types and expiries fail with a fixed
+sanitized error and unchanged source bytes. Corruption no longer creates an
+implicit credential backup or an empty mutable replacement.
+
+The owner alone performs reauthentication and explicit reference migration.
+Consumer loading no longer invokes heuristic fork consolidation. Legacy repair
+utility tests are explicit synthetic owner exercises, not authorization to use
+that heuristic on live credentials. A lost successor cannot be fabricated:
+reauthenticate through the owner and retain coherent store/intent history.
+
+## Assignment publication and recovery
+
+Native policy v2 requires a committed matching owner publication. A staged or
+failed update never falls back to an older grant. Permission history is retained.
+Fleet writes its narrow configuration connection as publisher; a blocked consumer
+does not rewrite its own authority. The exact `auth policy-capabilities` query is
+pure metadata and remains available before credential loading. This is not a
+blanket auth/config exemption. A substantive global publication may require
+managed readers to reload; no-op syncs preserve the revision.
+
+These are cooperative store/consumer guarantees, not process isolation against
+hostile same-UID code or proof of opaque permanent grant-family identity. External
+CLI-owned singleton paths retain their separate existing ownership contracts;
+do not infer cross-vendor locking or live consolidation from pooled-store tests.
+No live authentication, credential migration or deletion was exercised here.
 
 ## Tests and limits
 
@@ -57,7 +84,7 @@ real provider while developing this patch.
 processes against isolated roots with synthetic transport. It tests all three
 providers: Anthropic, Codex and xAI; competing refreshers, fresh-loader adoption,
 preflight and post-rotation disk errors, crash/restart, ambiguous timeout and
-definite-outage recovery. It has no Windows-only gate and runs on Darwin/Linux.
+ambiguous-outage fencing and explicit-generation recovery. It has no Windows-only gate and runs on Darwin/Linux.
 A run on Darwin does not establish Linux execution. Desktop router tests use
 the actual FastAPI routers and real assignment resolver, without a substitute
 Desktop server or live credential probe.

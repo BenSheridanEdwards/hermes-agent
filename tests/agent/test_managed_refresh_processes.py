@@ -107,19 +107,25 @@ def test_crash_after_post_survives_restart_without_replay(tmp_path, provider):
 
 
 @pytest.mark.parametrize('provider', PROVIDERS)
-def test_definite_outage_can_recover_after_runtime_cooldown(tmp_path, provider):
+def test_ambiguous_outage_requires_new_owner_generation_not_cooldown(tmp_path, provider):
     root = fixture(tmp_path, provider)
     finish(start(root, provider, mode='outage'))
-    # Anthropic has two documented endpoints and tries both on a definite 503.
-    assert len(calls(root)) == (2 if provider == 'anthropic' else 1)
-    assert json.loads((root / 'auth.json.rotation-intent.json').read_text()) == {}
+    assert len(calls(root)) == 1
+    assert json.loads((root / 'auth.json.rotation-intent.json').read_text())
     # Advance the fixture's persisted cooldown, without an administrative reset.
     store = json.loads((root / 'auth.json').read_text())
     for row in store['credential_pool'][provider]:
         row['last_status_at'] = 1
     (root / 'auth.json').write_text(json.dumps(store))
+    assert finish(start(root, provider, profile='two'))['selected'] is False
+    assert len(calls(root)) == 1
+    store['credential_pool'][provider][0]['refresh_token'] = 'synthetic-owner-replacement'
+    (root / 'auth.json').write_text(json.dumps(store))
     assert finish(start(root, provider, profile='two'))['fresh'] is True
-    assert len(calls(root)) == (3 if provider == 'anthropic' else 2)
+    assert len(calls(root)) == 2
+    records = json.loads((root / 'auth.json.rotation-intent.json').read_text())
+    assert any(row['state'] == 'pending' for row in records.values())
+    assert any(row['state'] == 'committed' for row in records.values())
 
 
 @pytest.mark.parametrize('provider', PROVIDERS)

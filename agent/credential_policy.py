@@ -51,14 +51,10 @@ class CredentialPolicy:
         path = self.store_path(provider)
         if path is None:
             return []
-        try:
-            store = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        from agent.credential_store_schema import read_store
+        store = read_store(path)
+        if store is None:
             return []
-        except (OSError, ValueError) as exc:
-            raise CredentialPolicyError("Assigned credential store is unreadable") from exc
-        if not isinstance(store, dict) or not isinstance(store.get("credential_pool", {}), dict):
-            raise CredentialPolicyError("Assigned credential store is invalid")
         rows = store.get("credential_pool", {}).get(provider, [])
         if not isinstance(rows, list):
             raise CredentialPolicyError("Assigned credential pool is invalid")
@@ -99,7 +95,25 @@ def load_policy(home: Path | None = None) -> CredentialPolicy | None:
         for source, refs in bindings.items():
             _require(isinstance(source, str) and isinstance(refs, dict))
             _require(all(isinstance(ref, str) and isinstance(name, str) and env.get(name) == source for ref, name in refs.items()))
-        _require(data["version"] == 1 and isinstance(env, dict) and isinstance(accounts, dict))
+        _require(type(data["version"]) is int and data["version"] in (1, 2) and isinstance(env, dict) and isinstance(accounts, dict))
+        publication = data.get('publication')
+        if 'publication' in data:
+            _require(isinstance(publication, dict))
+        legacy_gate = path.parent.parent / 'authority-publication.json'
+        # A newly coordinated owner must not leave an older snapshot usable
+        # halfway through publication, even before that snapshot is rewritten.
+        inferred_gate = path.parent.name == 'assignments' and legacy_gate.exists()
+        if data['version'] == 2 or publication is not None or inferred_gate:
+            if not isinstance(publication, dict):
+                raise ValueError('Invalid publication contract')
+            _require(isinstance(publication.get('file'), str))
+            gate_path = Path(publication['file'])
+            _require(gate_path.is_absolute())
+            revision = publication.get('revision')
+            _require(type(revision) is int and revision >= 1)
+            gate = json.loads(gate_path.read_text(encoding='utf-8'))
+            _require(isinstance(gate, dict) and gate.get('version') == 1 and
+                     gate.get('state') == 'committed' and type(gate.get('revision')) is int and gate['revision'] == revision)
         _require(isinstance(managed, list) and all(isinstance(n, str) for n in managed))
         names = set(managed) | set(env)
         _require(all(re.fullmatch(r"[A-Z_][A-Z0-9_]*", n) for n in names))
@@ -267,7 +281,7 @@ def restore_assigned_environment(home: Path, environ) -> None:
 
 
 def capabilities_command(_args) -> None:
-    print(json.dumps({"credential_policy": 1, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
+    print(json.dumps({"credential_policy": 2, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
                       "refresh_owner": "hermes", "activation": "reload"}))
 
 
