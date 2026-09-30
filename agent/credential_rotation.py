@@ -16,7 +16,7 @@ from agent.credential_policy import CredentialPolicyError
 
 def _read(path):
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -30,7 +30,7 @@ def _write(path, data):
     temporary = None
     try:
         fd, temporary = tempfile.mkstemp(prefix='.rotation-intent-', dir=path.parent)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             json.dump(data, stream, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())

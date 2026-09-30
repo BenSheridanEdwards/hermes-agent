@@ -534,12 +534,26 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     from cron import scheduler_script as sched_script
 
     calls = 0
+    # Exercise repeated uncertainty against a controlled lease clock, not the
+    # scheduler speed of an overloaded parallel test host.
+    import time as real_time
+    clock = [0.0]
+
+    class LeaseClock:
+        def monotonic(self):
+            return clock[0]
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    monkeypatch.setattr(scheduler, "time", LeaseClock())
 
     def heartbeat(*_args, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             return True
+        clock[0] += 0.02
         raise OSError("store unavailable")
 
     def run_body(_job, **kwargs):
