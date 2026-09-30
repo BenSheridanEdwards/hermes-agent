@@ -286,10 +286,10 @@ def _post_oauth_token(
         except Exception as exc:
             # A refresh may already have consumed its single-use grant when a
             # response times out. Trying a second endpoint can replay that grant.
-            if what == "refresh" and (
-                isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
-            ):
-                raise
+            if what == "refresh":
+                from agent.credential_rotation import definite_rejection
+                if not definite_rejection(exc):
+                    raise
             last_error = exc
             logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, exc)
     raise last_error or ValueError(f"Anthropic token {what} failed")

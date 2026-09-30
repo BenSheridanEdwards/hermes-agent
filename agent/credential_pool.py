@@ -867,14 +867,10 @@ def persist_pool_entries(
                     status_cleared_ids=status_cleared_ids,
                 )
             except Exception as exc:
-                # Fail closed on the FORK, not on the save: never fall back to
-                # writing a local copy (that IS the bug). The in-memory pool
-                # still holds the rotated pair for this process.
-                logger.warning(
-                    "%s pool: write-through of borrowed root grant failed (%s); "
-                    "not materializing a profile-local copy",
-                    provider, exc,
-                )
+                from agent.credential_policy import CredentialPolicyError
+                # Failure to commit the owner's successor must reach the intent
+                # boundary. Never report success or fall back to a profile copy.
+                raise CredentialPolicyError("Owner credential commit failed; refresh outcome remains uncertain") from exc
             return
     write_credential_pool(
         provider, payloads, removed_ids=removed_ids, status_cleared_ids=status_cleared_ids,
@@ -1420,8 +1416,8 @@ class CredentialPool(CredentialPoolAdminMixin):
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
         # the winner's rotated token and skips the POST.
-        policy = getattr(self, "_credential_policy", None)
-        target = policy.store_path(self.provider) if policy is not None else None
+        from agent.credential_rotation import owner_path
+        target = owner_path(self, entry)
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout(), target_path=target):
             check_pool_revision(self)  # A grant may have been revoked while waiting.
             if self.provider == "openai-codex":

@@ -49,13 +49,27 @@ def _write(path, data):
             Path(temporary).unlink(missing_ok=True)
 
 
-def begin(pool, entry):
+def owner_path(pool, entry):
+    """Resolve custody independently of the requesting consumer's policy."""
     policy = getattr(pool, '_credential_policy', None)
-    if policy is None or pool.provider not in {'anthropic', 'openai-codex', 'xai-oauth'}:
+    if policy is not None:
+        owner = policy.store_path(pool.provider)
+        if owner is None:
+            raise CredentialPolicyError('Assigned refresh has no durable owner')
+        return owner.resolve()
+    from agent import credential_pool as pools
+    if entry.id in getattr(pool, '_borrowed_root_ids', ()):
+        owner = pools._borrowed_single_use_pool_root()
+        if owner is None:
+            raise CredentialPolicyError('Shared refresh owner is unavailable')
+        return owner.resolve()
+    return pools.auth_mod._auth_file_path().resolve()
+
+
+def begin(pool, entry):
+    if pool.provider not in {'anthropic', 'openai-codex', 'xai-oauth'}:
         return None
-    owner = policy.store_path(pool.provider)
-    if owner is None:
-        raise CredentialPolicyError('Assigned refresh has no durable owner')
+    owner = owner_path(pool, entry)
     path = owner.with_name(owner.name + '.rotation-intent.json')
     data = _read(path)
     key = pool.provider + ':' + entry.id
@@ -78,10 +92,10 @@ def finish(intent):
 
 
 def definite_rejection(exc):
-    """A received HTTP error is not an indeterminate transport timeout."""
-    import urllib.error
-    if isinstance(exc, urllib.error.HTTPError):
-        return 400 <= exc.code < 600
-    response = getattr(exc, 'response', None)
-    code = getattr(response, 'status_code', None)
-    return isinstance(code, int) and 400 <= code < 600
+    """No supported provider contract currently proves nonconsumption.
+
+    HTTP classes, resets, truncation and timeouts cannot establish whether an
+    upstream spent a rotating grant. Exceptions require a documented provider
+    guarantee plus a regression test; none has been established here.
+    """
+    return False
