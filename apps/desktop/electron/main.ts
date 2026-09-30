@@ -860,8 +860,8 @@ const DESKTOP_MANAGED_SSH_RECOVERY_PATH = path.join(app.getPath('userData'), 'ma
 // local backend as. When set, startHermes() passes `hermes --profile <name>
 // dashboard …`, which deterministically pins HERMES_HOME (see
 // _apply_profile_override in hermes_cli/main.py) and bypasses the sticky
-// ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
-// no --profile flag, so the backend honors active_profile / default.
+// ~/.hermes/active_profile file. Unset (null) explicitly selects default;
+// it must never inherit a different sticky CLI profile.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
@@ -12980,14 +12980,11 @@ async function startHermes() {
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI.
+    // A null preference is the default route, not permission to follow a
+    // different sticky CLI profile (which would disagree with primaryProfileKey).
+    const activeProfile = readActiveDesktopProfile() ?? 'default'
+    backendArgs.unshift('--profile', activeProfile)
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,

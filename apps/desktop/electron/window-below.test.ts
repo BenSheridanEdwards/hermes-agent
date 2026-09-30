@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+// Pure selection/diagnostic unit tests must not import a host Electron binary
+// or inspect the user's real windows. Fail if a pure operation crosses here.
+vi.mock('electron', () => ({ app: { getPath: () => { throw new Error('unexpected native access') } } }))
 
 import { type EnumeratedWindow, enumerationFailureNote, pickWindowBelow } from './window-below'
 

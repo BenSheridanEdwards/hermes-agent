@@ -620,35 +620,9 @@ def _empty_auth_store() -> Dict[str, Any]:
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
-    if not auth_file.exists():
-        return _empty_auth_store()
-    try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
-    except OSError:
-        # Exists but unreadable (EMFILE, EACCES, EIO, stalled mount): contents are not bad, and this
-        # module read-modify-writes everywhere, so an empty store here is one _save_auth_store()
-        # away from erasing every credential. Fail loudly.
-        logger.warning(
-            "auth: could not read %s, leaving the store on disk untouched "
-            "rather than degrading to an empty one",
-            auth_file, exc_info=True)
-        raise
-    except Exception as exc:
-        # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
-        # advertise a backup that was not written.
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            preserved = False
-            logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
-                         exc_info=True)
-        logger.warning(
-            "auth: failed to parse %s (%s), starting with empty store. %s %s",
-            auth_file, exc,
-            "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
-            corrupt_path)
+    from agent.credential_store_schema import read_store
+    raw = read_store(auth_file)
+    if raw is None:
         return _empty_auth_store()
 
     if isinstance(raw, dict) and (
@@ -705,6 +679,8 @@ def _write_private_file_atomic(
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
     """Atomically persist *auth_store* (0o600, parent tightened to 0o700) to the active store, or to
     an explicit *target_path* (e.g. the global-root write-through for rotating xAI OAuth grants)."""
+    from agent.credential_store_schema import validate_store
+    validate_store(auth_store)
     auth_file = target_path if target_path is not None else _auth_file_path()
     # Tighten parent dir to 0o700 so siblings can't traverse to creds. No-op on Windows (POSIX mode bits not
     # enforced); ignore failures. secure_parent_dir refuses to chmod /, top-level dirs, or the hermes-agent

@@ -16,8 +16,15 @@ def _cleared_status_copy(entry: PooledCredential) -> PooledCredential:
 
 
 class CredentialPoolAdminMixin:
+    def _require_admin_authority(self):
+        from agent.credential_policy import CredentialPolicyError, check_pool_revision, load_policy
+        check_pool_revision(self)
+        if getattr(self, "_credential_policy", None) is not None or load_policy() is not None:
+            raise CredentialPolicyError("Assigned credentials are read-only here; use your credential manager")
+
     def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
         """Clear only the target's local error state, preserving sibling cooldowns."""
+        self._require_admin_authority()
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id)
             if entry is None:
@@ -36,6 +43,8 @@ class CredentialPoolAdminMixin:
         """
         from agent.credential_pool import _CLEAR_STATUS
 
+        self._require_admin_authority()
+
         with self._lock:
             stale = [
                 e for e in self._entries
@@ -52,6 +61,8 @@ class CredentialPoolAdminMixin:
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         from agent.credential_pool import persist_pool_entries
+
+        self._require_admin_authority()
 
         with self._lock:
             if index < 1 or index > len(self._entries):
@@ -70,6 +81,8 @@ class CredentialPoolAdminMixin:
     def move_entry(self, credential_id: str, priority: int) -> Optional[PooledCredential]:
         """Place an entry at a clamped zero-based position and persist contiguous priorities."""
         from agent.credential_pool import _normalize_pool_priorities
+
+        self._require_admin_authority()
 
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id)
@@ -112,6 +125,8 @@ class CredentialPoolAdminMixin:
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         from agent.credential_pool import _next_priority, write_credential_pool
+
+        self._require_admin_authority()
 
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))

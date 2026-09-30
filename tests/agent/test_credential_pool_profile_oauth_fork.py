@@ -353,7 +353,7 @@ def _fork(fleet, name, *, rotated_to=None):
     return pdir
 
 
-def test_heal_consolidates_existing_forks_to_the_live_copy(fleet, caplog):
+def test_explicit_fixture_owner_repair_consolidates_known_forks(fleet, caplog):
     """root + atlas hold spent RT0; forge already rotated to RT1 on old code."""
     import logging
     from agent.credential_pool import load_pool
@@ -365,6 +365,13 @@ def test_heal_consolidates_existing_forks_to_the_live_copy(fleet, caplog):
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.auth"):
         fleet["use"](forge)
+        from hermes_cli.auth import heal_forked_single_use_oauth_grants
+        before = (fleet["root"] / "auth.json").read_bytes()
+        load_pool("anthropic")
+        assert (fleet["root"] / "auth.json").read_bytes() == before
+        assert fleet["rows"](forge) is not None
+        # Explicit utility test on a synthetic, known-lineage scenario only.
+        heal_forked_single_use_oauth_grants("anthropic")
         sel = load_pool("anthropic").select()
     assert sel is not None and sel.access_token == "sk-ant-oat01-AT2"
     # forge's live pair was adopted by ROOT, then rotated there; forge holds nothing.
@@ -376,6 +383,7 @@ def test_heal_consolidates_existing_forks_to_the_live_copy(fleet, caplog):
 
     for home in (atlas, fleet["root"], forge):
         fleet["use"](home)
+        heal_forked_single_use_oauth_grants("anthropic")
         sel = load_pool("anthropic").select()
         assert sel is not None and sel.access_token == "sk-ant-oat01-AT2", home
     assert fleet["rows"](atlas) is None and fleet["rows"](forge) is None
@@ -396,6 +404,8 @@ def test_heal_is_idempotent_and_logs_once(fleet, caplog):
     fleet["use"](kid)
     with caplog.at_level(logging.INFO, logger="hermes_cli.auth"):
         load_pool("anthropic")
+        assert fleet["rows"](kid) is not None, "consumer loading must not delete held copies"
+        heal_forked_single_use_oauth_grants("anthropic")
         assert fleet["rows"](kid) is None
         notices = consume_oauth_heal_notices()
         assert len(notices) == 1 and "profile kid" in notices[0]
@@ -458,7 +468,7 @@ def test_heal_leaves_a_different_account_alone(fleet):
     assert json.loads((fleet["root"] / "auth.json").read_text())["credential_pool"]["xai-oauth"][0]["refresh_token"] == "xr-alice"
 
 
-def test_heal_pkce_singleton_shape_commits_live_pair_to_root_singleton(fleet):
+def test_explicit_fixture_owner_repair_commits_pkce_pair_to_root_singleton(fleet):
     """`hermes auth` PKCE shape: root + profile each have .anthropic_oauth.json +
     a hermes_pkce-seeded row; the profile's copy is the rotated (live) one."""
     from agent.credential_pool import load_pool
@@ -489,6 +499,9 @@ def test_heal_pkce_singleton_shape_commits_live_pair_to_root_singleton(fleet):
         expires_at_ms=int((time.time() - 60) * 1000),
     )
     (kid / "auth.json").write_text(json.dumps(kstore))
+    fleet["use"](kid)
+    from hermes_cli.auth import heal_forked_single_use_oauth_grants
+    heal_forked_single_use_oauth_grants("anthropic")
     srv = fleet["server"]
     srv["spent"].add("sk-ant-ort-RT0"); srv["valid"] = {"sk-ant-ort-RT1"}; srv["n"] = 1
 

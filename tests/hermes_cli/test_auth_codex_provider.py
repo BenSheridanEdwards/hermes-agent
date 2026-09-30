@@ -86,6 +86,7 @@ def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_emp
         "credential_pool": {
             "openai-codex": [
                 {
+                    "id": "synthetic-pool-fallback",
                     "source": "device_code",
                     "access_token": "pool-fallback-token",
                     "refresh_token": "pool-refresh",
