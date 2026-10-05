@@ -112,3 +112,43 @@ def test_kill_switch_routes_search_back_to_the_shell(tree, ops_factory, monkeypa
     assert result.total_count == 4
     assert any(c.startswith("test -e") for c in calls)
     assert any("pipefail" in c and "rg" in c for c in calls)
+
+
+def test_bounded_search_survives_rg_exiting_before_teardown(tree, ops_factory, monkeypatch):
+    """A fast rg that hits its output bound can exit between the runner's
+    ``poll()`` and the group teardown. The teardown must then be a no-op —
+    not an OSError that turns a successful search into ``[Errno 3] No such
+    process`` (or ``[Errno 1] Operation not permitted`` on macOS)."""
+    import os
+    import subprocess
+
+    from tools.environments.local import _kill_process_group_posix
+
+    # Wrapper already reaped and no recorded group: nothing to tear down.
+    gone = subprocess.Popen(["true"], start_new_session=True)
+    gone.wait()
+    _kill_process_group_posix(gone)
+
+    # The lookup itself refused (macOS EPERM on a process tearing down).
+    live = subprocess.Popen(["sleep", "5"], start_new_session=True)
+    try:
+        real_getpgid = os.getpgid
+
+        def refusing(pid):
+            if pid == live.pid:
+                raise PermissionError(1, "Operation not permitted")
+            return real_getpgid(pid)
+
+        monkeypatch.setattr(os, "getpgid", refusing)
+        _kill_process_group_posix(live)  # falls back to the recorded group or returns
+    finally:
+        monkeypatch.undo()
+        live.kill()
+        live.wait()
+
+    # End to end: an output bound reached instantly, many times over.
+    ops = ops_factory(tree, [])
+    for _ in range(25):
+        result = ops._run_rg_native(["sh", "-c", "'seq 1 5000'"], 3, timeout=10)
+        assert result.exit_code == 0, result
+        assert result.stdout.splitlines()[:3] == ["1", "2", "3"]
