@@ -99,7 +99,36 @@ def load_policy(home: Path | None = None) -> CredentialPolicy | None:
         for source, refs in bindings.items():
             _require(isinstance(source, str) and isinstance(refs, dict))
             _require(all(isinstance(ref, str) and isinstance(name, str) and env.get(name) == source for ref, name in refs.items()))
-        _require(data["version"] == 1 and isinstance(env, dict) and isinstance(accounts, dict))
+        _require(type(data["version"]) is int and data["version"] in (1, 2) and isinstance(env, dict) and isinstance(accounts, dict))
+        publication = data.get("publication")
+        if "publication" in data:
+            _require(isinstance(publication, dict))
+        canonical_policy = path.resolve()
+        legacy_gate = canonical_policy.parent.parent / "authority-publication.json"
+        # A newly coordinated owner must not leave an older snapshot usable
+        # halfway through publication, even before that snapshot is rewritten.
+        inferred_gate = canonical_policy.parent.name == "assignments" and legacy_gate.exists()
+        if data["version"] == 2 or publication is not None or inferred_gate:
+            if not isinstance(publication, dict):
+                raise ValueError("Invalid publication contract")
+            _require(isinstance(publication.get("file"), str))
+            gate_path = Path(publication["file"])
+            _require(gate_path.is_absolute())
+            # Ownership follows the canonical manifest, including path aliases.
+            if canonical_policy.parent.name == "assignments":
+                expected_gate = canonical_policy.parent.parent / "authority-publication.json"
+                _require(gate_path.resolve() == expected_gate.resolve())
+            revision = publication.get("revision")
+            _require(type(revision) is int and revision >= 1)
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            _require(
+                isinstance(gate, dict)
+                and type(gate.get("version")) is int
+                and gate["version"] == 1
+                and gate.get("state") == "committed"
+                and type(gate.get("revision")) is int
+                and gate["revision"] == revision
+            )
         _require(isinstance(managed, list) and all(isinstance(n, str) for n in managed))
         names = set(managed) | set(env)
         _require(all(re.fullmatch(r"[A-Z_][A-Z0-9_]*", n) for n in names))
@@ -267,7 +296,7 @@ def restore_assigned_environment(home: Path, environ) -> None:
 
 
 def capabilities_command(_args) -> None:
-    print(json.dumps({"credential_policy": 1, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
+    print(json.dumps({"credential_policy": 2, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
                       "refresh_owner": "hermes", "activation": "reload"}))
 
 
