@@ -62,9 +62,19 @@ export function createFirstRunSetupGate({
   const shouldGate = (backend?: FirstRunSetupBackend | null) =>
     Boolean(backend && backend.kind === 'bootstrap-needed' && !localBootstrapConfirmed)
 
-  const wait = async (backend?: FirstRunSetupBackend | null) => {
+  const wait = async (backend?: FirstRunSetupBackend | null, { unattended = false }: { unattended?: boolean } = {}) => {
     if (!shouldGate(backend)) {
       return 'continue-local' as const
+    }
+
+    // An unattended start is a supervisor respawn after a ready backend died:
+    // this machine was set up a moment ago and nobody asked for setup. Failing
+    // the attempt spends the supervisor's bounded retry budget instead of
+    // offering the installer over the install that was just serving.
+    if (unattended) {
+      throw new Error(
+        `The Hermes runtime at ${backend?.activeRoot} failed its startup check while restarting the backend`
+      )
     }
 
     if (waiter) {

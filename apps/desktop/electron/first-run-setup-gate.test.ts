@@ -132,3 +132,19 @@ test('remote apply without a waiter has no first-run side effects', async () => 
   assert.equal(hidden, 0)
   assert.equal(gate.isLocalBootstrapConfirmed(), true)
 })
+
+test('an unattended wait never offers first-run setup; it fails the attempt instead', async () => {
+  const prompts = []
+  const gate = createFirstRunSetupGate({ promptChoice: backend => prompts.push(backend), stuckAfterMs: 0 })
+
+  await assert.rejects(gate.wait(bootstrapBackend, { unattended: true }), /failed its startup check/)
+  assert.deepEqual(prompts, [])
+  assert.equal(gate.hasWaiter(), false)
+
+  assert.equal(await gate.wait({ kind: 'command', local: 'installed' }, { unattended: true }), 'continue-local')
+
+  const attended = gate.wait(bootstrapBackend)
+  assert.equal(prompts.length, 1)
+  gate.continueLocal()
+  assert.equal(await attended, 'continue-local')
+})

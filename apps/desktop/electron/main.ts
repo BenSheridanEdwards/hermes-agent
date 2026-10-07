@@ -2847,11 +2847,11 @@ function getFirstRunSetupGate() {
   return firstRunSetupGate
 }
 
-async function waitForFirstRunSetupChoice(backend) {
+async function waitForFirstRunSetupChoice(backend, { unattended = false }: { unattended?: boolean } = {}) {
   const gate = getFirstRunSetupGate()
 
-  if (!gate.shouldGate(backend)) {
-    return 'continue-local'
+  if (!gate.shouldGate(backend) || unattended) {
+    return gate.wait(backend, { unattended })
   }
 
   updateBootProgress(
@@ -13065,7 +13065,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
 
         return resolveRemoteBackend(primaryProfile, { primary: true, forceRegistryPrimary: true })
       },
-      waitForDecision: waitForFirstRunSetupChoice,
+      waitForDecision: backend => waitForFirstRunSetupChoice(backend, { unattended: supervisorRecovery }),
       // Mutual exclusion with an in-app update (#50238). Remote connections
       // return before this waiter; local starts park until the updater exits.
       waitForLocalStart: waitForUpdateToFinish
