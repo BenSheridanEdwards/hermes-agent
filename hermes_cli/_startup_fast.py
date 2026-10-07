@@ -217,7 +217,10 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
     print(f"Python: {sys.version.split()[0]}")
     openai_version = read_openai_version()
     print(f"OpenAI SDK: {openai_version}" if openai_version else "OpenAI SDK: Not installed")
-    if not check_updates:
+    # Desktop's runtime probe discards this output; the git reads and fetch below would only
+    # spend its timeout, and a timed-out probe reads as a broken install.
+    # health: allow HX002 -- Desktop sets it on its --version probe child only; not a setting
+    if not check_updates or os.environ.get("HERMES_VERSION_SKIP_UPDATE_CHECK") == "1":
         return
     # Synchronous update status — bounded by check_for_updates' own subprocess/network timeouts
     # and its 6-hour cache; any failure prints nothing.

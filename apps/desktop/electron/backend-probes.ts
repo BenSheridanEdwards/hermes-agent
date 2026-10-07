@@ -31,6 +31,13 @@ function resolveProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
 
 const PROBE_TIMEOUT_MS = resolveProbeTimeoutMs()
 
+/**
+ * A `--version` probe only needs the exit code. Without this the runtime also
+ * checks for updates (git reads, maybe a fetch), which can outlast the budget
+ * on a loaded machine. Older runtimes ignore it.
+ */
+const VERSION_PROBE_ENV: Readonly<NodeJS.ProcessEnv> = Object.freeze({ HERMES_VERSION_SKIP_UPDATE_CHECK: '1' })
+
 function isTimeoutError(err: unknown): boolean {
   if (!err || typeof err !== 'object') {
     return false
@@ -170,6 +177,7 @@ async function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }
 
   try {
     await execProbe(windowsShellCommand(hermesCommand, Boolean(opts?.shell)), ['--version'], {
+      env: { ...process.env, ...VERSION_PROBE_ENV },
       stdio: 'ignore',
       timeout: PROBE_TIMEOUT_MS,
       shell: Boolean(opts?.shell),
@@ -190,5 +198,6 @@ export {
   PROBE_TIMEOUT_MS,
   resolveProbeTimeoutMs,
   shouldTrustHermesOverride,
-  verifyHermesCli
+  verifyHermesCli,
+  VERSION_PROBE_ENV
 }

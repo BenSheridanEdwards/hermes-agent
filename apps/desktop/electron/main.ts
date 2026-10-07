@@ -5356,7 +5356,7 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
   //    bootstrap when the runtime itself is unusable.
   //    HERMES_DESKTOP_IGNORE_EXISTING=1 skips this rung (see backend-resolution).
   const activeBackend: SourceBackend | null = await installedRuntimeGate.resolve(ACTIVE_HERMES_ROOT, () =>
-    resolveSourceInstallationBackend(ACTIVE_HERMES_ROOT, backendArgs, { hermesHome: HERMES_HOME })
+    resolveSourceInstallationBackend(ACTIVE_HERMES_ROOT, backendArgs, { hermesHome: HERMES_HOME, log: rememberLog })
   )
 
   const activeRuntime: ActiveRuntimeState = activeRuntimeState(activeBackend)
@@ -5383,7 +5383,7 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
 
     if (userInstall) {
       const userBackend: SourceBackend | null = await installedRuntimeGate.resolve(userInstall.root, () =>
-        resolveSourceInstallationBackend(userInstall.root, backendArgs, { hermesHome: HERMES_HOME })
+        resolveSourceInstallationBackend(userInstall.root, backendArgs, { hermesHome: HERMES_HOME, log: rememberLog })
       )
 
       if (userBackend) {

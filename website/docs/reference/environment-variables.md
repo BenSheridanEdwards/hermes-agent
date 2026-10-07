@@ -893,6 +893,7 @@ Hermes sets these itself to carry state across a boundary where no `config.yaml`
 | `HERMES_REPO_URL` | Git remote the installers (`scripts/install.sh`, `scripts/install.ps1`) clone from, and re-point `origin` to on a rerun. It is an environment variable because the installer runs before any Hermes config exists. Used by CI and rehearsal scripts to install from a fork or mirror; unset, the installers use the official repository. |
 | `HERMES_UPDATE_STATUS_FILE` | Exported by the desktop update shim (`scripts/desktop-update/posix.sh`) with the path of the status JSON its progress window renders. The `hermes update` takeover children publish their long-running stages into that file so the window keeps moving. Absent (an older shim), they fall back to the status file named by the shim's pid in the update marker, and publish nothing when no UI is watching. |
 | `HERMES_UPDATE_UI_ACTIVE` | Set to `1` by an update child after it opens the native macOS status panel for an old shim that has no window of its own. Children inherit it, so the panel is opened at most once per update chain. |
+| `HERMES_VERSION_SKIP_UPDATE_CHECK` | Set to `1` by Hermes Desktop on the `hermes --version` child it runs to check that an installed runtime starts. That check only reads the exit code, so `--version` skips its update check (git reads and a possible fetch), which could otherwise use up the check's timeout on a busy machine. |
 
 ## Interface
 

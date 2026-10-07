@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 
 import { buildDesktopBackendEnv } from './backend-env'
-import { execProbe, PROBE_TIMEOUT_MS } from './backend-probes'
+import { execProbe, isTimeoutError, PROBE_TIMEOUT_MS, VERSION_PROBE_ENV } from './backend-probes'
 import { resolveInstallationLauncher } from './updater-process'
 
 export interface SourceBackend {
@@ -26,7 +26,7 @@ interface SourceOptions {
 export async function resolveSourceInstallationBackend(
   root: string,
   args: string[],
-  options: SourceOptions & { hermesHome?: string } = {}
+  options: SourceOptions & { hermesHome?: string; log?: (message: string) => void } = {}
 ): Promise<SourceBackend | null> {
   if (!existsSync(path.join(root, 'hermes_cli', 'main.py'))) {
     return null
@@ -46,14 +46,26 @@ export async function resolveSourceInstallationBackend(
   try {
     await execProbe(command, ['--version'], {
       cwd: root,
-      env: { ...process.env, ...options.env, ...env },
+      env: { ...process.env, ...options.env, ...env, ...VERSION_PROBE_ENV },
       shell,
       stdio: 'ignore',
       timeout: PROBE_TIMEOUT_MS,
       windowsHide: true
     })
-  } catch {
-    return null
+  } catch (error: unknown) {
+    // Only an exit or spawn failure proves the runtime unusable. A probe that
+    // never answered proves nothing (a loaded machine, a cold AV scan), and
+    // calling it unusable offers the installer over a working install. The
+    // spawn's port-announce wait, with its own recovery, is the authority.
+    if (!isTimeoutError(error)) {
+      options.log?.(`[runtime] ${root} is not usable: ${error instanceof Error ? error.message : String(error)}`)
+
+      return null
+    }
+
+    options.log?.(
+      `[runtime] ${launcher} --version did not answer within ${PROBE_TIMEOUT_MS}ms (twice); launching ${root} anyway`
+    )
   }
 
   return {

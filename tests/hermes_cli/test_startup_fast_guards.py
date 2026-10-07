@@ -217,6 +217,24 @@ def test_fast_version_parity(tmp_path):
     assert "Traceback" not in result.stderr
 
 
+def test_version_probe_env_skips_the_update_check(monkeypatch, capsys):
+    """Desktop's runtime probe discards --version output and runs under a timeout, so the
+    update check (git reads + fetch) must not run for it; plain --version keeps it."""
+    from hermes_cli import _startup_fast, source_check
+
+    calls = []
+    monkeypatch.setattr(source_check, "check_for_updates", lambda **kw: calls.append(kw) or {"behind": 0})
+
+    monkeypatch.setenv("HERMES_VERSION_SKIP_UPDATE_CHECK", "1")
+    _startup_fast.print_fast_version_info()
+    assert calls == []
+    assert "Hermes Agent v" in capsys.readouterr().out
+
+    monkeypatch.delenv("HERMES_VERSION_SKIP_UPDATE_CHECK")
+    _startup_fast.print_fast_version_info()
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("argv", [["update"], ["pm", "doctor"], ["gateway", "status"]])
 def test_termux_chat_shortcut_leaves_subcommands_to_dispatch(monkeypatch, argv):
     from hermes_cli import main
