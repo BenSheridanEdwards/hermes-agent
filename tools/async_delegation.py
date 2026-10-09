@@ -98,6 +98,51 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
+_BACKGROUND_WORK_MARKER = ".buzz-background-work"
+
+
+def _background_work_marker_path():
+    """Sibling of the ledger, so a redirected ``_db_path`` (tests) redirects this too."""
+    return _db_path().parent / _BACKGROUND_WORK_MARKER
+
+
+def refresh_background_work_marker() -> None:
+    """Advertise outstanding background work to a supervising harness such as buzz-acp.
+
+    Present means a delegation is running/finalizing or a completion still awaits
+    delivery. Absent means the harness may idle the pool. Derived from the durable
+    ledger so a restart stays correct. JSON shape is what buzz-acp already parses:
+    ``pending[].origin_session`` is the ACP session that must receive the result.
+    Best-effort, and must be called outside ``_DB_LOCK``.
+    """
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            rows = conn.execute(
+                """SELECT delegation_id, origin_session, state, delivery_state
+                   FROM async_delegations
+                   WHERE state IN ('running','finalizing') OR delivery_state='pending'"""
+            ).fetchall()
+        path = _background_work_marker_path()
+        running = [row[0] for row in rows if row[2] in ("running", "finalizing")]
+        pending = [
+            {"delegation_id": row[0], "origin_session": row[1] or ""}
+            for row in rows
+            if row[2] not in ("running", "finalizing") and row[3] == "pending"
+        ]
+        if running or pending:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "pid": os.getpid(),
+                "ts": int(time.time()),
+                "running": running,
+                "pending": pending,
+            }) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("background-work marker refresh failed", exc_info=True)
+
+
 def _connect() -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
     # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
@@ -176,6 +221,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
              json.dumps(task_payload), record.get("origin_session_id", "")))
     _prune_durable_records()
+    refresh_background_work_marker()
 
 
 def _prune_durable_records() -> None:
@@ -211,6 +257,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]))
+    refresh_background_work_marker()
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -304,6 +351,7 @@ def recover_abandoned_delegations() -> int:
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
             recovered += 1
+    refresh_background_work_marker()
     return recovered
 
 
@@ -330,7 +378,9 @@ def restore_undelivered_completions(target_queue) -> int:
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        return _replay_pending(conn, rows, target_queue, now)
+        restored = _replay_pending(conn, rows, target_queue, now)
+    refresh_background_work_marker()
+    return restored
 
 
 def _replay_pending(conn, rows, target_queue, now: float) -> int:
@@ -430,9 +480,11 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    return _update_delivery(
+    delivered = _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+    refresh_background_work_marker()
+    return delivered
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -449,6 +501,14 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
         return cur.rowcount == 1
+
+
+def renew_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Keep an admitted long-running consumer's claim from being stolen."""
+    now = time.time()
+    return _update_delivery("""UPDATE async_delegations SET delivery_claimed_at=?, updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+        (now, now, delegation_id, claim_id))
 
 
 def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
@@ -516,11 +576,13 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
+    delivered = _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+    refresh_background_work_marker()
+    return delivered
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

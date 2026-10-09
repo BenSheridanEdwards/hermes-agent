@@ -42,6 +42,8 @@ from tools.approval_context import reset_hermes_interactive_context, set_hermes_
 
 logger = logging.getLogger(__name__)
 
+_COMPLETION_CLAIM_RENEW_SECONDS = 60
+
 # Runs the synchronous AIAgent off the event loop.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 
@@ -849,6 +851,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
             return PromptResponse(stop_reason="end_turn")
 
+        background_text, completion_claims = await asyncio.to_thread(
+            self._drain_ready_process_notifications, session_id)
+        if background_text:
+            user_text = f"{background_text}\n\n{user_text}"
+            user_content = user_text
+        renew_task = asyncio.create_task(
+            self._renew_process_notification_claims(completion_claims, state)) if completion_claims else None
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
         conn, loop = self._conn, asyncio.get_running_loop()
         if state.cancel_event:
@@ -880,7 +890,145 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
+        try:
+            return await self._finish_turn(
+                state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed,
+                completion_claims=completion_claims,
+            )
+        finally:
+            if renew_task is not None:
+                renew_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renew_task
+            if completion_claims:
+                self._settle_process_notifications(completion_claims, delivered=False)
+
+    def _drain_ready_process_notifications(self, session_id: str) -> tuple[str, list[tuple[str, str]]]:
+        """Inject finished background results owned by this ACP session.
+
+        buzz-acp has no gateway watcher. It prompts the originating session when
+        `.buzz-background-work` lists a pending result; this drain is what puts
+        that result into the turn. Other sessions' events stay queued.
+        """
+        from tools.async_delegation import claim_event_delivery, defer_completion_delivery, get_durable_delegation
+        from tools.process_registry import process_registry
+        from tools.process_registry_notifications import format_process_notification
+
+        queue = process_registry.completion_queue
+        messages: list[str] = []
+        claims: list[tuple[str, str]] = []
+        requeue: list[Any] = []
+        for _ in range(queue.qsize()):
+            try:
+                evt = queue.get_nowait()
+            except Exception:
+                break
+            if not isinstance(evt, dict):
+                requeue.append(evt)
+                continue
+            is_async = evt.get("type") == "async_delegation"
+            claim_id: str | None = None
+            if is_async:
+                origin = str(evt.get("session_key") or "")
+                if origin and origin != session_id:
+                    requeue.append(evt)
+                    continue
+                try:
+                    claim_id = claim_event_delivery(evt, "acp")
+                    if claim_id is None:
+                        row = get_durable_delegation(str(evt.get("delegation_id") or ""))
+                        if row and row.get("delivery_state") == "pending":
+                            requeue.append(evt)
+                        continue
+                except Exception:
+                    logger.warning("Could not claim completion; retaining retry", exc_info=True)
+                    requeue.append(evt)
+                    continue
+            try:
+                text = format_process_notification(evt)
+            except Exception:
+                logger.warning("Failed to format process notification; requeuing", exc_info=True)
+                text = None
+            if not text:
+                if is_async and claim_id:
+                    try:
+                        defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+                    except Exception:
+                        logger.warning("Could not release unformatted completion; retaining retry", exc_info=True)
+                requeue.append(evt)
+                continue
+            messages.append(text)
+            if is_async and claim_id:
+                did = str(evt.get("delegation_id") or "")
+                if did:
+                    claims.append((did, claim_id))
+                    self._claimed_completion_events = getattr(self, "_claimed_completion_events", {})
+                    self._claimed_completion_events[claim_id] = evt
+        for evt in requeue:
+            try:
+                queue.put(evt)
+            except Exception:
+                pass
+        if not messages:
+            return "", claims
+        header = (
+            "[BACKGROUND WORK FINISHED — REPORT IT]\n"
+            "A background task you dispatched earlier has finished; its result is below. "
+            "The person who asked is waiting on it. Report the outcome now, in this thread, "
+            "even if the rest of this turn says to stay silent. Inspect the result, "
+            "continue any unfinished authorized work, and verify the overall outcome. "
+            "A worker finishing is not proof that the user's task is complete."
+        )
+        return header + "\n\n" + "\n\n".join(messages), claims
+
+    def _settle_process_notifications(
+        self, claims: list[tuple[str, str]], delivered: bool, *, attempted: bool = False,
+    ) -> None:
+        from tools.async_delegation import (
+            complete_completion_delivery, defer_completion_delivery, get_durable_delegation,
+            refresh_background_work_marker, release_completion_delivery,
+        )
+        from tools.process_registry import process_registry
+        events = getattr(self, "_claimed_completion_events", {})
+        for did, claim in list(claims):
+            event = events.get(claim)
+            try:
+                if delivered:
+                    complete_completion_delivery(did, claim)
+                else:
+                    if attempted:
+                        release_completion_delivery(did, claim)
+                    else:
+                        defer_completion_delivery(did, claim)
+                    row = get_durable_delegation(did)
+                    if event is not None and (row is None or row.get("delivery_state") == "pending"):
+                        process_registry.completion_queue.put(event)
+            except Exception:
+                logger.warning("Could not settle completion %s; retaining retry", did, exc_info=True)
+                if event is not None:
+                    process_registry.completion_queue.put(event)
+            events.pop(claim, None)
+        claims.clear()
+        if events or claims is not None:
+            refresh_background_work_marker()
+
+    async def _renew_process_notification_claims(
+        self, claims: list[tuple[str, str]], state: SessionState,
+    ) -> None:
+        from tools.async_delegation import get_durable_delegation, renew_completion_delivery
+        while claims:
+            await asyncio.sleep(_COMPLETION_CLAIM_RENEW_SECONDS)
+            for did, claim in list(claims):
+                try:
+                    if renew_completion_delivery(did, claim) or get_durable_delegation(did) is None:
+                        continue
+                except Exception:
+                    logger.exception("Could not renew completion delivery claim for %s", did)
+                logger.error("Lost completion delivery claim for %s; interrupting its consumer", did)
+                if state.cancel_event:
+                    state.cancel_event.set()
+                await self.cancel(state.session_id)
+                return
 
     def _flush_turn_tool_calls(
         self, cbs: _TurnCallbacks, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
@@ -947,7 +1095,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def _finish_turn(
         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
-        streamed_message: bool,
+        streamed_message: bool, *, completion_claims: list[tuple[str, str]] | None = None,
     ) -> PromptResponse:
         """Persist, emit provenance/final text, drain queued prompts, report usage."""
         try:
@@ -987,6 +1135,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         update.message_id = state.message_ids.current()
                     state.message_ids.close()
                 await conn.session_update(session_id, update)
+
+            if completion_claims:
+                delivered = (
+                    not interrupted and not result.get("error") and bool(result.get("messages"))
+                    and not str(final_response).startswith("Error:")
+                )
+                self._settle_process_notifications(completion_claims, delivered, attempted=True)
+                completion_claims.clear()
 
         finally:
             # Go idle before draining so recursive prompt() calls can acquire the session.
