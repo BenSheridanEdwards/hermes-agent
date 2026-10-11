@@ -1888,7 +1888,7 @@ class TestBoundedLocalFallback:
 
     @pytest.mark.parametrize("scan", ["skipped", "race-changed"])
     def test_local_callback_stays_empty_after_scan(self, monkeypatch, tmp_path, local_guard, scan):
-        import cron.lifecycle_guard as lifecycle_guard
+        from cron import lifecycle_guard
 
         script = tmp_path / "candidate.sh"
         script.write_bytes(b"\x7fELF" + bytes(64))
