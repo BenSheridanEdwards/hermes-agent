@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,12 +57,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 # The CI lane selector owns the platforms() spec resolver; share it so the
 # "skipped on this host" note and the lanes can never disagree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.runner_scratch import ScratchClaim, ScratchLease
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -77,14 +80,47 @@ def _sweep_killed_run_roots(root: str) -> None:
 
 
 def _rmtree_force(path: str) -> None:
-    def _chmod_retry(fn, p, _exc):
-        try:
-            os.chmod(os.path.dirname(p) if fn is os.rmdir or fn is os.listdir else p, 0o700)
-            os.chmod(p, 0o700)
-            fn(p)
-        except OSError:
-            pass
-    shutil.rmtree(path, onerror=_chmod_retry)
+    """Prepare only owned directories, then remove without following links.
+
+    Unlink permissions belong to the parent, not the file or symlink referent.
+    Never chmod a leaf. Failures retain evidence and fail the attempt instead
+    of turning incomplete cleanup into a successful test result.
+    """
+    initial = os.lstat(path)
+    if not stat.S_ISDIR(initial.st_mode):
+        raise OSError(f"cleanup refused non-directory worker: {path}")
+    root = Path(path).resolve()
+    identity = (initial.st_dev, initial.st_ino, initial.st_uid)
+
+    def verify_root():
+        current = root.lstat()
+        if (not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino, current.st_uid) != identity):
+            raise OSError(f"cleanup worker identity changed; retained: {root}")
+
+    def prepare(directory):
+        verify_root()
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or directory.resolve() != directory
+                or info.st_dev != initial.st_dev or info.st_uid != initial.st_uid
+                or (hasattr(os, 'getuid') and info.st_uid != os.getuid())):
+            raise OSError(f"cleanup refused unowned or aliased directory: {directory}")
+        if stat.S_IMODE(info.st_mode) & 0o700 != 0o700:
+            # no-follow is mandatory. An unsupported platform fails explicitly.
+            os.chmod(directory, stat.S_IMODE(info.st_mode) | 0o700, follow_symlinks=False)
+            after = directory.lstat()
+            if (after.st_dev, after.st_ino, after.st_uid) != (info.st_dev, info.st_ino, info.st_uid):
+                raise OSError(f"cleanup directory identity changed; retained: {directory}")
+        with os.scandir(directory) as entries:
+            children = [Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)]
+        for child in children:
+            prepare(child)
+
+    prepare(root)
+    verify_root()
+    shutil.rmtree(root)
+    if os.path.lexists(root):
+        raise OSError(f"cleanup retained worker: {root}")
 
 def _runner_scratch_root() -> str:
     """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
@@ -435,6 +471,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    scratch_root: ScratchClaim | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -469,7 +506,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, scratch_root
     )
     attempt = 0
     # A worker killed by signal (OOM, SIGKILL) or the file timeout is a runaway, not a flake:
@@ -480,7 +517,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, scratch_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -503,11 +540,19 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _cleanup_worker(temproot: str, lease: ScratchLease | None) -> None:
+    if lease is not None:
+        lease.verify()  # uncertain paths stay intact, and the attempt fails
+        temproot = str(lease.worker)
+    _rmtree_force(temproot)
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    scratch_root: ScratchClaim | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
@@ -529,43 +574,39 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    lease = scratch_root.create_worker() if scratch_root is not None else None
+    temproot = str(lease.worker) if lease is not None else tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
-
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    proc = None
     pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
+    # Cover receipt creation and Popen too: a failed launch still owns a worker.
     try:
+        if lease is not None:
+            env.update(TMP=temproot, TEMP=temproot, PYTHONDONTWRITEBYTECODE="1")
+            from scripts.runner_scratch import worker_receipt
+
+            cmd.extend(["--basetemp", str(Path(temproot) / "pytest"),
+                        "-o", f"cache_dir={Path(temproot) / 'cache'}",
+                        "--runner-owned-scratch=" + worker_receipt(lease)])
+        proc = subprocess.Popen(
+            cmd, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env,
+            start_new_session=True,
+        )
+        # Capture before communicate can reap the group leader.
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
+        assert proc is not None
         _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
@@ -579,7 +620,8 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        if proc is not None:
+            _kill_tree(proc, pgid=pgid)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -592,7 +634,7 @@ def _run_one_file_once(
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
         # behind; make them writable and retry instead of skipping them.
-        _rmtree_force(temproot)
+        _cleanup_worker(temproot, lease)
 
     if rc not in (0, 5) and not output.strip():
         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
@@ -817,6 +859,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
 def _save_durations(
     file_times: List[Tuple[Path, float]],
     repo_root: Path,
+    output_root: ScratchClaim | None = None,
 ) -> None:
     """Write the duration cache so future ``--slice`` runs can use it.
 
@@ -829,8 +872,17 @@ def _save_durations(
     for f, t in file_times:
         key = _format_file(f, repo_root)
         data[key] = round(t, 3)
-    path = repo_root / _DURATIONS_FILE
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if output_root is not None:
+        output_root.verify()
+    path = (output_root.task if output_root is not None else repo_root) / _DURATIONS_FILE
+    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    if output_root is None:
+        path.write_text(text, encoding="utf-8")
+    else:
+        # A fresh task has no duration output yet. Never follow a test-created
+        # symlink/hardlink or overwrite an unrelated entry here.
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(text)
 
 
 def _compute_lpt_slices(
@@ -1089,6 +1141,10 @@ def main() -> int:
         ),
     )
     # Split argv into "our flags + positional paths" vs "pytest passthrough".
+    parser.add_argument(
+        "--scratch-root", metavar="DIRECTORY",
+        help="New uniquely owned task directory for per-file temp/cache writes; no fallback",
+    )
     #
     # Two ways to pass args through to the per-file pytest invocation:
     #   1. Explicit ``--`` separator: everything after it goes to pytest.
@@ -1107,7 +1163,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from",
+        "--files-from", "--scratch-root",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1156,6 +1212,23 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+
+    if any(token.startswith("--runner-owned-scratch")
+           for token in bare_passthrough + explicit_passthrough):
+        parser.error("--runner-owned-scratch is reserved for canonical worker creation")
+
+    if args.scratch_root is not None:
+        from scripts.runner_scratch import claim_scratch_root, reject_location_overrides
+
+        try:
+            reject_location_overrides(bare_passthrough + explicit_passthrough)
+            args.scratch_root = claim_scratch_root(args.scratch_root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        sys.dont_write_bytecode = True
+        os.environ.update(TMPDIR=str(args.scratch_root.task), TMP=str(args.scratch_root.task),
+                          TEMP=str(args.scratch_root.task), PYTHONDONTWRITEBYTECODE="1")
+        tempfile.tempdir = None
 
     # Bare tokens are validated against pytest's option set so a typo fails
     # here with usage instead of once per discovered file. Anything after a
@@ -1375,7 +1448,9 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    if args.scratch_root is None:
+        _sweep_killed_run_roots(_runner_scratch_root())
+    # Explicit roots belong to callers: never prune their unrelated entries.
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get
@@ -1391,6 +1466,7 @@ def main() -> int:
                     file, repo_root, args.file_timeout, timeout_durations
                 ),
                 args.file_retries,
+                args.scratch_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1463,7 +1539,7 @@ def main() -> int:
         file_times, failures, _FLAKY_RESULTS,
     )
     if clean_times:
-        _save_durations(clean_times, repo_root)
+        _save_durations(clean_times, repo_root, args.scratch_root)
         print(f"  Durations cached to {_DURATIONS_FILE} ({len(clean_times)} files)")
 
     # Per-file time distribution (throwaway diagnostic — shows how

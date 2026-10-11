@@ -35,6 +35,14 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from tests.scratch_isolation import LEASE as _OWNED_TEST_SCRATCH, retain_temp, bounded_profile_resolver
+
+
+def pytest_addoption(parser):
+    # Internal runner-to-pytest receipt, not a user-controlled bypass flag.
+    # read_lease validates it before collection or temporary allocation.
+    parser.addoption("--runner-owned-scratch", default=None, help="internal canonical-runner receipt")
+
 # Every test file runs in its own process, and in a checkout without an install stamp
 # get_version_info() shells out to git 7 times (~0.55 s per process in a large local
 # clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow
@@ -72,6 +80,28 @@ _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
 from hermes_constants import _get_platform_default_hermes_home
 
 _NATIVE_HERMES_PARENT = _get_platform_default_hermes_home().parent
+
+_SESSION_PLATFORM_HOME = None
+if _OWNED_TEST_SCRATCH is not None:
+    # Existing test isolation already substitutes Hermes' default resolver per
+    # test. Do so before collection too, inside this owned worker. REAL HOME,
+    # _real_platform_state_root and the real-home deny-list remain unchanged.
+    import hermes_constants as _scratch_constants
+
+    _SESSION_PLATFORM_HOME = _OWNED_TEST_SCRATCH.worker / "native-test-home"
+
+    def _scratch_platform_default(_original=_get_platform_default_hermes_home,
+                                  _parent=_NATIVE_HERMES_PARENT,
+                                  _isolated=_SESSION_PLATFORM_HOME):
+        root = _original()
+        return _isolated / root.name if root.parent == _parent else root
+
+    _scratch_constants._get_platform_default_hermes_home = _scratch_platform_default
+    # A test home beneath a real profile is not that profile. Bound only the
+    # validated task's ancestor search before collection-time logging/imports.
+    # Real deletion predicates and all production/native deny roots stay intact.
+    _scratch_constants.named_profile_home = bounded_profile_resolver(
+        _OWNED_TEST_SCRATCH, _scratch_constants.named_profile_home)
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -138,7 +168,8 @@ for _key in SCRATCH_TMP_ENV_VARS:
     _value = os.environ.get(_key)
     if _value:
         _path = Path(_value).expanduser().resolve()
-        if any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots):
+        if (any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots)
+                and not retain_temp(_path)):
             del os.environ[_key]
 tempfile.tempdir = None  # re-resolve after stripping guarded temp directories
 os.environ.setdefault("TMPDIR", tempfile.gettempdir())
@@ -290,7 +321,8 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
         root = platform_default()
         # Explicit Path.home()/LOCALAPPDATA overrides in individual tests
         # still select their own layout. Suffix changes retain their name.
-        return tmp_path / root.name if root.parent == _NATIVE_HERMES_PARENT else root
+        return (tmp_path / root.name
+                if root.parent == _NATIVE_HERMES_PARENT or root.parent == _SESSION_PLATFORM_HOME else root)
 
     monkeypatch.setattr(
         hermes_constants, "_get_platform_default_hermes_home", isolated_platform_default
@@ -664,14 +696,17 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
         return
 
     def _guarded_connect(db_path=None, *args, **kwargs):
-        if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
-        else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
+        candidate = Path(db_path) if db_path is not None else _kdb.kanban_db_path(board=kwargs.get("board"))
+        candidate = candidate.expanduser()
+        # Match HomeIOGuard: make relative inputs absolute without resolving
+        # away '..' or symlink/parent composition before lease validation.
+        candidate = candidate if candidate.is_absolute() else Path.cwd() / candidate
+        if (_OWNED_TEST_SCRATCH is not None
+                and candidate.is_relative_to(_OWNED_TEST_SCRATCH.task)):
+            if _OWNED_TEST_SCRATCH.allows(candidate, [_REAL_KANBAN_ROOT]):
+                return _orig_connect(db_path, *args, **kwargs)
+            raise RuntimeError("kanban_write_guard: invalid owned scratch target")
+        resolved = candidate.resolve()
         try:
             resolved.relative_to(_REAL_KANBAN_ROOT)
         except ValueError:
@@ -1002,6 +1037,13 @@ _AUDIO_GUARD_BYPASS_MARK = "real_audio_playback"
 _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 
 
+def _enforce_owned_basetemp(config, lease) -> None:
+    """Active worker hook only; synthetic relocation configs use the default helper."""
+    candidate = config._tmp_path_factory._given_basetemp
+    if candidate != lease.worker / "pytest" or not lease.contains(candidate):
+        raise pytest.UsageError("runner-owned basetemp changed or escaped its task")
+
+
 def _relocate_basetemp_outside_operator_home(config) -> None:
     """Move pytest's basetemp out of the operator's platform-native Hermes home.
 
@@ -1101,7 +1143,10 @@ def pytest_unconfigure(config):  # noqa: D401 — pytest hook
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
-    _relocate_basetemp_outside_operator_home(config)
+    if _OWNED_TEST_SCRATCH is not None:
+        _enforce_owned_basetemp(config, _OWNED_TEST_SCRATCH)
+    else:
+        _relocate_basetemp_outside_operator_home(config)
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
@@ -1427,7 +1472,8 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS,
+                scratch=_OWNED_TEST_SCRATCH).install(monkeypatch)
 
 
 @pytest.fixture

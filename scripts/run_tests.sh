@@ -37,6 +37,51 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Explicit CLI location, never an inherited guard/config override. Validate
+# before activation, pytest imports or bytecode precompilation can write.
+SCRATCH_ROOT=""
+_scratch_seen=0
+_scratch_value=0
+for _arg in "$@"; do
+  if [ "$_scratch_value" = 1 ]; then
+    SCRATCH_ROOT="$_arg"
+    _scratch_value=0
+    continue
+  fi
+  case "$_arg" in
+    --) break ;;
+    --scratch-root|--scratch-root=*)
+      if [ "$_scratch_seen" = 1 ]; then
+        printf '%s\n' 'error: --scratch-root may be supplied only once' >&2
+        exit 2
+      fi
+      _scratch_seen=1
+      if [ "$_arg" = --scratch-root ]; then
+        _scratch_value=1
+      else
+        SCRATCH_ROOT="${_arg#--scratch-root=}"
+      fi ;;
+  esac
+done
+PYTHON_OPTIONS=()
+SCRATCH_ENV=()
+if [ "$_scratch_seen" = 1 ]; then
+  if [ "$_scratch_value" = 1 ] || [ -z "$SCRATCH_ROOT" ]; then
+    printf '%s\n' 'error: --scratch-root requires a nonempty directory' >&2
+    exit 2
+  fi
+  _scratch_python="${HERMES_PYTHON:-${__HERMES_TEST_PYTHON:-}}"
+  if [ -z "$_scratch_python" ] || [ ! -x "$_scratch_python" ]; then
+    printf '%s\n' 'error: --scratch-root requires a prepared HERMES_PYTHON or active test interpreter; no automatic setup' >&2
+    exit 2
+  fi
+  SCRATCH_ROOT="$("$_scratch_python" -I -S -B "$SCRIPT_DIR/runner_scratch.py" "$SCRATCH_ROOT" "$@")" || exit 2
+  PYTHON_OPTIONS=(-B)
+  export PYTHONDONTWRITEBYTECODE=1
+  export TMPDIR="$SCRATCH_ROOT" TMP="$SCRATCH_ROOT" TEMP="$SCRATCH_ROOT"
+  SCRATCH_ENV=("PYTHONDONTWRITEBYTECODE=1" "TMPDIR=$SCRATCH_ROOT" "TMP=$SCRATCH_ROOT" "TEMP=$SCRATCH_ROOT")
+fi
+
 # ── Locate python ───────────────────────────────────────────────────────────
 # The suite runs under the checkout's isolated test environment (pm.testenv),
 # and only there: unless the inherited environment is current for this
@@ -50,14 +95,23 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # the Nix devShell's editable venv and CI's minimal installer lanes provide
 # one on purpose. The import check matters: a wrapped `hermes` binary exports
 # HERMES_PYTHON pointing at a release venv without pytest.
-_has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/null; }
+_has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" ${PYTHON_OPTIONS[@]+"${PYTHON_OPTIONS[@]}"} -c 'import pytest' 2>/dev/null; }
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
-if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
+if [ "$_scratch_seen" = 1 ] && [ -z "${__HERMES_ACTIVATED:-}" ]; then
+  # Do not import pytest while the new task directory is not yet claimed:
+  # tempfile could otherwise fall back from the nonexistent TMPDIR. Missing
+  # pytest fails in the canonical runner; explicit mode never auto-installs.
+  PYTHON="$_scratch_python"
+elif [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
 else
   if ! hermes_activation_current "$REPO_ROOT"; then
+    if [ "$_scratch_seen" = 1 ]; then
+      printf '%s\n' 'error: --scratch-root requires a prepared test interpreter; automatic environment setup is not scratch-contained' >&2
+      exit 2
+    fi
     if [ -n "${__HERMES_TESTS_REEXEC:-}" ]; then
       echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
@@ -67,7 +121,7 @@ else
     exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"
   fi
   PYTHON="${__HERMES_TEST_PYTHON:-}"
-  if ! _has_pytest "$PYTHON"; then
+  if { [ "$_scratch_seen" = 1 ] && [ ! -x "$PYTHON" ]; } || { [ "$_scratch_seen" = 0 ] && ! _has_pytest "$PYTHON"; }; then
     echo "error: activation provided no test interpreter with pytest (__HERMES_TEST_PYTHON=${PYTHON:-unset})" >&2
     exit 1
   fi
@@ -75,12 +129,9 @@ fi
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
-EXTRA_PYTHONPATH=""
-EXTRA_PYTEST_PLUGINS=""
-if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
-  EXTRA_PYTHONPATH="$HOME/.hermes"
-  EXTRA_PYTEST_PLUGINS="pytest_live_guard"
-fi
+# shellcheck source=scripts/test_guard_plugin.sh
+. "$SCRIPT_DIR/test_guard_plugin.sh"
+hermes_test_guard_plugin "$HOME"
 
 
 # ── Windows location variables (computed before we drop env) ───────────────
@@ -174,8 +225,10 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+if [ "$_scratch_seen" = 0 ]; then
+  echo "▶ pre-compiling bytecode cache"
+  "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+fi
 
 echo "▶ launching test runner"
 exec env -i \
@@ -183,6 +236,7 @@ exec env -i \
   HOME="$HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
+  ${SCRATCH_ENV[@]+"${SCRATCH_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
@@ -193,4 +247,4 @@ exec env -i \
   ${HERMES_RUN_E2E:+HERMES_RUN_E2E="$HERMES_RUN_E2E"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
-  "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+  "$PYTHON" ${PYTHON_OPTIONS[@]+"${PYTHON_OPTIONS[@]}"} "$SCRIPT_DIR/run_tests_parallel.py" "$@"
