@@ -172,6 +172,9 @@ _EXTRA_KEYS = frozenset({
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
     # a billing bench to a 60s transient cooldown.
     "failure_reason",
+    # Non-secret provider-qualified account principal Hermes observed at sign-in / renewal
+    # (agent/credential_identity.observed_principal); round-tripped so refresh never drops it.
+    "principal", "auth_mode",
 })
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.
@@ -1583,11 +1586,19 @@ class CredentialPool(CredentialPoolAdminMixin):
         """Codex / xAI: POST the refresh and return the rotated (unpersisted) entry."""
         refresh_fn_name = _TOKENS_SINGLETON_PROVIDERS[self.provider][2]
         refreshed = getattr(auth_mod, refresh_fn_name)(entry.access_token, entry.refresh_token)
+        from agent.credential_identity import observed_principal, principal_matches
+        from agent.credential_policy import CredentialPolicyError
+        expected = entry.extra.get("principal") or observed_principal(self.provider, {"access_token": entry.access_token})
+        observed = observed_principal(self.provider, refreshed)
+        if expected and not principal_matches(observed, expected):
+            # Keep the existing uncertainty journal: a consumed rotation must not be replayed.
+            raise CredentialPolicyError("Refreshed token has a different or unknown account identity")
         return replace(
             entry,
             access_token=refreshed["access_token"],
             refresh_token=refreshed["refresh_token"],
             last_refresh=refreshed.get("last_refresh"),
+            extra={**entry.extra, **({"principal": observed} if observed else {})},
         )
 
     def _refresh_entry_impl(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
