@@ -449,6 +449,18 @@ class _ProcessOwner:
                 node['cleanup_error'] = f'{previous}; {error}' if previous else str(error)
                 node = node['parent']
 
+    def _unresolved_storage(self, node):
+        # The containing process has stopped: no completed child may still be
+        # awaiting its caller's first cleanup message. In-flight children closed
+        # by this owner's cancellation retain the existing reclamation path.
+        owned = self._subtree(node)
+        errors = [error for item in owned for error in item.get('pending_storage', {}).values()]
+        errors.extend(f'completed worker cleanup unresolved; storage retained: {item["lease"].worker}'
+                      for item in owned if item is not node and item['lease'] is not None
+                      and item.get('finished') and not item.get('storage_cancelled')
+                      and not item.get('storage_cleaned'))
+        return errors
+
     def cleanup(self, key, parent=None):
         """Owner-side filesystem cleanup, serialized with ancestor cancellation."""
         with self.lock:
@@ -463,7 +475,7 @@ class _ProcessOwner:
                     raise RuntimeError('process/capture cleanup not acknowledged')
                 owned = self._subtree(node)
                 errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
-                errors.extend(error for item in owned for error in item.get('pending_storage', {}).values())
+                errors.extend(self._unresolved_storage(node))
                 if errors:
                     raise RuntimeError('; '.join(errors))
                 for item in owned:
@@ -508,18 +520,21 @@ class _ProcessOwner:
                     with self.lock:
                         pending = parent.setdefault('pending_storage', {})
                         key = message['worker']
-                        if message['phase'] == 'begin':
+                        if message['phase'] in ('reserve', 'begin'):
                             if parent['closing']:
                                 self._veto(parent, 'setup cleanup requested after owner closure')
                                 answer = {'ack': False}
                             else:
                                 pending[key] = 'setup storage cleanup acknowledgement pending: ' + key
                                 answer = {'ack': True}
-                        elif message['phase'] == 'end' and key in pending:
+                        elif (message['phase'] == 'end' and key in pending
+                              and (message.get('reservation') is None or message['reservation'] in pending)):
                             if message.get('error'):
                                 self._veto(parent, message['error'])
                             else:
                                 pending.pop(key)
+                                if message.get('reservation') is not None:
+                                    pending.pop(message['reservation'])
                             answer = {'ack': True}
                         else:
                             self._veto(parent, 'invalid setup cleanup acknowledgement')
@@ -550,9 +565,11 @@ class _ProcessOwner:
                 return node['cleanup_error']
             owned = self._subtree(node)
             for item in owned:
+                if item is not node and not item.get('finished'):
+                    item['storage_cancelled'] = True
                 item['closing'] = True
             errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
-            errors.extend(error for item in owned for error in item.get('pending_storage', {}).values())
+            errors.extend(self._unresolved_storage(node))
             # Each leader is our unreaped child, so its PID/session cannot be
             # recycled between identity capture, killpg and absence observation.
             for item in reversed(owned):
@@ -596,7 +613,7 @@ class _ProcessOwner:
                 item['cleanup_error'] = '; '.join(errors) or None
             return '; '.join(errors) or None
 
-    def run(self, *, cmd, cwd, env, timeout, input=None, parent=None, submitted=None):
+    def run(self, *, cmd, cwd, env, timeout, input=None, parent=None, submitted=None, storage_reservation=None):
         from multiprocessing import Pipe
         import math
 
@@ -650,6 +667,10 @@ class _ProcessOwner:
                 if env.get('HERMES_PYTHON') != sys.executable or any(k.startswith('__HERMES_') for k in env):
                     raise ValueError('nested runner requires prepared interpreter without activation')
                 cmd[0] = bash
+            if storage_reservation is not None:
+                if (parent is None or lease is None
+                        or storage_reservation not in parent.get('pending_storage', {})):
+                    raise ValueError('owned launch requires its pending storage reservation')
             if sys.implementation.name != 'cpython':
                 raise RuntimeError('owned output recovery requires the CPython POSIX collector')
             server, child = Pipe(duplex=True)
@@ -665,6 +686,11 @@ class _ProcessOwner:
                                   test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
                 key = len(self.nodes)
                 self.nodes.append(node)
+                if storage_reservation is not None:
+                    # Transfer, never clear responsibility before the original
+                    # lease is retained in the registered process node.
+                    assert parent is not None
+                    parent['pending_storage'].pop(storage_reservation)
             except BaseException:
                 server.close()
                 child.close()
@@ -781,6 +807,8 @@ class _ProcessOwner:
             stdout, stderr = _captured_output(proc, captured)
             if primary:
                 stderr += '\nowner failure: ' + primary
+            for error in self._unresolved_storage(node):
+                self._veto(node, error)
             node['finished'] = True
             return dict(returncode=124 if timed_out else (125 if primary else original_rc),
                         stdout=stdout, stderr=stderr, cleanup_error=node['cleanup_error'],
@@ -788,11 +816,15 @@ class _ProcessOwner:
                         capture_complete=node['capture_complete'], node=key)
 
 
+def _owner_fd():
+    return int(os.environ[_OWNER_ENV])
+
+
 def _owner_exchange(message):
     from multiprocessing.connection import Connection
 
     with _client_lock:
-        connection = Connection(os.dup(int(os.environ[_OWNER_ENV])))
+        connection = Connection(os.dup(_owner_fd()))
         try:
             connection.send_bytes(json.dumps(message).encode())
             return json.loads(connection.recv_bytes())
@@ -809,7 +841,20 @@ def _owned_cleanup(result):
         raise RuntimeError(reply['cleanup_error'])
 
 
-def _cleanup_unlaunched(temp, lease):
+def _reserve_storage():
+    # Receipt precedes worker allocation. Failure before this first send
+    # creates no worker; a lost reply leaves the owner conservative.
+    if _OWNER_ENV not in os.environ:
+        return None
+    import uuid
+    token = 'allocation:' + uuid.uuid4().hex
+    reply = _owner_exchange(dict(op='setup_cleanup', phase='reserve', worker=token))
+    if not reply['ack']:
+        raise RuntimeError('worker allocation refused by enclosing owner')
+    return token
+
+
+def _cleanup_unlaunched(temp, lease, reservation=None):
     """Setup never launched a child, but storage refusal still crosses IPC."""
     inherited = _OWNER_ENV in os.environ
     if inherited:
@@ -822,6 +867,7 @@ def _cleanup_unlaunched(temp, lease):
         if inherited:
             try:
                 reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp,
+                                             reservation=reservation,
                                              error=f'setup storage cleanup refused: {error!r}'))
                 if not reply['ack']:
                     raise RuntimeError('setup cleanup refusal was not acknowledged')
@@ -829,16 +875,17 @@ def _cleanup_unlaunched(temp, lease):
                 raise BaseExceptionGroup('storage refusal and acknowledgement failure', [error, transport])
         raise
     if inherited:
-        reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp))
+        reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp, reservation=reservation))
         if not reply['ack']:
             raise RuntimeError('setup cleanup completion was not acknowledged; ancestor storage retained')
 
 
-def _owned_run(cmd, *, cwd, env, timeout, input=None):
+def _owned_run(cmd, *, cwd, env, timeout, input=None, storage_reservation=None):
     """Canonical dispatch for explicit workers and their compatibility callers."""
     global _process_owner
     inherited = os.environ.get(_OWNER_ENV)
-    request = dict(cmd=list(map(str, cmd)), cwd=str(cwd), env=env, timeout=timeout, input=input)
+    request = dict(cmd=list(map(str, cmd)), cwd=str(cwd), env=env, timeout=timeout, input=input,
+                   storage_reservation=storage_reservation)
     if inherited is not None:
         job = _owner_exchange({'op': 'launch', 'request': request})['job']
         while True:
@@ -1046,6 +1093,7 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
     from scripts.runner_scratch import worker_receipt
 
     started = time.monotonic()
+    reservation = _reserve_storage()
     lease = scratch_root.create_worker()
     temp = str(lease.worker)
     try:
@@ -1056,11 +1104,11 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
         env = dict(os.environ, TMPDIR=temp, TMP=temp, TEMP=temp,
                    PYTEST_DEBUG_TEMPROOT=temp, PYTHONDONTWRITEBYTECODE='1')
     except BaseException as error:
-        _finish_owned_attempt(error, None, lambda: _cleanup_unlaunched(temp, lease))
+        _finish_owned_attempt(error, None, lambda: _cleanup_unlaunched(temp, lease, reservation))
         raise AssertionError('unreachable')
     # If IPC/ownership is lost, no containing storage is deleted on assumption.
     try:
-        result = _owned_run(cmd, cwd=repo_root, env=env, timeout=file_timeout)
+        result = _owned_run(cmd, cwd=repo_root, env=env, timeout=file_timeout, storage_reservation=reservation)
     except BaseException as error:
         error.add_note(f'process ownership unresolved; worker retained: {temp}')
         raise
@@ -1071,7 +1119,7 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
     cleanup = RuntimeError(result['cleanup_error']) if result['cleanup_error'] else None
     # Keep successful-child output too if the following storage cleanup fails.
     primary = RuntimeError(f'pytest child exited {rc}\n{output}')
-    delete = (lambda: _cleanup_unlaunched(temp, lease)) if result.get('unlaunched') else lambda: _owned_cleanup(result)
+    delete = (lambda: _cleanup_unlaunched(temp, lease, reservation)) if result.get('unlaunched') else lambda: _owned_cleanup(result)
     _finish_owned_attempt(primary, cleanup, delete, raise_primary=False)
     if rc not in (0, 5) and not output.strip():
         output = f'pytest child exited {rc} with no output: {file}\n'

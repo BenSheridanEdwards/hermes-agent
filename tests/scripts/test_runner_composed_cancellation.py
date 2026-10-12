@@ -215,6 +215,9 @@ def test_nonzero_attempt_preserves_output_with_cleanup_failure(tmp_path, monkeyp
     from scripts.runner_scratch import claim_scratch_root
 
     claim = claim_scratch_root(str(tmp_path / 'task'))
+    # This legacy final-result model is not an IPC transaction. Initiation
+    # coverage below uses the actual owner reservation and exchange instead.
+    monkeypatch.setattr(runner, '_reserve_storage', lambda: None)
     monkeypatch.setattr(runner, '_owned_run', lambda *a, **kw: dict(
         returncode=1, stdout='primary assertion witness', stderr='primary stderr witness',
         timed_out=False, cleanup_error='process residue' if failure_kind == 'process' else None))
@@ -285,7 +288,8 @@ def test_owned_dispatch_rejects_noncanonical_requests_without_spawn(tmp_path, mo
 
 
 @contextmanager
-def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_fault=False, nested_refusal=False):
+def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_fault=False, nested_refusal=False,
+                 exchange_fault=None):
     """Real Popen/collector/IPC, inert child in the enclosing test session.
 
     No second session owner can escape outer cancellation. The fixture alone
@@ -304,6 +308,8 @@ def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_faul
                   lease=lease, task=lease.task, deadline=time.monotonic() + 30,
                   closing=False, closed=False, cleanup_error=None)
     owner.nodes.append(parent)
+    parent['_faults'], parent['_leases'] = [], []
+    nested = nested_refusal or exchange_fault is not None
     created = []
     original_init = runner._HeldPopen.__init__
     original_execute = runner._HeldPopen._execute_child
@@ -325,7 +331,7 @@ def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_faul
                 'os.write(2,b"primary stderr\\n"); time.sleep(0.1); raise SystemExit(1)')
         if constructor_fault:
             code = 'import time; time.sleep(15)'
-        if nested_refusal and cmd[:3] != [sys.executable, '-m', 'pytest']:
+        if nested and cmd[:3] != [sys.executable, '-m', 'pytest']:
             proc._test_task = Path(cmd[3])
             proc._test_endpoint = os.dup(kwargs['pass_fds'][0])
             code = ('import os,select,time; from pathlib import Path\n'
@@ -353,34 +359,51 @@ def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_faul
         try:
             claim = claim_scratch_root(str(proc._test_task))
             try:
-                runner._run_explicit_file_once(Path('inert.py'), [],
+                result = runner._run_explicit_file_once(Path('inert.py'), [],
                     Path(runner.__file__).resolve().parent.parent, 30, claim)
             except BaseException as error:
                 input = repr(error)
             else:
-                input = 'missing expected infrastructure refusal'
+                input = result[2]
         finally:
             close_endpoint(proc)
             del endpoint.fd, endpoint.pid
         return original_communicate(proc, input=input, **kwargs)
 
-    if nested_refusal:
-        from multiprocessing.connection import Connection
+    if nested:
         from scripts import runner_scratch
         original_exchange = runner._owner_exchange
+        original_fd = runner._owner_fd
+        original_dup = os.dup
         original_receipt = runner_scratch.worker_receipt
 
         def exchange(message):
-            if not hasattr(endpoint, 'fd'):
-                return original_exchange(message)
-            connection = Connection(os.dup(endpoint.fd))
+            endpoint.operation = (message['op'], message.get('phase'))
             try:
-                connection.send_bytes(json.dumps(message).encode())
-                return json.loads(connection.recv_bytes())
+                answer = original_exchange(message)
+                if hasattr(endpoint, 'fd') and (
+                        (exchange_fault == 'cleanup-reply' and message['op'] == 'cleanup')
+                        or (exchange_fault == 'setup-end-reply' and endpoint.operation == ('setup_cleanup', 'end'))):
+                    parent['_faults'].append(exchange_fault)
+                    raise BrokenPipeError('inert reply lost after recorded deletion')
+                return answer
             finally:
-                connection.close()
+                del endpoint.operation
+
+        def duplicate(fd):
+            operation = getattr(endpoint, 'operation', None)
+            if hasattr(endpoint, 'fd') and fd == endpoint.fd and (
+                    (exchange_fault == 'cleanup-send' and operation == ('cleanup', None))
+                    or (exchange_fault == 'setup-begin' and operation == ('setup_cleanup', 'begin'))):
+                parent['_faults'].append(exchange_fault)
+                raise OSError('inert descriptor duplication failure before send')
+            return original_dup(fd)
 
         def receipt(lease):
+            if hasattr(endpoint, 'pid'):
+                parent['_leases'].append(lease)
+                if exchange_fault in ('setup-begin', 'setup-end-reply'):
+                    raise OSError('inert setup receipt failure')
             raw = original_receipt(lease)
             if not hasattr(endpoint, 'pid'):
                 return raw
@@ -389,6 +412,8 @@ def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_faul
             return json.dumps(data)
 
         monkeypatch.setattr(runner, '_owner_exchange', exchange)
+        monkeypatch.setattr(runner, '_owner_fd', lambda: endpoint.fd if hasattr(endpoint, 'fd') else original_fd())
+        monkeypatch.setattr(os, 'dup', duplicate)
         monkeypatch.setattr(runner_scratch, 'worker_receipt', receipt)
         monkeypatch.setattr(runner._HeldPopen, 'communicate', communicate)
 
@@ -555,6 +580,7 @@ def test_setup_cleanup_acknowledgement_controls_ancestor_deletion(tmp_path, monk
         deleted = []
 
         def receipt_failure(lease):
+            parent['closing'] = mode == 'closing'
             raise OSError('inert setup receipt failure')
 
         def cleanup(temp, lease):
@@ -575,7 +601,6 @@ def test_setup_cleanup_acknowledgement_controls_ancestor_deletion(tmp_path, monk
         monkeypatch.setattr(runner_scratch, 'worker_receipt', receipt_failure)
         monkeypatch.setattr(runner, '_cleanup_worker', cleanup)
         monkeypatch.setattr(runner, '_owner_exchange', exchange)
-        parent['closing'] = mode == 'closing'
         expected = OSError if mode == 'success' else BaseExceptionGroup
         with pytest.raises(expected) as failure:
             runner._run_explicit_file_once(Path('inert.py'), [], tmp_path, 30, claim)
@@ -598,3 +623,92 @@ def test_setup_cleanup_acknowledgement_controls_ancestor_deletion(tmp_path, monk
                 assert len(list(claim.task.iterdir())) == 1 and not deleted
             else:
                 assert len(deleted) == 1 and list(claim.task.iterdir()) == []
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('fault', ['cleanup-send', 'setup-begin'])
+def test_cleanup_initiation_fault_reaches_expected_failure_consumer(tmp_path, monkeypatch, real_bash, fault):
+    from tests.scripts.test_run_tests_shell import test_shell_runner_executes_tests_and_propagates_failure
+
+    with _inert_owner(monkeypatch, tmp_path, exchange_fault=fault) as (_, owner, parent, _):
+        with pytest.raises(ExceptionGroup) as failure:
+            test_shell_runner_executes_tests_and_propagates_failure(parent['lease'].worker, real_bash, monkeypatch)
+        primary, cleanup = failure.value.exceptions
+        assert 'runner failure propagation canary' in str(primary)
+        assert 'shell primary stderr' in str(primary)
+        assert 'descriptor duplication failure before send' in str(primary)
+        assert parent['_faults'] == [fault]
+        lease, = parent['_leases']
+        lease.verify()  # Original lease, not a fresh claim on a retained pathname.
+        shell = owner.nodes[1]
+        assert (shell['task'] / 'executed').read_text() == 'executed'
+        if fault == 'cleanup-send':
+            assert 'primary stdout' in str(primary) and 'primary stderr' in str(primary)
+            assert 'completed worker cleanup unresolved' in str(cleanup)
+            leaf = owner.nodes[2]
+            assert leaf['lease'] == lease and leaf['finished'] and not leaf.get('storage_cleaned')
+            assert not leaf['cleanup_error'], 'fault never reached the leaf cleanup receiver'
+        else:
+            assert 'inert setup receipt failure' in str(primary)
+            assert 'acknowledgement pending' in str(cleanup)
+            assert len(shell['pending_storage']) == 1, 'reservation exists, cleanup begin never arrived'
+        assert shell['cleanup_error'] and parent['cleanup_error']
+        parent['finished'] = True
+        assert owner.cleanup(0)['cleanup_error']
+        lease.verify()
+        assert parent['lease'].worker.exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('fault', ['none', 'cleanup-reply', 'setup-end-reply'])
+def test_recorded_deletion_is_distinct_from_cleanup_initiation_loss(tmp_path, monkeypatch, real_bash, fault):
+    from tests.scripts.test_run_tests_shell import test_shell_runner_executes_tests_and_propagates_failure
+
+    with _inert_owner(monkeypatch, tmp_path, exchange_fault=fault) as (_, owner, parent, _):
+        # Same actual expected-nonzero consumer. No unresolved storage remains
+        # when a reply is lost AFTER the owner recorded successful deletion.
+        test_shell_runner_executes_tests_and_propagates_failure(parent['lease'].worker, real_bash, monkeypatch)
+        assert parent['_faults'] == ([] if fault == 'none' else [fault])
+        lease, = parent['_leases']
+        assert not lease.worker.exists()
+        assert all(not n.get('pending_storage') and not n['cleanup_error'] for n in owner.nodes)
+        if fault != 'setup-end-reply':
+            assert owner.nodes[2]['storage_cleaned']
+        parent['finished'] = True
+        assert owner.cleanup(0)['cleanup_error'] is None
+        assert not parent['lease'].worker.exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('fault', ['before-send', 'reply-lost'])
+def test_allocation_reservation_failure_never_creates_worker(tmp_path, monkeypatch, fault):
+    from scripts.runner_scratch import claim_scratch_root
+
+    with _inert_owner(monkeypatch, tmp_path) as (runner, owner, parent, created):
+        claim = claim_scratch_root(str(parent['lease'].worker / 'allocation-task'))
+        original_exchange, original_dup = runner._owner_exchange, os.dup
+        active = False
+
+        def duplicate(fd):
+            if active and fault == 'before-send':
+                raise OSError('inert reservation descriptor failure')
+            return original_dup(fd)
+
+        def exchange(message):
+            nonlocal active
+            assert message['phase'] == 'reserve'
+            active = True
+            try:
+                original_exchange(message)
+                raise BrokenPipeError('inert reservation reply loss')
+            finally:
+                active = False
+
+        monkeypatch.setattr(os, 'dup', duplicate)
+        monkeypatch.setattr(runner, '_owner_exchange', exchange)
+        with pytest.raises(OSError, match='inert reservation'):
+            runner._run_explicit_file_once(Path('inert.py'), [], tmp_path, 30, claim)
+        assert list(claim.task.iterdir()) == [] and created == []
+        assert bool(parent.get('pending_storage')) is (fault == 'reply-lost')
+        parent['finished'] = True
+        assert bool(owner.cleanup(0)['cleanup_error']) is (fault == 'reply-lost')

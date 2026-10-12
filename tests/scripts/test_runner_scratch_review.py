@@ -275,6 +275,9 @@ def test_pre_spawn_failures_clean_only_owned_worker(tmp_path, monkeypatch, failu
         # Enter the real Popen constructor, fail before its OS launch seam,
         # and use the real owner and deletion acknowledgement. No reply model.
         owner = runner._ProcessOwner()
+        # This constructor-only owner is local, not the enclosing IPC owner.
+        # No launch can occur: _get_handles below fails before _execute_child.
+        monkeypatch.setattr(runner, '_reserve_storage', lambda: None)
         def no_handles(*args, **kwargs):
             raise OSError('inert injected spawn')
         monkeypatch.setattr(runner._HeldPopen, '_get_handles', no_handles)
@@ -487,6 +490,8 @@ def test_timeout_cleanup_and_no_retry_use_original_worker(tmp_path, monkeypatch)
         return dict(returncode=124, stdout='inert timeout output', stderr='',
                     cleanup_error=None, timed_out=True, lease=lease)
     monkeypatch.setattr(runner, '_owned_run', dispatch)
+    # This existing dispatch model owns no real IPC allocation transaction.
+    monkeypatch.setattr(runner, '_reserve_storage', lambda: None)
     monkeypatch.setattr(runner, '_owned_cleanup', lambda result:
                         runner._cleanup_worker(str(result['lease'].worker), result['lease']))
     result = runner._run_one_file(Path('inert.py'), [], tmp_path, 2, retries=1, scratch_root=claim)

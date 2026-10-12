@@ -228,7 +228,19 @@ completion. Uncleaned descendant leases are verified before containing deletion.
 A refusal is recorded on the child and every ancestor before acknowledgement, so
 an expected assertion failure cannot consume it as an ordinary nonzero exit.
 Prelaunch setup cleanup uses a pending acknowledgement: interruption or refusal
-leaves a containing deletion veto, even though no process was launched.
+leaves a containing deletion veto, even though no process was launched. The owner
+now reserves that obligation BEFORE worker allocation, not on receipt of the first
+cleanup message. Launch registration atomically transfers it to the original lease
+held by the process node. A setup cleanup end clears it only after actual deletion.
+
+A completed descendant without recorded storage cleanup is unresolved even when no
+cleanup request arrived. Both enclosing result construction and containing deletion
+consult that disposition, so descriptor duplication failure before send cannot hide
+behind expected assertion output. Reply loss after owner-recorded successful deletion
+is distinct: storage is already resolved. Descendants still in flight when the owner
+cancels their ancestor keep the existing owned-reclamation path; this exemption does
+not clear capture/process errors or pending setup allocations, and cannot be applied
+to a completed descendant waiting for its caller's cleanup request.
 
 The POSIX CPython collector retains its already-read byte chunks when communicate
 fails or drain expires. Replies and observations explicitly mark capture incomplete
