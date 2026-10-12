@@ -13,6 +13,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from gateway.config import PlatformConfig
@@ -28,6 +29,10 @@ from gateway.platforms.event import MessageEvent, MessageType
 # ---------------------------------------------------------------------------
 # Now we can safely import
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+class NetworkError(Exception):
+    """PTB-shaped transient error without depending on its concrete constructor."""
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +261,102 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert "could not be downloaded" in (event.text or "")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_stage", ["get_file", "download"])
+    async def test_voice_network_failure_retries_full_acquisition_once(
+        self, adapter, monkeypatch, failure_stage
+    ):
+        """Both getFile and CDN failures re-fetch the File before a single retry."""
+        first_file = _make_file_obj()
+        second_file = _make_file_obj(b"complete-audio")
+        if failure_stage == "download":
+            first_file.download_as_bytearray = AsyncMock(
+                side_effect=NetworkError("CDN read timed out")
+            )
+            get_file = AsyncMock(side_effect=[first_file, second_file])
+        else:
+            get_file = AsyncMock(
+                side_effect=[NetworkError("getFile timed out"), second_file]
+            )
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100, get_file=get_file)
+        sleep = AsyncMock()
+        cache = AsyncMock(return_value="/tmp/voice.ogg")
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.cache_audio_from_bytes_async", cache
+        )
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert get_file.await_count == 2
+        sleep.assert_awaited_once()
+        cache.assert_awaited_once_with(b"complete-audio", ext=".ogg")
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_urls == ["/tmp/voice.ogg"]
+        msg.reply_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error, expected_attempts",
+        [(NetworkError("still timed out"), 2), (RuntimeError("bad metadata"), 1)],
+        ids=["network-exhausted", "non-network"],
+    )
+    async def test_voice_retry_exhaustion_surfaces_failure_once(
+        self, adapter, monkeypatch, error, expected_attempts
+    ):
+        msg = _make_message()
+        msg.voice = MagicMock(
+            file_size=100, get_file=AsyncMock(side_effect=error)
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert msg.voice.get_file.await_count == expected_attempts
+        assert sleep.await_count == expected_attempts - 1
+        msg.reply_text.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_urls == []
+        assert "could not be downloaded" in (event.text or "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "cancel_stage", ["get_file", "download", "retry_sleep"]
+    )
+    async def test_voice_download_cancellation_is_not_retried_or_surfaced(
+        self, adapter, monkeypatch, cancel_stage
+    ):
+        msg = _make_message()
+        file_obj = _make_file_obj()
+        if cancel_stage == "download":
+            file_obj.download_as_bytearray = AsyncMock(
+                side_effect=asyncio.CancelledError()
+            )
+            get_file = AsyncMock(return_value=file_obj)
+            sleep = AsyncMock()
+        elif cancel_stage == "retry_sleep":
+            get_file = AsyncMock(side_effect=NetworkError("retry me"))
+            sleep = AsyncMock(side_effect=asyncio.CancelledError())
+        else:
+            get_file = AsyncMock(side_effect=asyncio.CancelledError())
+            sleep = AsyncMock()
+        msg.voice = MagicMock(file_size=100, get_file=get_file)
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        get_file.assert_awaited_once()
+        if cancel_stage == "retry_sleep":
+            sleep.assert_awaited_once()
+        else:
+            sleep.assert_not_awaited()
+        msg.reply_text.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
 
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio
@@ -340,6 +441,51 @@ class TestSendVoice:
         connected_adapter._bot.send_document.assert_awaited_once()
         connected_adapter._bot.send_audio.assert_not_awaited()
         connected_adapter._bot.send_voice.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "ptb-wrapped"])
+    @pytest.mark.parametrize(
+        "suffix, send_method", [(".ogg", "send_voice"), (".mp3", "send_audio")]
+    )
+    async def test_read_timeout_is_ambiguous_and_never_resends(
+        self, connected_adapter, tmp_path, monkeypatch, wrapped, suffix, send_method
+    ):
+        audio_file = tmp_path / f"clip{suffix}"
+        audio_file.write_bytes(b"OggS" + b"\x00" * 32)
+        read_timeout = httpx.ReadTimeout("response timed out")
+        if wrapped:
+            timeout = RuntimeError("Timed out")
+            timeout.__cause__ = read_timeout
+        else:
+            timeout = read_timeout
+        connected_adapter._bot.send_voice = AsyncMock()
+        connected_adapter._bot.send_audio = AsyncMock()
+        target_send = getattr(connected_adapter._bot, send_method)
+        target_send.side_effect = timeout
+        connected_adapter._bot.send_document = AsyncMock()
+        connected_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="warning-text")
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._probe_voice_duration_seconds",
+            lambda _path: None,
+        )
+
+        result = await connected_adapter.send_voice("12345", str(audio_file))
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.raw_response == {
+            "success": False,
+            "ambiguous": True,
+            "operation": "send_voice",
+        }
+        assert "ambiguous" in (result.error or "").lower()
+        target_send.assert_awaited_once()
+        other_send = connected_adapter._bot.send_audio if send_method == "send_voice" else connected_adapter._bot.send_voice
+        other_send.assert_not_awaited()
+        connected_adapter._bot.send_document.assert_not_awaited()
+        connected_adapter.send.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

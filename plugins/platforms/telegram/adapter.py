@@ -480,6 +480,9 @@ _INGRESS_DISPATCH_STALL_HEARTBEATS = 4
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
+# Inbound getFile/CDN reads are idempotent. One short pause avoids immediately reusing a transiently
+# broken route while keeping media handling bounded and responsive.
+_INBOUND_MEDIA_RETRY_DELAY = 0.25
 # Text send used to hang forever on a shielded httpcore socket (NordVPN/Telegram sticky IP).
 # A wedged send froze getUpdates on the same loop. Bound every text send/edit and media upload.
 _TEXT_SEND_DEADLINE = 30.0
@@ -1351,6 +1354,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """True when a TimedOut wraps a ConnectTimeout: TCP never connected, so re-sending is safe
         (a plain TimedOut may have reached Telegram and must not be re-sent)."""
         return cls._exception_graph_matches(error, "connecttimeout", "connect timeout", "connect timed out")
+
+    @classmethod
+    def _looks_like_read_timeout(cls, error: Exception) -> bool:
+        """True when Telegram timed out waiting for a response after the request may have arrived."""
+        return cls._exception_graph_matches(error, "readtimeout", "read timeout", "read timed out")
 
     @staticmethod
     def _looks_like_pool_timeout(error: Exception) -> bool:
@@ -5310,6 +5318,24 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=chat_id, file_path=audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._looks_like_read_timeout(e):
+                safe_error = _redact_telegram_error_text(e)
+                logger.error(
+                    "[%s] Telegram voice/audio read timed out after upload; delivery is ambiguous and will not be retried: %s",
+                    self.name,
+                    safe_error,
+                    exc_info=True,
+                )
+                return SendResult(
+                    success=False,
+                    error=f"Telegram voice/audio delivery ambiguous after read timeout: {safe_error}",
+                    raw_response={
+                        "success": False,
+                        "ambiguous": True,
+                        "operation": "send_voice",
+                    },
+                    retryable=False,
+                )
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s", self.name,
                 _redact_telegram_error_text(e), exc_info=True)
@@ -6768,8 +6794,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
                 await self.handle_message(event)
                 return True
-            file_obj = await source.get_file()
-            data = await file_obj.download_as_bytearray()
+            file_obj: Any = None
+            data: Any = None
+            for attempt in range(2):
+                try:
+                    # Re-fetch the File on every attempt: a failed CDN read may leave its response stream
+                    # partially consumed, so retrying download_as_bytearray() on the same object is unsafe.
+                    file_obj = await source.get_file()
+                    data = await file_obj.download_as_bytearray()
+                    break
+                except Exception as download_error:
+                    retryable = any(
+                        self._looks_like_network_error(cur)
+                        for cur in _iter_exception_graph(download_error)
+                        if isinstance(cur, Exception)
+                    )
+                    if attempt or not retryable:
+                        raise
+                    logger.info(
+                        "[Telegram] Retrying user %s download after transient network failure: %s",
+                        kind,
+                        _redact_telegram_error_text(download_error),
+                    )
+                    await asyncio.sleep(_INBOUND_MEDIA_RETRY_DELAY)
+            assert file_obj is not None and data is not None
             if kind == "video":
                 ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
                 cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
