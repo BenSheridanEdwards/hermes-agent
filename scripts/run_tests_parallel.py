@@ -560,6 +560,16 @@ class _ProcessOwner:
         import signal
         import psutil
 
+        def exited_unreaped(proc):
+            # A fresh WNOWAIT witness, not cached returncode or a numeric PID,
+            # proves this is still our unreaped direct child before signalling.
+            result = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if result is None:
+                return False
+            if result.si_pid != proc.pid or result.si_code not in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED):
+                raise RuntimeError(f'invalid owned child exit witness: {proc.pid}')
+            return True
+
         with self.lock:
             if node['closed']:
                 return node['cleanup_error']
@@ -577,9 +587,24 @@ class _ProcessOwner:
                 if item['closed']:
                     continue
                 try:
-                    if os.getsid(proc.pid) != proc.pid or os.getpgid(proc.pid) != proc.pid:
-                        raise RuntimeError(f'owned session identity changed: {proc.pid}')
-                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
+                    exited_unreaped(proc)  # also rejects a reaped/not-owned PID
+                    try:
+                        if os.getsid(proc.pid) != proc.pid or os.getpgid(proc.pid) != proc.pid:
+                            raise RuntimeError(f'owned session identity changed: {proc.pid}')
+                    except ProcessLookupError:
+                        # Darwin can stop exposing the session of an exited,
+                        # still-unreaped leader. Successful Popen with setsid
+                        # plus a fresh pinned-exit witness retains authority;
+                        # constructor uncertainty must not infer that history.
+                        if not item.get('session_established') or not exited_unreaped(proc):
+                            raise
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
+                    except ProcessLookupError:
+                        # Empty group after exit is normal, but ESRCH while the
+                        # child is still live/unknown is not cleanup success.
+                        if not exited_unreaped(proc):
+                            raise
                 except ProcessLookupError as error:
                     errors.append(f'owned unreaped leader missing: {proc.pid}: {error}')
                 except (OSError, RuntimeError) as error:
@@ -682,7 +707,7 @@ class _ProcessOwner:
                 node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
                                   started=time.monotonic(), closed_at=None, reader=None,
                                   cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
-                                  finished=False, capture_complete=False,
+                                  finished=False, capture_complete=False, session_established=False,
                                   test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
                 key = len(self.nodes)
                 self.nodes.append(node)
@@ -701,6 +726,9 @@ class _ProcessOwner:
                               pass_fds=(child.fileno(),), stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, encoding='utf-8', errors='replace')
+                # Successful constructor return confirms the requested setsid
+                # completed. An exception after launch entry cannot assert it.
+                node['session_established'] = True
             except BaseException as error:
                 primary = repr(error)
                 try:
@@ -765,6 +793,12 @@ class _ProcessOwner:
         except BaseException as error:
             primary = repr(error)
         with self.lock:
+            if timed_out:
+                # This owner, not the vanished caller, now owes reclamation.
+                # Shared deadlines may finish a leaf before its ancestor enters
+                # _close; that ordering must not turn owned cancellation into
+                # a completed ordinary attempt awaiting its first cleanup send.
+                node['storage_cancelled'] = True
             try:
                 cleanup = self._close(node)
             except BaseException as error:

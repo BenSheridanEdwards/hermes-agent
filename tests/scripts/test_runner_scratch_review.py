@@ -15,6 +15,115 @@ from scripts import runner_scratch as scratch
 from tests.home_io_guard import HomeIOGuard
 
 
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('group_exists', [True, False])
+@pytest.mark.parametrize('lookup_gone', [True, False])
+def test_exited_owned_session_keeps_unreaped_identity_when_lookup_is_gone(tmp_path, monkeypatch, group_exists, lookup_gone):
+    """A Darwin-style dead leader is not proof that its pinned PID was lost.
+
+    Model kernel calls only, never signal a live negative target. Exercise the
+    actual closer and lease deletion gate; real-session coverage stays in the
+    composed cancellation suite.
+    """
+    from types import SimpleNamespace
+    from scripts import run_tests_parallel as runner
+    from scripts.runner_scratch import claim_scratch_root
+    import psutil
+
+    lease = claim_scratch_root(str(tmp_path / 'dead-session')).create_worker()
+    pid = 12345
+    proc = SimpleNamespace(pid=pid, poll=lambda: 0)
+    node = dict(proc=proc, parent=None, lease=lease, finished=True,
+                closing=False, closed=False, cleanup_error=None,
+                session_established=True)
+    owner = runner._ProcessOwner()
+    owner.nodes.append(node)
+    events = []
+
+    def waitid(kind, target, flags):
+        assert kind == os.P_PID and target == pid
+        assert flags == os.WEXITED | os.WNOHANG | os.WNOWAIT
+        events.append('pin')
+        return SimpleNamespace(si_pid=pid, si_code=os.CLD_EXITED, si_status=0)
+
+    def missing(target):
+        assert target == pid
+        if not lookup_gone:
+            return pid
+        raise ProcessLookupError('model: exited leader has no queryable session')
+
+    def killpg(target, sig):
+        assert target == pid and 'pin' in events
+        events.append('kill')
+        if not group_exists:
+            raise ProcessLookupError('model: empty group')
+
+    def waitpid(target, flags):
+        assert target == pid and flags == 0 and events[-1] != 'reap'
+        events.append('reap')
+        return pid, 0
+
+    monkeypatch.setattr(runner.os, 'waitid', waitid)
+    monkeypatch.setattr(runner.os, 'getsid', missing)
+    monkeypatch.setattr(runner.os, 'getpgid', missing)
+    monkeypatch.setattr(runner.os, 'killpg', killpg)
+    monkeypatch.setattr(runner.os, 'waitpid', waitpid)
+    monkeypatch.setattr(psutil, 'process_iter', lambda attrs: iter(()))
+    assert owner._close(node) is None
+    assert events[0] == 'pin' and 'kill' in events and events[-1] == 'reap'
+    assert owner.cleanup(0)['cleanup_error'] is None
+    assert not lease.worker.exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('uncertainty', ['reaped', 'unconfirmed-session', 'wrong-child', 'changed-session', 'live-missing-group'])
+def test_unproven_session_still_vetoes_signalling_and_storage(tmp_path, monkeypatch, uncertainty):
+    from types import SimpleNamespace
+    from scripts import run_tests_parallel as runner
+    from scripts.runner_scratch import claim_scratch_root
+    import psutil
+
+    lease = claim_scratch_root(str(tmp_path / 'uncertain-session')).create_worker()
+    pid = 12345
+    proc = SimpleNamespace(pid=pid, poll=lambda: 0)
+    node = dict(proc=proc, parent=None, lease=lease, finished=True,
+                closing=False, closed=False, cleanup_error=None,
+                session_established=uncertainty != 'unconfirmed-session')
+    owner = runner._ProcessOwner()
+    owner.nodes.append(node)
+    signalled = []
+
+    def waitid(*args):
+        if uncertainty == 'reaped':
+            raise ChildProcessError('model: not our unreaped child')
+        if uncertainty == 'live-missing-group':
+            return None
+        return SimpleNamespace(si_pid=pid + (uncertainty == 'wrong-child'),
+                               si_code=os.CLD_EXITED, si_status=0)
+
+    def identity(target):
+        if uncertainty == 'changed-session':
+            return pid + 1
+        if uncertainty == 'live-missing-group':
+            return pid
+        raise ProcessLookupError('model: no session lookup')
+
+    def killpg(target, sig):
+        signalled.append(target)
+        raise ProcessLookupError('model: group missing while child still live')
+
+    monkeypatch.setattr(runner.os, 'waitid', waitid)
+    monkeypatch.setattr(runner.os, 'getsid', identity)
+    monkeypatch.setattr(runner.os, 'getpgid', identity)
+    monkeypatch.setattr(runner.os, 'killpg', killpg)
+    monkeypatch.setattr(runner.os, 'waitpid', lambda target, flags: (target, 0))
+    monkeypatch.setattr(psutil, 'process_iter', lambda attrs: iter(()))
+    assert owner._close(node)
+    assert signalled == ([pid] if uncertainty == 'live-missing-group' else [])
+    assert owner.cleanup(0)['cleanup_error']
+    assert lease.worker.exists()
+
+
 def _owned(parent):
     claim = scratch.claim_scratch_root(str(parent / 'task'))
     lease = claim.create_worker()

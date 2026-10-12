@@ -1,9 +1,12 @@
 # Explicit canonical-runner scratch, REAL HOME preserved
 
-Explicit scratch is a POSIX-only opt-in to the canonical runner. The bounded
-six-file regression manifest passed on macOS with the checkout's locked Python
-3.14.7 environment: 151 passed, no failures or skips. Broader default-mode and
-cross-platform compatibility remain pending; this is not live-runtime approval.
+Explicit scratch is a POSIX-only opt-in to the canonical runner. The earlier
+published scratch candidate `01b2e5266e17795fae5aa31ae80f6918032aa5b7` passed
+its six-file regression manifest with 151 passes. That is historical evidence,
+not evidence for the subsequent ownership changes. Core and ownership execution
+at `b510b5c1edd3adc3a87d31a0f3ed2a60021f3960` both failed their runner gates.
+The following ownership corrections require affected source review and fresh
+execution. Broader compatibility and live-runtime approval remain unresolved.
 
 ## Invocation contract
 
@@ -168,7 +171,8 @@ coverage yet. Do not mark those tests POSIX-only to hide this regression or invo
 an uncontained Windows default path. The frozen runner/lease scope requires an
 explicit disposition for a supported Windows containment path before this increment
 can be considered cross-platform compatible or merge-ready. No new compatibility
-tests have run; correction-4's 151 passes are evidence only for its earlier head.
+tests ran at the earlier source-only handoff. Current execution status is stated
+at the top of this document; correction-4's 151 passes belong only to its earlier head.
 
 ## Composed cancellation source candidate
 
@@ -182,6 +186,13 @@ not an OS sandbox for hostile test code or arbitrary detached subprocesses.
 
 Each canonical launch has its own session. The owner retains an unreaped leader
 using POSIX waitid/WNOWAIT, so group/session identities stay pinned during cleanup.
+Closure requires a fresh non-reaping direct-child witness before signalling, not
+just a cached return code. Successful `Popen(start_new_session=True)` records the
+session-creation fact. If an exited leader no longer has a queryable session,
+that fact plus a fresh matching exited-child witness permits its pinned group to
+be closed. ESRCH from signalling an already-empty group is accepted only with a
+fresh exited-child witness. Reaped PIDs, unknown constructor outcomes, changed
+live session identities and missing groups with still-live children fail closed.
 Cancellation closes its logical subtree against new launches, kills those owned
 groups, checks session-member absence and reaps leaders before permitting worker
 storage deletion. An uncertain identity, observation failure or remaining member
@@ -202,7 +213,9 @@ not registered with the process owner. That canary is created and reaped by the
 outer test, outside the cancelled nested sessions; it inherits the enclosing test
 group for last-resort containment. Live preservation excludes zombies. Negative
 leaves have independent 50-second caps, but success requires identity absence
-before that cap, never self-expiry. All these behavioral regressions remain unrun.
+before that cap, never self-expiry. At `b510b5c1edd3adc3a87d31a0f3ed2a60021f3960`,
+the direct case passed; outer/retry/multi and sibling cases failed. They require
+fresh execution after the affected ownership correction is source-cleared.
 
 Windows is still blocked at runner_scratch.validate_scratch_root/_identity and
 _ProcessOwner's POSIX waitid/pass_fds boundary. Existing real_bash selects Git Bash
@@ -238,9 +251,12 @@ cleanup request arrived. Both enclosing result construction and containing delet
 consult that disposition, so descriptor duplication failure before send cannot hide
 behind expected assertion output. Reply loss after owner-recorded successful deletion
 is distinct: storage is already resolved. Descendants still in flight when the owner
-cancels their ancestor keep the existing owned-reclamation path; this exemption does
-not clear capture/process errors or pending setup allocations, and cannot be applied
-to a completed descendant waiting for its caller's cleanup request.
+cancels their ancestor keep the existing owned-reclamation path. A worker whose own
+clamped deadline triggers owner cancellation also records that disposition before
+closure, even if it finishes before its ancestor enters closure at the shared
+deadline. This avoids making cancellation depend on thread scheduling order. The
+exemption does not clear capture/process errors or pending setup allocations, and
+cannot be applied to a completed ordinary attempt awaiting its caller's cleanup.
 
 The POSIX CPython collector retains its already-read byte chunks when communicate
 fails or drain expires. Replies and observations explicitly mark capture incomplete
@@ -256,4 +272,7 @@ are not another test executor. The fixture models thread-to-process receipt pare
 stamping and substitutes direct-child reclamation for group killing, while retaining
 actual Popen handles, independent finite child bounds, original errors and cleanup.
 Existing canonical cancellation/session-effect regressions remain distinct and
-unchanged. All new behavioral checks remain unrun pending source and workload gates.
+unchanged. These inert cases passed within the failed ownership workload at
+`b510b5c1edd3adc3a87d31a0f3ed2a60021f3960`; that does not close the real-session
+gate. The newly added kernel-contract models and revised ownership boundary have
+not run and require affected source review before execution.
