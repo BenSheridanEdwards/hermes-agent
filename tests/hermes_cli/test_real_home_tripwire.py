@@ -157,32 +157,70 @@ def test_close_keeps_a_reused_descriptors_new_owner(tmp_path, monkeypatch):
             original_close(fd)
 
 
-def test_path_metadata_exemption_tracks_path_changes(protected_home, monkeypatch):
+def test_path_metadata_exemption_tracks_path_changes(tmp_path, monkeypatch):
     from tests.home_io_guard import HomeIOGuard
 
-    target = protected_home / "file.txt"
-    guard = HomeIOGuard(lambda: [protected_home])
-    monkeypatch.setenv("PATH", str(protected_home))
-    guard.check(target, metadata=True)  # executable lookup, not a state read
-    monkeypatch.setenv("PATH", str(protected_home.parent))
+    # This direct-class model must not become a deny root of the enclosing
+    # installed guard: its realpath probes still run through that guard.
+    installation = tmp_path / "installation"
+    bindir = installation / "bin"
+    bindir.mkdir(parents=True)
+    target = bindir / "tool"
+    target.touch()
+    root_file = installation / "state.txt"
+    root_file.touch()
+    guard = HomeIOGuard(lambda: [installation])
+    monkeypatch.setenv("PATH", str(bindir))
+    guard.check(target, metadata=True)  # strict descendant executable lookup
+    monkeypatch.setenv("PATH", str(installation))
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(target, metadata=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(root_file, metadata=True)  # PATH equal to deny root is not an exemption
+    monkeypatch.setenv("PATH", str(bindir))
+    guard.check(target, metadata=True)
 
 
-def test_relative_path_metadata_exemption_tracks_working_directory(protected_home, tmp_path, monkeypatch):
+def test_relative_path_metadata_exemption_tracks_working_directory(tmp_path, monkeypatch):
     from tests.home_io_guard import HomeIOGuard
 
-    target = protected_home / "file.txt"
-    guard = HomeIOGuard(lambda: [protected_home])
+    installation = tmp_path / "installation"
+    bindir = installation / "bin"
+    bindir.mkdir(parents=True)
+    target = bindir / "tool"
+    target.touch()
+    guard = HomeIOGuard(lambda: [installation])
     other = tmp_path / "other"
     other.mkdir()
     (other / "nested").mkdir()
-    monkeypatch.setenv("PATH", "../protected")
+    monkeypatch.setenv("PATH", "../installation/bin")
     monkeypatch.chdir(other)
     guard.check(target, metadata=True)
     monkeypatch.chdir(other / "nested")
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(target, metadata=True)
+    monkeypatch.chdir(other)
+    guard.check(target, metadata=True)
+
+
+@pytest.mark.platforms("posix")
+def test_path_metadata_exemption_rejects_denied_followed_target(tmp_path, monkeypatch):
+    from tests.home_io_guard import HomeIOGuard
+
+    installation = tmp_path / "installation"
+    bindir = installation / "bin"
+    bindir.mkdir(parents=True)
+    denied = tmp_path / "denied-state"
+    denied.mkdir()
+    target = denied / "state.txt"
+    target.write_text("unchanged", encoding="utf-8")
+    alias = bindir / "tool"
+    alias.symlink_to(target)
+    guard = HomeIOGuard(lambda: [installation, denied])
+    monkeypatch.setenv("PATH", str(bindir))
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(alias, metadata=True)
+    assert target.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_checkout_inside_a_guarded_root_is_not_hermes_state():
