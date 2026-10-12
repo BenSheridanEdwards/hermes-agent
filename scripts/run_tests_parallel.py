@@ -45,6 +45,7 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -426,6 +427,53 @@ def _captured_output(proc, captured):
         for name in ('stdout', 'stderr'))
 
 
+@contextmanager
+def _cleanup_stage(operation, pid, prior_errors=()):
+    """Annotate and re-raise the same exception; never alter cleanup authority."""
+    try:
+        yield
+    except BaseException as error:
+        error.add_note(f'owned cleanup operation={operation} pid={pid} errno={getattr(error, "errno", None)!r}')
+        if prior_errors:
+            error.add_note('earlier owned cleanup errors: ' + json.dumps(prior_errors))
+        raise
+
+
+def _cleanup_call(operation, pid, function, *args):
+    with _cleanup_stage(operation, pid):
+        return function(*args)
+
+
+def _cleanup_iter(operation, pid, function, *args):
+    with _cleanup_stage(operation, pid):
+        yield from function(*args)
+
+
+def _cleanup_error_text(error):
+    """Serialize causes/frames without traceback formatting that reads source files."""
+    seen = set()
+
+    def details(current):
+        if id(current) in seen:
+            return {'cycle': type(current).__qualname__}
+        seen.add(id(current))
+        frames = []
+        tb = current.__traceback__
+        while tb is not None:
+            frames.append(dict(file=tb.tb_frame.f_code.co_filename,
+                               function=tb.tb_frame.f_code.co_name, line=tb.tb_lineno))
+            tb = tb.tb_next
+        result = dict(type=type(current).__qualname__, errno=getattr(current, 'errno', None),
+                      exception=repr(current), notes=getattr(current, '__notes__', []), frames=frames)
+        if current.__cause__ is not None:
+            result['cause'] = details(current.__cause__)
+        elif current.__context__ is not None and not current.__suppress_context__:
+            result['context'] = details(current.__context__)
+        return result
+
+    return json.dumps(details(error))
+
+
 class _ProcessOwner:
     """One canonical owner for every explicit worker and nested runner.
 
@@ -563,7 +611,8 @@ class _ProcessOwner:
         def exited_unreaped(proc):
             # A fresh WNOWAIT witness, not cached returncode or a numeric PID,
             # proves this is still our unreaped direct child before signalling.
-            result = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            result = _cleanup_call('waitid/witness', proc.pid, os.waitid,
+                                   os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if result is None:
                 return False
             if result.si_pid != proc.pid or result.si_code not in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED):
@@ -589,7 +638,8 @@ class _ProcessOwner:
                 try:
                     exited_unreaped(proc)  # also rejects a reaped/not-owned PID
                     try:
-                        if os.getsid(proc.pid) != proc.pid or os.getpgid(proc.pid) != proc.pid:
+                        if (_cleanup_call('getsid', proc.pid, os.getsid, proc.pid) != proc.pid
+                                or _cleanup_call('getpgid', proc.pid, os.getpgid, proc.pid) != proc.pid):
                             raise RuntimeError(f'owned session identity changed: {proc.pid}')
                     except ProcessLookupError:
                         # Darwin can stop exposing the session of an exited,
@@ -599,43 +649,45 @@ class _ProcessOwner:
                         if not item.get('session_established') or not exited_unreaped(proc):
                             raise
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
+                        _cleanup_call('killpg', proc.pid, os.killpg, proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
                     except ProcessLookupError:
                         # Empty group after exit is normal, but ESRCH while the
                         # child is still live/unknown is not cleanup success.
                         if not exited_unreaped(proc):
                             raise
                 except ProcessLookupError as error:
-                    errors.append(f'owned unreaped leader missing: {proc.pid}: {error}')
+                    errors.append(f'owned unreaped leader missing: {proc.pid}: {_cleanup_error_text(error)}')
                 except (OSError, RuntimeError) as error:
-                    errors.append(f'owned kill failed: {proc.pid}: {error}')
-            deadline = time.monotonic() + 5
-            pending = {item['proc'].pid for item in owned if not item['closed']}
-            while pending and time.monotonic() < deadline:
-                members = set()
-                for process in psutil.process_iter(['pid']):
-                    try:
-                        session = os.getsid(process.pid)
-                        if session in pending and process.pid != session:
-                            members.add(session)
-                    except ProcessLookupError:
-                        continue
-                ready = {item['proc'].pid for item in owned
-                         if not item['closed'] and item['proc'].pid in pending and item['proc'].poll() is not None}
-                pending &= members | (pending - ready)
+                    errors.append(f'owned kill failed: {proc.pid}: {_cleanup_error_text(error)}')
+            with _cleanup_stage('observation/reaping', node['proc'].pid, errors):
+                deadline = time.monotonic() + 5
+                pending = {item['proc'].pid for item in owned if not item['closed']}
+                while pending and time.monotonic() < deadline:
+                    members = set()
+                    for process in _cleanup_iter('observation.process_iter', node['proc'].pid, psutil.process_iter, ['pid']):
+                        try:
+                            session = _cleanup_call('observation.getsid', process.pid, os.getsid, process.pid)
+                            if session in pending and process.pid != session:
+                                members.add(session)
+                        except ProcessLookupError:
+                            continue
+                    ready = {item['proc'].pid for item in owned
+                             if not item['closed'] and item['proc'].pid in pending and _cleanup_call(
+                                 'observation.poll', item['proc'].pid, item['proc'].poll) is not None}
+                    pending &= members | (pending - ready)
+                    if pending:
+                        time.sleep(0.02)
                 if pending:
-                    time.sleep(0.02)
-            if pending:
-                errors.append(f'owned process residue; storage retained: {sorted(pending)}')
-            for item in owned:
-                if item['closed']:
-                    continue
-                proc = item['proc']
-                if proc.pid not in pending:
-                    os.waitpid(proc.pid, 0)
-                item['closed'] = True
-                item['closed_at'] = time.monotonic()
-                item['cleanup_error'] = '; '.join(errors) or None
+                    errors.append(f'owned process residue; storage retained: {sorted(pending)}')
+                for item in owned:
+                    if item['closed']:
+                        continue
+                    proc = item['proc']
+                    if proc.pid not in pending:
+                        _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0)
+                    item['closed'] = True
+                    item['closed_at'] = time.monotonic()
+                    item['cleanup_error'] = '; '.join(errors) or None
             return '; '.join(errors) or None
 
     def run(self, *, cmd, cwd, env, timeout, input=None, parent=None, submitted=None, storage_reservation=None):
@@ -747,10 +799,11 @@ class _ProcessOwner:
                     try:
                         if not getattr(proc, 'pid', None):
                             raise RuntimeError('constructor did not retain a child PID')
-                        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        _cleanup_call('constructor.waitid/witness', proc.pid, os.waitid,
+                                      os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
                     except (OSError, RuntimeError) as identity_error:
                         node['closed'] = True  # unresolved, never eligible for deletion
-                        self._veto(node, f'constructor ownership uncertain: {identity_error!r}')
+                        self._veto(node, f'constructor ownership uncertain: {_cleanup_error_text(identity_error)}')
             finally:
                 try:
                     child.close()
@@ -802,7 +855,7 @@ class _ProcessOwner:
             try:
                 cleanup = self._close(node)
             except BaseException as error:
-                cleanup = f'owned cleanup failed; storage retained: {error!r}'
+                cleanup = f'owned cleanup failed; storage retained: {_cleanup_error_text(error)}'
             if cleanup:
                 self._veto(node, cleanup)
             # Process closure and capture disposition are one deletion boundary.

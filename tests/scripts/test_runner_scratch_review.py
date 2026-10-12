@@ -124,6 +124,90 @@ def test_unproven_session_still_vetoes_signalling_and_storage(tmp_path, monkeypa
     assert lease.worker.exists()
 
 
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('stage', ['waitid/witness', 'getsid', 'getpgid', 'killpg',
+                                  'observation.process_iter', 'observation.getsid',
+                                  'observation.poll', 'waitpid'])
+def test_cleanup_diagnostic_preserves_stage_cause_and_consumer_veto(tmp_path, monkeypatch, stage):
+    """Inert kernel/constructor only; real owner result and consumer deletion gate."""
+    import errno
+    import sys
+    import psutil
+    from scripts import run_tests_parallel as runner
+    from scripts.runner_scratch import claim_scratch_root, worker_receipt
+
+    lease = claim_scratch_root(str(tmp_path / 'diagnostic')).create_worker()
+    pid = 12345
+    events = []
+    cause = ValueError('original diagnostic cause')
+    fault = PermissionError(errno.EPERM, 'inert permission failure')
+
+    def operation(name, value):
+        events.append(name)
+        if stage == name:
+            raise fault from cause
+        return value
+
+    class InertProcess:
+        def __init__(self, *args, **kwargs):
+            self.pid, self.returncode = pid, 1
+            self._launch_entered = True
+            owner.nodes[-1]['cleanup_error'] = 'earlier cleanup canary'
+
+        def communicate(self, input=None):
+            return 'original stdout', 'original stderr'
+
+        def poll(self):
+            if 'observation.process_iter' in events:
+                return operation('observation.poll', 1)
+            return 1
+
+    def processes(attrs):
+        # A generator failure tests iteration, not just iterator construction.
+        operation('observation.process_iter', None)
+        yield SimpleNamespace(pid=pid + 1)
+
+    def getsid(target):
+        if target == pid + 1:
+            return operation('observation.getsid', pid + 1)
+        return operation('getsid', pid)
+
+    monkeypatch.setattr(runner, '_HeldPopen', InertProcess)
+    monkeypatch.setattr(runner.os, 'waitid', lambda *args: operation(
+        'waitid/witness', SimpleNamespace(si_pid=pid, si_code=os.CLD_EXITED, si_status=1)))
+    monkeypatch.setattr(runner.os, 'getsid', getsid)
+    monkeypatch.setattr(runner.os, 'getpgid', lambda target: operation('getpgid', pid))
+    monkeypatch.setattr(runner.os, 'killpg', lambda *args: operation('killpg', None))
+    monkeypatch.setattr(runner.os, 'waitpid', lambda *args: operation('waitpid', (pid, 0)))
+    monkeypatch.setattr(psutil, 'process_iter', processes)
+    owner = runner._ProcessOwner()
+    result = owner.run(cmd=[sys.executable, '-m', 'pytest', 'inert.py',
+                           '--runner-owned-scratch=' + worker_receipt(lease)],
+                       cwd=Path(runner.__file__).resolve().parent.parent,
+                       env={}, timeout=30)
+    assert result['returncode'] == 1
+    assert result['stdout'] == 'original stdout' and result['stderr'] == 'original stderr'
+    diagnostic = result['cleanup_error']
+    assert f'operation={stage}' in diagnostic
+    assert 'earlier cleanup canary' in diagnostic
+    assert 'PermissionError' in diagnostic and 'errno=1' in diagnostic
+    assert 'original diagnostic cause' in diagnostic and 'inert permission failure' in diagnostic
+    assert fault.__cause__ is cause
+    assert any(f'operation={stage}' in note for note in fault.__notes__)
+    assert owner.cleanup(result['node'])['cleanup_error']
+    primary = RuntimeError('original pytest child exited 1')
+    cleanup = RuntimeError(diagnostic)
+    with pytest.raises(ExceptionGroup) as failed:
+        runner._finish_owned_attempt(primary, cleanup, lease.worker.rmdir)
+    assert failed.value.exceptions == (primary, cleanup)
+    assert lease.worker.exists()
+    prefix = ['waitid/witness', 'getsid', 'getpgid', 'killpg']
+    suffix = ['observation.process_iter', 'observation.getsid', 'observation.poll', 'waitpid']
+    expected = (prefix[:prefix.index(stage) + 1] + suffix if stage in prefix
+                else prefix + suffix[:suffix.index(stage) + 1])
+    assert events == expected, 'diagnostics must preserve syscall order and failure short-circuiting'
+
+
 def _owned(parent):
     claim = scratch.claim_scratch_root(str(parent / 'task'))
     lease = claim.create_worker()
