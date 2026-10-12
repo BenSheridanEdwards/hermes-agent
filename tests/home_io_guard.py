@@ -6,10 +6,13 @@ from functools import lru_cache, wraps
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import sys
 import threading
+from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.request import url2pathname
 
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
@@ -47,8 +50,9 @@ def _contains(path: str, prefix: str) -> bool:
 
 
 class HomeIOGuard:
-    def __init__(self, roots, installed_apps=lambda: ()):
+    def __init__(self, roots, installed_apps=lambda: (), *, scratch=None):
         self.roots = roots
+        self.scratch = scratch
         # The machine's installed desktop app (``packaged_gui_app_paths()`` before any test ran):
         # deleting, replacing or writing into it is refused. Reads stay allowed: several update
         # paths only probe it.
@@ -56,7 +60,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, metadata_operation=None):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -74,7 +78,15 @@ class HomeIOGuard:
                 if parent is None:
                     raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
                 candidate = os.path.join(os.fspath(parent), candidate)
-            absolute = _normcase(os.path.abspath(candidate))
+            # Keep the original spelling for physical resolution. Explicit
+            # tasks and trusted-prefix inputs must not erase parent traversal.
+            raw_path = Path(candidate) if os.path.isabs(candidate) else Path.cwd() / candidate
+            raw_absolute = _normcase(os.fspath(raw_path))
+            if '..' in raw_path.parts and (self.scratch is not None or any(
+                    _within(raw_absolute, prefix) for prefix in _INTERPRETER_PREFIX_STRS)):
+                self.refuse(value)
+            absolute = (raw_absolute if self.scratch is not None
+                        else _normcase(os.path.abspath(candidate)))
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.
@@ -82,39 +94,52 @@ class HomeIOGuard:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
+            if self.scratch is not None:
+                task = _normcase(os.fspath(self.scratch.task))
+                if _within(absolute, task):
+                    allowed = self.scratch.allows(absolute, roots)
+                    if (not allowed and metadata and not destructive
+                            and metadata_operation in ('stat', 'lstat', 'readlink')):
+                        allowed = self.scratch.allows_missing_metadata(
+                            absolute, roots, operation=metadata_operation)
+                    if not allowed or (destructive and absolute == task):
+                        self.refuse(value)
+                    return
+                # realpath/mkdir traverses ancestors. Only metadata on the
+                # exact canonical spine is needed, not reads/listing/writes.
+                if metadata and self.scratch.ancestor_metadata(absolute):
+                    return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
                 return
-            # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
-            # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
-            # command lookup, not reading Hermes state. CI has no such entries.
+            # Source/interpreter allowances are narrow descendants of a denied
+            # installation root, never authority over another denied target.
+            # A nested deny-model inside a trusted prefix still wins.
+            prefixes = _INTERPRETER_PREFIX_STRS
             if metadata:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
                 if os.path.dirname(absolute) in self._path_entries(path, cwd):
-                    return
-            # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
-            # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
-            # realpath() walking up through its ancestors.
-            for prefix in _INTERPRETER_PREFIX_STRS:
-                if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
-                    return
-            # Check the lexical path first: resolving must not probe a protected
-            # tree merely to decide that the original path was forbidden.
+                    prefixes = (*prefixes, _normcase(os.path.realpath(os.path.dirname(absolute))))
+
+            def permitted_installation_target(target, root):
+                return any(prefix != root and _within(prefix, root)
+                           and (_within(target, prefix) or (metadata and _contains(target, prefix)))
+                           for prefix in prefixes)
+
+            # Refuse a lexical denied path before probing it, unless it is a
+            # legitimate installation path. Then independently check the target
+            # the OS follows; no lexical-prefix early return may skip this.
             for root in roots:
-                if _within(absolute, root):
+                if _within(absolute, root) and not permitted_installation_target(absolute, root):
                     self.refuse(value)
             if resolved is None:
-                resolved = _normcase(os.path.realpath(absolute))
+                resolved = _normcase(os.path.realpath(raw_absolute))
             if metadata and resolved in roots:
                 return
-            # A fixture symlink to the running interpreter resolves into its installation.
-            for prefix in _INTERPRETER_PREFIX_STRS:
-                if _within(resolved, prefix):
-                    return
             for root in roots:
-                if _within(resolved, root):
+                if _within(resolved, root) and not permitted_installation_target(resolved, root):
                     self.refuse(value)
         finally:
             self.checking.active = False
@@ -165,7 +190,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               metadata_operation=name if module is os and metadata else None)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)
@@ -185,7 +211,23 @@ class HomeIOGuard:
         for name in ("rename", "replace"):
             wrap(os, name, (("src", "src_dir_fd"), ("dst", "dst_dir_fd")), destructive=True)
         wrap(shutil, "rmtree", (("path", "dir_fd"),), destructive=True)
-        wrap(sqlite3, "connect", (("database", None),))
+        original_connect = sqlite3.connect
+
+        @wraps(original_connect)
+        def guarded_connect(*args, **kwargs):
+            database = args[0] if args else kwargs.get('database')
+            uri = args[7] if len(args) > 7 else kwargs.get('uri', False)
+            target = self._sqlite_target(database, uri=uri)
+            if target is not None:
+                self.check(target)
+                # SQLite may create these beside the database without going
+                # through Python's open wrapper. Validate existing aliases too.
+                for spelling in {os.fspath(target), os.path.realpath(target)}:
+                    for suffix in ('-journal', '-wal', '-shm'):
+                        self.check(spelling + suffix)
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, 'connect', guarded_connect)
 
         original_open, original_close = os.open, os.close
 
@@ -208,3 +250,39 @@ class HomeIOGuard:
 
         monkeypatch.setattr(os, "open", guarded_open)
         monkeypatch.setattr(os, "close", guarded_close)
+
+    @staticmethod
+    def _sqlite_target(database, *, uri):
+        """Decode supported SQLite URI filenames; refuse ambiguous VFS forms."""
+        value = os.fsdecode(database)
+        if value == ':memory:':
+            return None
+        if not value.startswith('file:'):
+            if not value:
+                raise AssertionError('TEST BUG: SQLite temporary database has no guarded target')
+            return Path(value)
+        error = 'TEST BUG: unsupported SQLite URI in guarded connect'
+        if (not uri or '#' in value or any(ord(c) < 32 for c in value)
+                or re.search(r'%(?![0-9a-fA-F]{2})', value)):
+            raise AssertionError(error)
+        try:
+            parsed = urlsplit(value)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True,
+                              errors='strict')
+            options = dict(pairs)
+            allowed = {'mode': {'ro', 'rw', 'rwc', 'memory'},
+                       'cache': {'private', 'shared'}, 'immutable': {'0', '1'}}
+            if (parsed.netloc not in ('', 'localhost') or len(options) != len(pairs)
+                    or any(key not in allowed or val not in allowed[key] for key, val in pairs)):
+                raise ValueError('unsupported authority or options')
+            decoded = unquote(parsed.path, errors='strict')
+            if not decoded or '\x00' in decoded:
+                raise ValueError('empty or NUL filename')
+            if decoded == ':memory:' or options.get('mode') == 'memory':
+                return None
+            # url2pathname decodes on Windows itself; do not double-unquote.
+            filename = url2pathname(parsed.path) if os.name == 'nt' else decoded
+            path = Path(filename)
+            return path if path.is_absolute() else Path.cwd() / path
+        except (ValueError, UnicodeError) as exc:
+            raise AssertionError(error) from exc

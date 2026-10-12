@@ -45,10 +45,12 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,12 +58,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 # The CI lane selector owns the platforms() spec resolver; share it so the
 # "skipped on this host" note and the lanes can never disagree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.runner_scratch import ScratchClaim, ScratchLease
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -77,14 +81,47 @@ def _sweep_killed_run_roots(root: str) -> None:
 
 
 def _rmtree_force(path: str) -> None:
-    def _chmod_retry(fn, p, _exc):
-        try:
-            os.chmod(os.path.dirname(p) if fn is os.rmdir or fn is os.listdir else p, 0o700)
-            os.chmod(p, 0o700)
-            fn(p)
-        except OSError:
-            pass
-    shutil.rmtree(path, onerror=_chmod_retry)
+    """Prepare only owned directories, then remove without following links.
+
+    Unlink permissions belong to the parent, not the file or symlink referent.
+    Never chmod a leaf. Failures retain evidence and fail the attempt instead
+    of turning incomplete cleanup into a successful test result.
+    """
+    initial = os.lstat(path)
+    if not stat.S_ISDIR(initial.st_mode):
+        raise OSError(f"cleanup refused non-directory worker: {path}")
+    root = Path(path).resolve()
+    identity = (initial.st_dev, initial.st_ino, initial.st_uid)
+
+    def verify_root():
+        current = root.lstat()
+        if (not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino, current.st_uid) != identity):
+            raise OSError(f"cleanup worker identity changed; retained: {root}")
+
+    def prepare(directory):
+        verify_root()
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or directory.resolve() != directory
+                or info.st_dev != initial.st_dev or info.st_uid != initial.st_uid
+                or (hasattr(os, 'getuid') and info.st_uid != os.getuid())):
+            raise OSError(f"cleanup refused unowned or aliased directory: {directory}")
+        if stat.S_IMODE(info.st_mode) & 0o700 != 0o700:
+            # no-follow is mandatory. An unsupported platform fails explicitly.
+            os.chmod(directory, stat.S_IMODE(info.st_mode) | 0o700, follow_symlinks=False)
+            after = directory.lstat()
+            if (after.st_dev, after.st_ino, after.st_uid) != (info.st_dev, info.st_ino, info.st_uid):
+                raise OSError(f"cleanup directory identity changed; retained: {directory}")
+        with os.scandir(directory) as entries:
+            children = [Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)]
+        for child in children:
+            prepare(child)
+
+    prepare(root)
+    verify_root()
+    shutil.rmtree(root)
+    if os.path.lexists(root):
+        raise OSError(f"cleanup retained worker: {root}")
 
 def _runner_scratch_root() -> str:
     """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
@@ -321,6 +358,854 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
+# Explicit-mode process ownership is rooted in the outer canonical runner.
+# A duplex inherited descriptor carries requests, never a pathname/PID claim.
+# Nested launchers cannot outlive their owning worker's cancellation boundary.
+_OWNER_ENV = "_HERMES_RUNNER_OWNER_FD"
+_process_owner = None
+_process_owner_lock = threading.Lock()
+_client_lock = threading.Lock()
+
+
+def _live_leader_platform():
+    return sys.platform == 'darwin'
+
+
+class _HeldPopen(subprocess.Popen):
+    """Observe exit without reaping: the owned PID pins its session identity."""
+
+    _waitpid_lock: threading.Lock
+
+    def _execute_child(self, *args, **kwargs):
+        # Constructor return is not the launch boundary. Once entered, even an
+        # exception before _child_created is assigned is treated as uncertain.
+        self._launch_entered = True
+        return super()._execute_child(*args, **kwargs)
+
+    def _internal_poll(self, _deadstate=None):
+        with self._waitpid_lock:
+            if self.returncode is None:
+                result = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if result is not None:
+                    self.returncode = (result.si_status if result.si_code == os.CLD_EXITED
+                                       else -result.si_status)
+            return self.returncode
+
+    def _wait(self, timeout):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._internal_poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.02)
+        return self.returncode
+
+
+def _finish_owned_attempt(primary, cleanup, delete, *, raise_primary=True):
+    """An uncertain lifetime forbids deleting its containing storage."""
+    if cleanup is not None:
+        if primary is not None:
+            raise BaseExceptionGroup("primary failure and process cleanup failure", [primary, cleanup])
+        raise cleanup
+    try:
+        delete()
+    except BaseException as error:
+        if primary is not None:
+            raise BaseExceptionGroup("primary failure and storage cleanup failure", [primary, error])
+        raise
+    if primary is not None and raise_primary:
+        raise primary
+
+
+def _captured_output(proc, captured):
+    """Snapshot observed CPython communicate chunks, even before its return.
+
+    The explicit owner is POSIX-only. CPython's POSIX collector appends bytes
+    to _fileobj2output before wait/decode. A failed/unfinished communicate must
+    not replace those bytes with empty, supposedly complete streams.
+    """
+    if 'streams' in captured:
+        return captured['streams']
+    buffers = getattr(proc, '_fileobj2output', {})
+    return tuple(b''.join(tuple(buffers.get(getattr(proc, name, None), ()))).decode(
+        'utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')
+        for name in ('stdout', 'stderr'))
+
+
+@contextmanager
+def _cleanup_stage(operation, pid, prior_errors=()):
+    """Annotate and re-raise the same exception; never alter cleanup authority."""
+    try:
+        yield
+    except BaseException as error:
+        error.add_note(f'owned cleanup operation={operation} pid={pid} errno={getattr(error, "errno", None)!r}')
+        if prior_errors:
+            error.add_note('earlier owned cleanup errors: ' + json.dumps(prior_errors))
+        raise
+
+
+def _diagnostic_value(value, depth=0) -> Any:
+    """Bounded JSON primitives only; never repr arbitrary objects or read files."""
+    if depth > 6:
+        return {'state': 'truncated'}
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is str:
+        return value[:512]
+    if type(value) in (list, tuple):
+        return [_diagnostic_value(v, depth + 1) for v in value[:64]]
+    if type(value) is dict:
+        return {k: _diagnostic_value(v, depth + 1)
+                for k, v in list(value.items())[:32] if type(k) is str}
+    return {'state': 'unknown'}
+
+
+def _record_cleanup(evidence, operation, **fields):
+    # Diagnostics are not authority. Even diagnostic serialization failure must
+    # neither replace the primary error nor prevent the original operation.
+    try:
+        if evidence is not None:
+            record = evidence.setdefault(operation, {})
+            safe = _diagnostic_value(fields)
+            if operation == 'waitid/witness' and 'outcome' in safe:
+                # Missing SID/PGID or ESRCH can request a second fresh witness.
+                # Retain both observations rather than overwrite that evidence.
+                history = record.setdefault('witnesses', [])
+                if len(history) < 3:
+                    history.append(safe['outcome'])
+            record.update(safe)
+    except BaseException:
+        pass
+
+
+def _session_snapshot(session):
+    """One racy, cooperative-budget census, NEVER an absence/ownership oracle.
+
+    Only PID/SID are inspected to filter candidates; status/PGID are queried
+    only for the already-owned leader or matching session. No argv/env/UIDs.
+    Individual OS metadata calls cannot be preempted here. No helper thread,
+    executor, signal or changed owner deadline is introduced to hide that limit.
+    """
+    import psutil
+
+    result: dict = dict(state='partial', scanned=0, unresolved=0, lookup_errors={}, members=[], leader={'pid': session})
+    deadline = time.monotonic() + 0.025
+    try:
+        result['leader']['status'] = psutil.Process(session).status()
+    except Exception as error:
+        result['leader']['error'] = type(error).__name__
+        result['unresolved'] += 1
+    try:
+        iterator = iter(psutil.process_iter(['pid']))
+        for _ in range(1024):
+            if time.monotonic() >= deadline:
+                result['reason'] = 'time_budget'
+                break
+            try:
+                process = next(iterator)
+            except StopIteration:
+                result['state'] = 'partial' if result['unresolved'] else 'complete_racy'
+                break
+            result['scanned'] += 1
+            try:
+                sid = os.getsid(process.pid)
+            except Exception as error:
+                # Unclassifiable candidates remain unknown, not proven outside.
+                result['unresolved'] += 1
+                name = type(error).__name__
+                result['lookup_errors'][name] = result['lookup_errors'].get(name, 0) + 1
+                continue
+            if sid != session:
+                continue
+            member: dict = {'pid': process.pid, 'sid': sid}
+            try:
+                member['pgid'] = os.getpgid(process.pid)
+                member['status'] = process.status()
+            except Exception as error:
+                member['error'] = type(error).__name__
+                result['unresolved'] += 1
+            result['members'].append(member)
+            if len(result['members']) == 64:
+                result['reason'] = 'member_limit'
+                break
+        else:
+            result['reason'] = 'pid_limit'
+    except Exception as error:
+        result['reason'] = 'enumeration_error'
+        result['error'] = type(error).__name__
+    return result
+
+
+def _signal_facts(pid, function, args):
+    import types
+
+    result = {'arguments': [int(arg) for arg in args], 'native_audit_origin': 'unknown'}
+    # Only built-in/function descriptors, not properties on callable objects.
+    metadata = {'type': type(function).__name__, 'is_posix_killpg':
+                function is vars(sys.modules['posix']).get('killpg')}
+    if type(function) in (types.FunctionType, types.BuiltinFunctionType):
+        metadata.update(module=function.__module__, qualname=function.__qualname__)
+        if type(function) is types.FunctionType:
+            metadata['code_file'] = function.__code__.co_filename
+    result['callable'] = metadata
+    try:
+        result['snapshot'] = _session_snapshot(pid)
+    except BaseException:
+        result['snapshot'] = {'state': 'unknown'}
+    return result
+
+
+def _cleanup_call(operation, pid, function, *args, evidence=None):
+    if evidence is not None and operation == 'killpg':
+        try:
+            _record_cleanup(evidence, operation, **_signal_facts(pid, function, args))
+        except BaseException:
+            _record_cleanup(evidence, operation, diagnostic_state='unknown')
+    try:
+        with _cleanup_stage(operation, pid):
+            result = function(*args)
+    except BaseException as error:
+        try:
+            _record_cleanup(evidence, operation, outcome={
+                'state': 'error', 'type': type(error).__name__, 'errno': getattr(error, 'errno', None)})
+        except BaseException:
+            pass
+        raise
+    try:
+        value = ({key: getattr(result, key, None) for key in ('si_pid', 'si_code', 'si_status')}
+                 if operation == 'waitid/witness' and result is not None else result)
+        _record_cleanup(evidence, operation, outcome={'state': 'returned', 'value': value})
+    except BaseException:
+        _record_cleanup(evidence, operation, outcome={'state': 'unknown'})
+    return result
+
+
+def _cleanup_iter(operation, pid, function, *args):
+    with _cleanup_stage(operation, pid):
+        yield from function(*args)
+
+
+def _cleanup_error_text(error):
+    """Serialize causes/frames without traceback formatting that reads source files."""
+    seen = set()
+
+    def details(current):
+        if id(current) in seen:
+            return {'cycle': type(current).__qualname__}
+        seen.add(id(current))
+        frames = []
+        tb = current.__traceback__
+        while tb is not None:
+            frames.append(dict(file=tb.tb_frame.f_code.co_filename,
+                               function=tb.tb_frame.f_code.co_name, line=tb.tb_lineno))
+            tb = tb.tb_next
+        result = dict(type=type(current).__qualname__, errno=getattr(current, 'errno', None),
+                      exception=repr(current), notes=getattr(current, '__notes__', []), frames=frames)
+        if current.__cause__ is not None:
+            result['cause'] = details(current.__cause__)
+        elif current.__context__ is not None and not current.__suppress_context__:
+            result['context'] = details(current.__context__)
+        return result
+
+    return json.dumps(details(error))
+
+
+class _ProcessOwner:
+    """One canonical owner for every explicit worker and nested runner.
+
+    The root retains Popen handles. Requests are bound to the caller's inherited
+    endpoint, and cancellation closes the complete logical subtree atomically
+    against new launches. No name scan, caller-supplied PID or cooperative exit.
+    """
+
+    def __init__(self):
+        if os.name != 'posix' or not all(hasattr(os, name) for name in
+                ('waitid', 'WNOWAIT', 'P_PID', 'WEXITED', 'WNOHANG')):
+            raise RuntimeError('owned process supervision requires POSIX waitid/WNOWAIT')
+        self.lock = threading.RLock()
+        self.nodes = []
+
+    def _veto(self, node, error):
+        """Latch before replying; ordinary nonzero consumers cannot clear this."""
+        with self.lock:
+            while node is not None:
+                previous = node.get('cleanup_error')
+                node['cleanup_error'] = f'{previous}; {error}' if previous else str(error)
+                node = node['parent']
+
+    def _unresolved_storage(self, node):
+        # The containing process has stopped: no completed child may still be
+        # awaiting its caller's first cleanup message. In-flight children closed
+        # by this owner's cancellation retain the existing reclamation path.
+        owned = self._subtree(node)
+        errors = [error for item in owned for error in item.get('pending_storage', {}).values()]
+        errors.extend(f'completed worker cleanup unresolved; storage retained: {item["lease"].worker}'
+                      for item in owned if item is not node and item['lease'] is not None
+                      and item.get('finished') and not item.get('storage_cancelled')
+                      and not item.get('storage_cleaned'))
+        return errors
+
+    def cleanup(self, key, parent=None):
+        """Owner-side filesystem cleanup, serialized with ancestor cancellation."""
+        with self.lock:
+            node = None
+            try:
+                if type(key) is not int or not 0 <= key < len(self.nodes):
+                    raise ValueError('unknown owned cleanup node')
+                node = self.nodes[key]
+                if node['parent'] is not parent or node['lease'] is None:
+                    raise ValueError('cleanup endpoint does not own this worker')
+                if not node.get('finished'):
+                    raise RuntimeError('process/capture cleanup not acknowledged')
+                owned = self._subtree(node)
+                errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
+                errors.extend(self._unresolved_storage(node))
+                if errors:
+                    raise RuntimeError('; '.join(errors))
+                for item in owned:
+                    if item['lease'] is not None and not item.get('storage_cleaned'):
+                        item['lease'].verify()
+                _cleanup_worker(str(node['lease'].worker), node['lease'])
+                for item in owned:
+                    item['storage_cleaned'] = True
+                return {'cleanup_error': None}
+            except BaseException as error:
+                message = f'owned storage cleanup refused; storage retained: {error!r}'
+                # A malformed request may not nominate somebody else's node.
+                self._veto(node if node is not None and node['parent'] is parent else parent, message)
+                return {'cleanup_error': message}
+
+    def _serve(self, connection, parent):
+        jobs = {}
+
+        def dispatch(job, request):
+            try:
+                job['result'] = self.run(parent=parent, **request)
+            except BaseException as error:
+                self._veto(parent, f'dispatch failed; storage retained: {error!r}')
+                job['result'] = dict(returncode=125, stdout='', stderr=repr(error),
+                                     cleanup_error='dispatch failed; storage retained', timed_out=False,
+                                     capture_complete=False)
+
+        try:
+            while True:
+                message = json.loads(connection.recv_bytes())
+                if message['op'] == 'launch':
+                    key = str(len(jobs))
+                    job = {}
+                    jobs[key] = job
+                    request = message['request']
+                    request['submitted'] = time.monotonic()
+                    threading.Thread(target=dispatch, args=(job, request), daemon=True).start()
+                    answer = {'job': key}
+                elif message['op'] == 'cleanup':
+                    answer = self.cleanup(message['node'], parent)
+                elif message['op'] == 'setup_cleanup':
+                    with self.lock:
+                        pending = parent.setdefault('pending_storage', {})
+                        key = message['worker']
+                        if message['phase'] in ('reserve', 'begin'):
+                            if parent['closing']:
+                                self._veto(parent, 'setup cleanup requested after owner closure')
+                                answer = {'ack': False}
+                            else:
+                                pending[key] = 'setup storage cleanup acknowledgement pending: ' + key
+                                answer = {'ack': True}
+                        elif (message['phase'] == 'end' and key in pending
+                              and (message.get('reservation') is None or message['reservation'] in pending)):
+                            if message.get('error'):
+                                self._veto(parent, message['error'])
+                            else:
+                                pending.pop(key)
+                                if message.get('reservation') is not None:
+                                    pending.pop(message['reservation'])
+                            answer = {'ack': True}
+                        else:
+                            self._veto(parent, 'invalid setup cleanup acknowledgement')
+                            answer = {'ack': False}
+                elif message['op'] == 'poll':
+                    answer = {'result': jobs[message['job']].get('result')}
+                else:
+                    raise ValueError('unknown owner operation')
+                connection.send_bytes(json.dumps(answer).encode())
+        except (EOFError, BrokenPipeError, OSError):
+            return
+        finally:
+            connection.close()
+
+    def _subtree(self, node):
+        owned = [node]
+        for candidate in self.nodes:
+            if any(candidate['parent'] is item for item in owned):
+                owned.append(candidate)
+        return owned
+
+    def _close(self, node):
+        import signal
+        import psutil
+
+        def exited_unreaped(proc, evidence):
+            # A fresh WNOWAIT witness, not cached returncode or a numeric PID,
+            # proves this is still our unreaped direct child before signalling.
+            result = _cleanup_call('waitid/witness', proc.pid, os.waitid,
+                                   os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                                   evidence=evidence)
+            if result is None:
+                return False
+            if result.si_pid != proc.pid or result.si_code not in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED):
+                raise RuntimeError(f'invalid owned child exit witness: {proc.pid}')
+            return True
+
+        with self.lock:
+            if node['closed']:
+                return node['cleanup_error']
+            owned = self._subtree(node)
+            for item in owned:
+                if item is not node and not item.get('finished'):
+                    item['storage_cancelled'] = True
+                item['closing'] = True
+            errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
+            errors.extend(self._unresolved_storage(node))
+            close_deadline = time.monotonic() + 5
+            signalled_members = set()
+            # Each leader is our unreaped child, so its PID/session cannot be
+            # recycled between identity capture, killpg and absence observation.
+            for item in reversed(owned):
+                proc = item['proc']
+                if item['closed']:
+                    continue
+                evidence = item.setdefault('cleanup_facts', {})
+                _record_cleanup(evidence, 'owner', pid=proc.pid,
+                                session_established=item.get('session_established'))
+                anchor = item.get('anchor')
+                if anchor is not None:
+                    try:
+                        _cleanup_call('anchor.close', proc.pid, anchor.prepare_close,
+                                      close_deadline, evidence=evidence)
+                    except BaseException as error:
+                        errors.append(f'anchor closure handshake failed: {_cleanup_error_text(error)}')
+                try:
+                    exited = exited_unreaped(proc, evidence)  # rejects a reaped/not-owned PID
+                    if anchor is not None and exited:
+                        raise RuntimeError('owned live anchor exited before cleanup signal')
+                    try:
+                        if (_cleanup_call('getsid', proc.pid, os.getsid, proc.pid, evidence=evidence) != proc.pid
+                                or _cleanup_call('getpgid', proc.pid, os.getpgid, proc.pid, evidence=evidence) != proc.pid):
+                            raise RuntimeError(f'owned session identity changed: {proc.pid}')
+                    except ProcessLookupError:
+                        # Darwin can stop exposing the session of an exited,
+                        # still-unreaped leader. Successful Popen with setsid
+                        # plus a fresh pinned-exit witness retains authority;
+                        # constructor uncertainty must not infer that history.
+                        if anchor is not None or not item.get('session_established') or not exited_unreaped(proc, evidence):
+                            raise
+                    if anchor is not None and anchor.returncode is None and anchor.worker_pid is not None:
+                        # Timeout is not a worker-exit claim. Before cleanup, its
+                        # pinned worker must still belong to this signal target.
+                        if (_cleanup_call('anchor.worker.getsid', anchor.worker_pid, os.getsid,
+                                          anchor.worker_pid) != proc.pid
+                                or _cleanup_call('anchor.worker.getpgid', anchor.worker_pid, os.getpgid,
+                                                 anchor.worker_pid) != proc.pid):
+                            raise RuntimeError('uncompleted worker left its owned anchor group')
+                    try:
+                        _cleanup_call('killpg', proc.pid, os.killpg, proc.pid, signal.SIGKILL, evidence=evidence)  # windows-footgun: ok - POSIX owner only
+                        if anchor is not None:
+                            signalled_members.add(proc.pid)
+                            if anchor.worker_pid is not None:
+                                signalled_members.add(anchor.worker_pid)
+                    except ProcessLookupError:
+                        # Empty group after exit is normal, but ESRCH while the
+                        # child is still live/unknown is not cleanup success.
+                        if anchor is not None or not exited_unreaped(proc, evidence):
+                            raise
+                except ProcessLookupError as error:
+                    errors.append(f'owned unreaped leader missing: {proc.pid}: {_cleanup_error_text(error)}')
+                except (OSError, RuntimeError) as error:
+                    errors.append(f'owned kill failed: {proc.pid}: {_cleanup_error_text(error)}')
+            with _cleanup_stage('observation/reaping', node['proc'].pid, errors):
+                _record_cleanup(node.get('cleanup_facts'), 'observation', state='started')
+                deadline = close_deadline if any(item.get('anchor') is not None for item in owned) else time.monotonic() + 5
+                pending = {item['proc'].pid for item in owned if not item['closed']}
+                while pending and time.monotonic() < deadline:
+                    members = set()
+                    for process in _cleanup_iter('observation.process_iter', node['proc'].pid, psutil.process_iter, ['pid']):
+                        try:
+                            session = _cleanup_call('observation.getsid', process.pid, os.getsid, process.pid)
+                            if session in pending and process.pid != session:
+                                members.add(session)
+                        except ProcessLookupError:
+                            if any(item.get('anchor') is not None for item in owned) and process.pid not in signalled_members:
+                                raise  # An unclassified PID is not descendant absence.
+                            continue
+                    ready = {item['proc'].pid for item in owned
+                             if not item['closed'] and item['proc'].pid in pending and _cleanup_call(
+                                 'observation.poll', item['proc'].pid, item['proc'].poll,
+                                 evidence=item.get('cleanup_facts')) is not None}
+                    pending &= members | (pending - ready)
+                    if pending:
+                        time.sleep(0.02)
+                if pending:
+                    errors.append(f'owned process residue; storage retained: {sorted(pending)}')
+                _record_cleanup(node.get('cleanup_facts'), 'observation', state='returned', pending=sorted(pending))
+                for item in owned:
+                    if item['closed']:
+                        continue
+                    proc = item['proc']
+                    if proc.pid not in pending:
+                        anchor = item.get('anchor')
+                        if anchor is not None:
+                            _cleanup_call('anchor.eof', proc.pid, anchor.finish, deadline,
+                                          evidence=item.get('cleanup_facts'))
+                        reaped = _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0,
+                                               evidence=item.get('cleanup_facts'))
+                        if anchor is not None and (not isinstance(reaped, tuple) or len(reaped) != 2
+                                or reaped[0] != proc.pid or not os.WIFSIGNALED(reaped[1])
+                                or os.WTERMSIG(reaped[1]) != signal.SIGKILL):  # windows-footgun: ok - POSIX owner, Darwin anchor only
+                            raise RuntimeError('anchor reap did not confirm owned cleanup signal')
+                    item['closed'] = True
+                    item['closed_at'] = time.monotonic()
+                    item['cleanup_error'] = '; '.join(errors) or None
+            return '; '.join(errors) or None
+
+    def run(self, *, cmd, cwd, env, timeout, input=None, parent=None, submitted=None, storage_reservation=None):
+        from multiprocessing import Pipe
+        import math
+
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('owned dispatch requires a finite positive deadline')
+        started = time.monotonic() if submitted is None else submitted
+        captured = {}
+        primary = None
+        with self.lock:
+            deadline = started + timeout
+            if parent is not None:
+                deadline = min(deadline, parent['deadline'])
+            if time.monotonic() >= deadline:
+                return dict(returncode=124, stdout='', stderr='deadline before launch', cleanup_error=None,
+                            timed_out=True, unlaunched=True, capture_complete=True)
+            if parent is not None and (parent['closing'] or parent['proc'].poll() is not None
+                    or (parent.get('anchor') is not None and (
+                        parent['anchor'].returncode is not None or parent['anchor'].error is not None))):
+                return dict(returncode=125, stdout='', stderr='', cleanup_error='owner already closing', timed_out=False)
+            cmd = list(cmd)
+            root = Path(__file__).resolve().parent.parent
+            if Path(cwd).resolve() != root:
+                raise ValueError('owned dispatch requires canonical checkout cwd')
+            lease = None
+            task = None
+            if cmd[:3] == [sys.executable, '-m', 'pytest']:
+                from scripts.runner_scratch import receive_worker, worker_receipt
+                receipts = [i for i, value in enumerate(cmd) if value.startswith('--runner-owned-scratch=')]
+                if len(receipts) != 1:
+                    raise ValueError('owned pytest requires one canonical lease')
+                i = receipts[0]
+                lease = receive_worker(cmd[i].split('=', 1)[1],
+                                       expected_parent=parent.get('worker_pid', parent['proc'].pid) if parent else os.getpid())
+                if parent is not None and lease.task != parent['task']:
+                    raise ValueError('owned pytest lease must belong to its canonical runner task')
+                task = lease.task
+                cmd[i] = '--runner-owned-scratch=' + worker_receipt(lease)
+            else:
+                # This endpoint is not an arbitrary unguarded process executor.
+                # Match the POSIX real_bash fixture against the owner's PATH,
+                # never the child's supplied executable search environment.
+                bash = shutil.which('bash')
+                launcher = shutil.which(cmd[0]) if cmd else None
+                if (not bash or not launcher or Path(launcher).resolve() != Path(bash).resolve()
+                        or len(cmd) < 4 or cmd[1:3] != [str(root / 'scripts/run_tests.sh'), '--scratch-root']
+                        or parent is None or parent['lease'] is None):
+                    raise ValueError('owned dispatch accepts only canonical explicit shell launches')
+                from scripts.runner_scratch import validate_scratch_root
+                parent['lease'].verify()
+                task = Path(validate_scratch_root(cmd[3], new=True))
+                if not task.is_relative_to(parent['lease'].worker):
+                    raise ValueError('nested runner task must remain in its submitting worker')
+                if env.get('HERMES_PYTHON') != sys.executable or any(k.startswith('__HERMES_') for k in env):
+                    raise ValueError('nested runner requires prepared interpreter without activation')
+                cmd[0] = bash
+            if storage_reservation is not None:
+                if (parent is None or lease is None
+                        or storage_reservation not in parent.get('pending_storage', {})):
+                    raise ValueError('owned launch requires its pending storage reservation')
+            if sys.implementation.name != 'cpython':
+                raise RuntimeError('owned output recovery requires the CPython POSIX collector')
+            server, child = Pipe(duplex=True)
+            try:
+                env = dict(env, **{_OWNER_ENV: str(child.fileno())})
+                # Keep the object and ancestry even when __init__ raises after fork.
+                proc = _HeldPopen.__new__(_HeldPopen)
+                proc._launch_entered = False
+                node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
+                                  started=time.monotonic(), closed_at=None, reader=None,
+                                  cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
+                                  finished=False, capture_complete=False, session_established=False, cleanup_facts={}, anchor=None,
+                                  test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
+                key = len(self.nodes)
+                self.nodes.append(node)
+                if storage_reservation is not None:
+                    # Transfer, never clear responsibility before the original
+                    # lease is retained in the registered process node.
+                    assert parent is not None
+                    parent['pending_storage'].pop(storage_reservation)
+            except BaseException:
+                server.close()
+                child.close()
+                raise  # No constructor entered; caller still retains storage.
+            no_child = False
+            try:
+                launch_cmd, inherited_fds = cmd, (child.fileno(),)
+                if _live_leader_platform():
+                    from scripts.runner_anchor import AnchorChannel
+                    node['anchor'] = AnchorChannel(deadline)
+                    control_fd = node['anchor'].child.fileno()
+                    launch_cmd = [sys.executable, '-I', '-S', '-B', str(root / 'scripts/runner_anchor.py'),
+                                  str(control_fd), str(child.fileno())]
+                    inherited_fds += (control_fd,)
+                proc.__init__(launch_cmd, cwd=cwd, env=env, start_new_session=True,
+                              pass_fds=inherited_fds, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, encoding='utf-8', errors='replace')
+                # Successful constructor return confirms the requested setsid
+                # completed. An exception after launch entry cannot assert it.
+                node['session_established'] = True
+                if node['anchor'] is not None:
+                    node['worker_pid'] = node['anchor'].start(proc.pid, cmd)
+            except BaseException as error:
+                primary = repr(error)
+                try:
+                    server.close()
+                except BaseException as close_error:
+                    primary += f'; descriptor close failed: {close_error!r}'
+                    self._veto(node, primary)
+                no_child = not proc._launch_entered and not getattr(proc, '_child_created', False)
+                if no_child:
+                    node.update(closed=True, finished=True, capture_complete=True,
+                                closed_at=time.monotonic())
+                else:
+                    self._veto(node, f'constructor failed after launch entry; capture incomplete: {error!r}')
+                    # waitid validates unreaped direct-child ownership. An already
+                    # reaped exec-failure PID is not a safe signal target.
+                    try:
+                        if not getattr(proc, 'pid', None):
+                            raise RuntimeError('constructor did not retain a child PID')
+                        _cleanup_call('constructor.waitid/witness', proc.pid, os.waitid,
+                                      os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    except (OSError, RuntimeError) as identity_error:
+                        node['closed'] = True  # unresolved, never eligible for deletion
+                        self._veto(node, f'constructor ownership uncertain: {_cleanup_error_text(identity_error)}')
+            finally:
+                try:
+                    child.close()
+                except BaseException as error:
+                    self._veto(node, f'owner descriptor cleanup failed: {error!r}')
+                    primary = f'{primary or ""}; {error!r}'
+            if no_child:
+                if node['anchor'] is not None:
+                    try:
+                        node['anchor'].dispose(time.monotonic() + 5)
+                    except BaseException as error:
+                        self._veto(node, f'anchor descriptor cleanup failed: {error!r}')
+                return dict(returncode=125, stdout='', stderr=primary, cleanup_error=node['cleanup_error'],
+                            timed_out=False, launch_failed=True, node=key, capture_complete=True)
+
+            def collect():
+                try:
+                    captured['streams'] = proc.communicate(input=input)
+                except BaseException as error:
+                    captured['error'] = repr(error)
+
+            try:
+                if primary is None or (node['anchor'] is not None and node['session_established']):
+                    reader = threading.Thread(target=collect, daemon=True)
+                    node['reader'] = reader
+                    reader.start()
+                    if node['anchor'] is None or node.get('worker_pid') is not None:
+                        threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
+                    else:
+                        server.close()
+                else:
+                    server.close()
+            except BaseException as error:
+                primary = repr(error)
+                self._veto(node, f'owner thread startup failed: {error!r}')
+                try:
+                    server.close()
+                except BaseException as close_error:
+                    self._veto(node, f'owner descriptor cleanup failed: {close_error!r}')
+        timed_out = False
+        original_rc = 125
+        try:
+            if primary is None:
+                if node['anchor'] is not None:
+                    try:
+                        original_rc = node['anchor'].wait_result()
+                        timed_out = original_rc is None  # acknowledged ancestor cancellation
+                    except TimeoutError:
+                        timed_out = True
+                else:
+                    while proc.poll() is None and time.monotonic() < node['deadline']:
+                        time.sleep(0.02)
+                    timed_out = time.monotonic() >= node['deadline']
+                    original_rc = proc.returncode
+        except BaseException as error:
+            primary = repr(error)
+            if node['anchor'] is not None:
+                self._veto(node, f'anchor worker outcome uncertain: {_cleanup_error_text(error)}')
+        with self.lock:
+            if timed_out:
+                # This owner, not the vanished caller, now owes reclamation.
+                # Shared deadlines may finish a leaf before its ancestor enters
+                # _close; that ordering must not turn owned cancellation into
+                # a completed ordinary attempt awaiting its first cleanup send.
+                node['storage_cancelled'] = True
+            try:
+                cleanup = self._close(node)
+            except BaseException as error:
+                cleanup = f'owned cleanup failed; storage retained: {_cleanup_error_text(error)}'
+                _record_cleanup(node.get('cleanup_facts'), 'close', state='error', type=type(error).__name__)
+            if cleanup:
+                self._veto(node, cleanup)
+            # Process closure and capture disposition are one deletion boundary.
+            # No enclosing closer can slip between absence and a capture veto.
+            output_deadline = time.monotonic() + 5
+            owned = self._subtree(node)
+            observations = []
+            for item in owned:
+                anchor = item.get('anchor')
+                if anchor is not None:
+                    _record_cleanup(item.get('cleanup_facts'), 'anchor',
+                                    worker_pid=anchor.worker_pid, worker_returncode=anchor.returncode)
+                    try:
+                        anchor.dispose(output_deadline)
+                    except BaseException as error:
+                        self._veto(item, f'anchor transport cleanup failed: {_cleanup_error_text(error)}')
+                data = item['captured']
+                reader = item['reader']
+                if reader is None and item.get('capture_complete'):
+                    pass  # Proven no-launch node has no output collector.
+                elif reader is None or reader.ident is None:
+                    data['error'] = 'output collector did not start'
+                    for name in ('stdin', 'stdout', 'stderr'):
+                        try:
+                            stream = getattr(item['proc'], name, None)
+                            if stream is not None and not stream.closed:
+                                stream.close()
+                        except BaseException as error:
+                            self._veto(item, f'collector descriptor cleanup failed: {error!r}')
+                else:
+                    reader.join(timeout=max(0, output_deadline - time.monotonic()))
+                complete = bool(item.get('capture_complete') or (
+                    reader is not None and not reader.is_alive() and 'streams' in data and 'error' not in data))
+                item['capture_complete'] = complete
+                if not complete:
+                    self._veto(item, 'capture incomplete; output reclamation failed: ' +
+                               data.get('error', 'pipe still open'))
+                out, err = _captured_output(item['proc'], data)
+                observations.append(dict(pid=getattr(item['proc'], 'pid', None),
+                                         worker_pid=item.get('worker_pid', getattr(item['proc'], 'pid', None)),
+                                         session=getattr(item['proc'], 'pid', None),
+                                         test_file=item['test_file'], deadline=item['deadline'],
+                                         started=item['started'], closed_at=item['closed_at'],
+                                         stdout=out, stderr=err, capture_complete=complete,
+                                         cleanup_facts=item.get('cleanup_facts', {})))
+            stdout, stderr = _captured_output(proc, captured)
+            if primary and node['anchor'] is None:
+                stderr += '\nowner failure: ' + primary
+            for error in self._unresolved_storage(node):
+                self._veto(node, error)
+            node['finished'] = True
+            if node['anchor'] is not None:
+                original_rc = node['anchor'].returncode
+            return dict(returncode=124 if timed_out else (
+                            (125 if original_rc is None else original_rc) if node['anchor'] is not None
+                            else (125 if primary else original_rc)),
+                        stdout=stdout, stderr=stderr, cleanup_error=node['cleanup_error'],
+                        timed_out=timed_out, deadline=node['deadline'], observations=observations,
+                        capture_complete=node['capture_complete'], node=key)
+
+
+def _owner_fd():
+    return int(os.environ[_OWNER_ENV])
+
+
+def _owner_exchange(message):
+    from multiprocessing.connection import Connection
+
+    with _client_lock:
+        connection = Connection(os.dup(_owner_fd()))
+        try:
+            connection.send_bytes(json.dumps(message).encode())
+            return json.loads(connection.recv_bytes())
+        finally:
+            connection.close()
+
+
+def _owned_cleanup(result):
+    if _OWNER_ENV in os.environ:
+        reply = _owner_exchange({'op': 'cleanup', 'node': result['node']})
+    else:
+        reply = _process_owner.cleanup(result['node'])
+    if reply['cleanup_error']:
+        raise RuntimeError(reply['cleanup_error'])
+
+
+def _reserve_storage():
+    # Receipt precedes worker allocation. Failure before this first send
+    # creates no worker; a lost reply leaves the owner conservative.
+    if _OWNER_ENV not in os.environ:
+        return None
+    import uuid
+    token = 'allocation:' + uuid.uuid4().hex
+    reply = _owner_exchange(dict(op='setup_cleanup', phase='reserve', worker=token))
+    if not reply['ack']:
+        raise RuntimeError('worker allocation refused by enclosing owner')
+    return token
+
+
+def _cleanup_unlaunched(temp, lease, reservation=None):
+    """Setup never launched a child, but storage refusal still crosses IPC."""
+    inherited = _OWNER_ENV in os.environ
+    if inherited:
+        reply = _owner_exchange(dict(op='setup_cleanup', phase='begin', worker=temp))
+        if not reply['ack']:
+            raise RuntimeError('setup cleanup refused by enclosing owner; storage retained')
+    try:
+        _cleanup_worker(temp, lease)
+    except BaseException as error:
+        if inherited:
+            try:
+                reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp,
+                                             reservation=reservation,
+                                             error=f'setup storage cleanup refused: {error!r}'))
+                if not reply['ack']:
+                    raise RuntimeError('setup cleanup refusal was not acknowledged')
+            except BaseException as transport:
+                raise BaseExceptionGroup('storage refusal and acknowledgement failure', [error, transport])
+        raise
+    if inherited:
+        reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp, reservation=reservation))
+        if not reply['ack']:
+            raise RuntimeError('setup cleanup completion was not acknowledged; ancestor storage retained')
+
+
+def _owned_run(cmd, *, cwd, env, timeout, input=None, storage_reservation=None):
+    """Canonical dispatch for explicit workers and their compatibility callers."""
+    global _process_owner
+    inherited = os.environ.get(_OWNER_ENV)
+    request = dict(cmd=list(map(str, cmd)), cwd=str(cwd), env=env, timeout=timeout, input=input,
+                   storage_reservation=storage_reservation)
+    if inherited is not None:
+        job = _owner_exchange({'op': 'launch', 'request': request})['job']
+        while True:
+            result = _owner_exchange({'op': 'poll', 'job': job})['result']
+            if result is not None:
+                return result
+            time.sleep(0.02)
+    with _process_owner_lock:
+        if _process_owner is None:
+            _process_owner = _ProcessOwner()
+    return _process_owner.run(**request)
+
+
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
@@ -435,6 +1320,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    scratch_root: ScratchClaim | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -469,7 +1355,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, scratch_root
     )
     attempt = 0
     # A worker killed by signal (OOM, SIGKILL) or the file timeout is a runaway, not a flake:
@@ -480,7 +1366,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, scratch_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -503,13 +1389,114 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _cleanup_worker(temproot: str, lease: ScratchLease | None) -> None:
+    if lease is not None:
+        lease.verify()  # uncertain paths stay intact, and the attempt fails
+        temproot = str(lease.worker)
+    _rmtree_force(temproot)
+
+
+def _owned_body_summary(result, output):
+    """Counts are known only from complete capture and a terminal summary.
+
+    A progress fragment or an absent summary is not a zero-test observation.
+    Keep the general parser unchanged for existing non-cleanup callers.
+    """
+    if result.get('capture_complete') is not True:
+        return {'counts_unknown': 1}
+    counts = r'\d+ (?:passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)'
+    for line in reversed(output.splitlines()):
+        line = line.strip().strip('= ').strip()
+        if re.fullmatch(rf'(?:{counts}(?:,\s*)?)+ in \d+(?:\.\d+)?s(?: \([^\n]*\))?', line):
+            summary = _parse_pytest_summary(line)
+            if summary:
+                return summary
+            if result['returncode'] == 5:
+                return {'zero_selected': 1}
+        if result['returncode'] == 5 and re.fullmatch(r'no tests ran in \d+(?:\.\d+)?s', line):
+            return {'zero_selected': 1}
+    return {'counts_unknown': 1}
+
+
+def _owned_facts_text(result):
+    try:
+        facts = [{'pid': item.get('pid'), 'facts': item.get('cleanup_facts', {})}
+                 for item in result.get('observations', [])[:64]]
+        return '\nowned cleanup facts: ' + json.dumps(facts, allow_nan=False)
+    except BaseException:
+        return '\nowned cleanup facts: unknown (diagnostic serialization failed)'
+
+
+def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_root):
+    from scripts.runner_scratch import worker_receipt
+
+    started = time.monotonic()
+    reservation = _reserve_storage()
+    lease = scratch_root.create_worker()
+    temp = str(lease.worker)
+    try:
+        cmd = [sys.executable, '-m', 'pytest', str(file), *pytest_args,
+               '--basetemp', str(lease.worker / 'pytest'),
+               '-o', f'cache_dir={lease.worker / "cache"}',
+               '--runner-owned-scratch=' + worker_receipt(lease)]
+        env = dict(os.environ, TMPDIR=temp, TMP=temp, TEMP=temp,
+                   PYTEST_DEBUG_TEMPROOT=temp, PYTHONDONTWRITEBYTECODE='1')
+    except BaseException as error:
+        _finish_owned_attempt(error, None, lambda: _cleanup_unlaunched(temp, lease, reservation))
+        raise AssertionError('unreachable')
+    # If IPC/ownership is lost, no containing storage is deleted on assumption.
+    try:
+        result = _owned_run(cmd, cwd=repo_root, env=env, timeout=file_timeout, storage_reservation=reservation)
+    except BaseException as error:
+        error.add_note(f'process ownership unresolved; worker retained: {temp}')
+        raise
+    output = result['stdout'] + result['stderr']
+    rc = result['returncode']
+    if result['timed_out']:
+        output = f'({file_timeout:.0f}s exceeded; owned process deadline)\n' + output
+    cleanup = RuntimeError(result['cleanup_error']) if result['cleanup_error'] else None
+    # Attach this to the SAME exception on failure, never convert uncertainty
+    # into an ordinary retryable child rc. Raw streams remain independently held.
+    child_outcome: dict = dict(returncode=rc, stdout=result['stdout'], stderr=result['stderr'],
+                         capture_complete=result.get('capture_complete'),
+                         summary=_owned_body_summary(result, output), diagnostic_text=_owned_facts_text(result))
+    if rc and _describe_interpreter_crash(rc, output):
+        child_outcome['summary']['crashed'] = 1
+    # Keep successful-child output too if the following storage cleanup fails.
+    primary = RuntimeError(f'pytest child exited {rc}\n{output}' + child_outcome['diagnostic_text'])
+    delete = (lambda: _cleanup_unlaunched(temp, lease, reservation)) if result.get('unlaunched') else lambda: _owned_cleanup(result)
+    try:
+        _finish_owned_attempt(primary, cleanup, delete, raise_primary=False)
+    except BaseException as error:
+        setattr(error, '_runner_child_outcome', child_outcome)
+        raise
+    # Emit independently of child streams and rc. main suppresses successful
+    # child output, and a retry can replace this attempt's returned tuple.
+    # One print keeps each bounded observation together in the canonical log.
+    print(f'\n=== Owned cleanup observation: {_format_file(file, repo_root)} ==='
+          + child_outcome['diagnostic_text'], flush=True)
+    if rc not in (0, 5) and not output.strip():
+        output = f'pytest child exited {rc} with no output: {file}\n'
+    if rc == 5:
+        rc = 0
+    summary = _parse_pytest_summary(output)
+    crash = _describe_interpreter_crash(rc, output) if rc else None
+    if crash:
+        summary['crashed'] = 1
+        output = f'(interpreter crashed: {crash})\n{output}'
+    return file, rc, output, summary, time.monotonic() - started
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    scratch_root: ScratchClaim | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    if scratch_root is not None:
+        return _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_root)
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
     # Give this subprocess its own pytest temp root.
@@ -529,43 +1516,39 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    lease = scratch_root.create_worker() if scratch_root is not None else None
+    temproot = str(lease.worker) if lease is not None else tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
-
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    proc = None
     pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
+    # Cover receipt creation and Popen too: a failed launch still owns a worker.
     try:
+        if lease is not None:
+            env.update(TMP=temproot, TEMP=temproot, PYTHONDONTWRITEBYTECODE="1")
+            from scripts.runner_scratch import worker_receipt
+
+            cmd.extend(["--basetemp", str(Path(temproot) / "pytest"),
+                        "-o", f"cache_dir={Path(temproot) / 'cache'}",
+                        "--runner-owned-scratch=" + worker_receipt(lease)])
+        proc = subprocess.Popen(
+            cmd, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env,
+            start_new_session=True,
+        )
+        # Capture before communicate can reap the group leader.
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
+        assert proc is not None
         _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
@@ -579,7 +1562,8 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        if proc is not None:
+            _kill_tree(proc, pgid=pgid)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -592,7 +1576,7 @@ def _run_one_file_once(
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
         # behind; make them writable and retry instead of skipping them.
-        _rmtree_force(temproot)
+        _cleanup_worker(temproot, lease)
 
     if rc not in (0, 5) and not output.strip():
         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
@@ -742,6 +1726,10 @@ def _print_progress(
             parts.append(f"{xp}xp")
         if file_summary.get("crashed"):
             parts.append("CRASHED")
+        if file_summary.get('counts_unknown'):
+            parts.append('COUNTS UNKNOWN')
+        if file_summary.get('cleanup_failed'):
+            parts.append('CLEANUP FAILED')
         test_str = " ".join(parts) + ", " if parts else ""
     else:
         n_tests = test_counts.get(file, 0)
@@ -817,6 +1805,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
 def _save_durations(
     file_times: List[Tuple[Path, float]],
     repo_root: Path,
+    output_root: ScratchClaim | None = None,
 ) -> None:
     """Write the duration cache so future ``--slice`` runs can use it.
 
@@ -829,8 +1818,17 @@ def _save_durations(
     for f, t in file_times:
         key = _format_file(f, repo_root)
         data[key] = round(t, 3)
-    path = repo_root / _DURATIONS_FILE
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if output_root is not None:
+        output_root.verify()
+    path = (output_root.task if output_root is not None else repo_root) / _DURATIONS_FILE
+    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    if output_root is None:
+        path.write_text(text, encoding="utf-8")
+    else:
+        # A fresh task has no duration output yet. Never follow a test-created
+        # symlink/hardlink or overwrite an unrelated entry here.
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(text)
 
 
 def _compute_lpt_slices(
@@ -1089,6 +2087,10 @@ def main() -> int:
         ),
     )
     # Split argv into "our flags + positional paths" vs "pytest passthrough".
+    parser.add_argument(
+        "--scratch-root", metavar="DIRECTORY",
+        help="New uniquely owned task directory for per-file temp/cache writes; no fallback",
+    )
     #
     # Two ways to pass args through to the per-file pytest invocation:
     #   1. Explicit ``--`` separator: everything after it goes to pytest.
@@ -1107,7 +2109,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from",
+        "--files-from", "--scratch-root",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1156,6 +2158,23 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+
+    if any(token.startswith("--runner-owned-scratch")
+           for token in bare_passthrough + explicit_passthrough):
+        parser.error("--runner-owned-scratch is reserved for canonical worker creation")
+
+    if args.scratch_root is not None:
+        from scripts.runner_scratch import claim_scratch_root, reject_location_overrides
+
+        try:
+            reject_location_overrides(bare_passthrough + explicit_passthrough)
+            args.scratch_root = claim_scratch_root(args.scratch_root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        sys.dont_write_bytecode = True
+        os.environ.update(TMPDIR=str(args.scratch_root.task), TMP=str(args.scratch_root.task),
+                          TEMP=str(args.scratch_root.task), PYTHONDONTWRITEBYTECODE="1")
+        tempfile.tempdir = None
 
     # Bare tokens are validated against pytest's option set so a typo fails
     # here with usage instead of once per discovered file. Anything after a
@@ -1322,28 +2341,25 @@ def main() -> int:
     # nothing at all and must.
     tests_collected = 0
     files_crashed = 0
+    files_unknown = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, Dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed, tests_skipped
-        nonlocal tests_collected, files_crashed
+        nonlocal tests_collected, files_crashed, files_unknown
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
-            with lock:
-                files_done += 1
-                tests_done += n_tests
-                fail_count += 1
-                failures.append((file, f"runner crashed: {exc!r}", {}))
-                _print_progress(
-                    tests_done, approx_total_tests, file, 1,
-                    time.monotonic() - started_at,
-                    repo_root, tests_passed, tests_failed,
-                    test_counts,
-                    subproc_wall=0.0,
-                )
-            return
+            outcome = getattr(exc, '_runner_child_outcome', None)
+            fpath, rc, subproc_wall = file, 1, time.monotonic() - started_at
+            if outcome is not None:
+                summary = dict(outcome['summary'], cleanup_failed=1)
+                output = (f"runner CLEANUP FAILED (child exited {outcome['returncode']}): {exc!r}\n"
+                          + outcome['stdout'] + outcome['stderr'] + outcome['diagnostic_text'])
+            else:
+                summary = {'counts_unknown': 1}
+                output = f"runner crashed: {exc!r}"
         with lock:
             files_done += 1
             tests_done += n_tests
@@ -1352,6 +2368,7 @@ def main() -> int:
             tests_failed += summary.get("failed", 0)
             tests_skipped += summary.get("skipped", 0)
             files_crashed += summary.get("crashed", 0)
+            files_unknown += summary.get('counts_unknown', 0)
             tests_collected += sum(
                 summary.get(k, 0)
                 for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
@@ -1375,7 +2392,9 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    if args.scratch_root is None:
+        _sweep_killed_run_roots(_runner_scratch_root())
+    # Explicit roots belong to callers: never prune their unrelated entries.
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get
@@ -1387,10 +2406,11 @@ def main() -> int:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                _effective_file_timeout(
+                args.file_timeout if args.scratch_root is not None else _effective_file_timeout(
                     file, repo_root, args.file_timeout, timeout_durations
                 ),
                 args.file_retries,
+                args.scratch_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1410,7 +2430,10 @@ def main() -> int:
         f", {files_crashed} file{'s' if files_crashed != 1 else ''} CRASHED"
         if files_crashed else ""
     )
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{crashed_note}{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    unknown_note = f", body counts UNKNOWN for {files_unknown} files (other counts are observed only)" if files_unknown else ""
+    body_counts = (f"observed {tests_passed} passes, {tests_failed} failures" if files_unknown
+                   else f"{tests_passed} tests passed, {tests_failed} failed")
+    print(f"=== Summary: {len(files)} files, {body_counts}{crashed_note}{skipped_note}{unknown_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -1433,7 +2456,7 @@ def main() -> int:
     # The summary line above reads green at a glance ("0 failed ... 100%
     # complete"), which has been misread as a successful verification, so say
     # it plainly AND fail the exit code.
-    no_tests_ran_at_all = bool(files) and tests_collected == 0 and not files_crashed
+    no_tests_ran_at_all = bool(files) and tests_collected == 0 and not files_crashed and not files_unknown
     if no_tests_ran_at_all:
         print()
         print(
@@ -1463,7 +2486,7 @@ def main() -> int:
         file_times, failures, _FLAKY_RESULTS,
     )
     if clean_times:
-        _save_durations(clean_times, repo_root)
+        _save_durations(clean_times, repo_root, args.scratch_root)
         print(f"  Durations cached to {_DURATIONS_FILE} ({len(clean_times)} files)")
 
     # Per-file time distribution (throwaway diagnostic — shows how
@@ -1504,10 +2527,20 @@ def main() -> int:
         crashed_files = [(f, o, s) for f, o, s in failures if s.get("crashed")]
         rest = [(f, s) for f, _o, s in failures if not s.get("crashed")]
         test_fail_files = [(f, s) for f, s in rest if s.get("failed", 0) > 0]
+        cleanup_failed_files = [(f, s) for f, s in rest if s.get('cleanup_failed')]
+        unknown_files = [(f, s) for f, s in rest if s.get('counts_unknown')]
         all_passed_but_nonzero = [(f, s) for f, s in rest
-                                  if s.get("failed", 0) == 0 and s.get("passed", 0) > 0]
+                                  if s.get("failed", 0) == 0 and s.get("passed", 0) > 0
+                                  and not s.get('cleanup_failed')]
         no_tests_ran = [(f, s) for f, s in rest
-                        if s.get("failed", 0) == 0 and s.get("passed", 0) == 0]
+                        if s.get("failed", 0) == 0 and s.get("passed", 0) == 0
+                        and not s.get('cleanup_failed') and not s.get('counts_unknown')]
+        if cleanup_failed_files:
+            print(f"=== {len(cleanup_failed_files)} files CLEANUP FAILED: child outcomes do not pass the canonical gate ===")
+            for file, _s in cleanup_failed_files:
+                print(f"  {_format_file(file, repo_root)}")
+        if unknown_files:
+            print(f"=== {len(unknown_files)} files: body counts UNKNOWN, not evidence that no tests ran ===")
         if crashed_files:
             print(f"=== {len(crashed_files)} file{'s' if len(crashed_files) != 1 else ''} where the interpreter CRASHED mid-run (native fault — a real bug, not a collection error; the tests that did run are not counted) ===")
             for file, output, _s in crashed_files:
