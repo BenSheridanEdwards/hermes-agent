@@ -17,7 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.scripts.fixtures.compatibility_runner import command, environment, run as run_probe
+from tests.scripts.fixtures.compatibility_runner import command, run_command, run as run_probe
+
+
+@pytest.fixture(autouse=True)
+def _native_launcher(real_bash, monkeypatch):
+    from tests.scripts.fixtures import compatibility_runner
+    monkeypatch.setattr(compatibility_runner, '_BASH', real_bash)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -71,7 +77,6 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path, record_property):
     A private stop-file requests early exit on failure. Observation checks PID
     plus creation time; a recycled PID is never signalled. No guard bypass.
     """
-    import subprocess
     import psutil
 
     probe = tmp_path / 'test_leaker.py'
@@ -116,8 +121,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path, record_property):
             return False
 
     try:
-        result = subprocess.run(argv, cwd=ROOT, env=environment(),
-                                capture_output=True, encoding='utf-8', timeout=60)
+        result = run_command(argv, timeout=60)
         assert handoff.exists(), result.stdout + result.stderr
         receipt = json.loads(handoff.read_text())
         record_property('grandchild_identity', json.dumps(receipt, sort_keys=True))

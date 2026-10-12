@@ -357,6 +357,326 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
+# Explicit-mode process ownership is rooted in the outer canonical runner.
+# A duplex inherited descriptor carries requests, never a pathname/PID claim.
+# Nested launchers cannot outlive their owning worker's cancellation boundary.
+_OWNER_ENV = "_HERMES_RUNNER_OWNER_FD"
+_process_owner = None
+_process_owner_lock = threading.Lock()
+_client_lock = threading.Lock()
+
+
+class _HeldPopen(subprocess.Popen):
+    """Observe exit without reaping: the owned PID pins its session identity."""
+
+    _waitpid_lock: threading.Lock
+
+    def _internal_poll(self, _deadstate=None):
+        with self._waitpid_lock:
+            if self.returncode is None:
+                result = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if result is not None:
+                    self.returncode = (result.si_status if result.si_code == os.CLD_EXITED
+                                       else -result.si_status)
+            return self.returncode
+
+    def _wait(self, timeout):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._internal_poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.02)
+        return self.returncode
+
+
+def _finish_owned_attempt(primary, cleanup, delete, *, raise_primary=True):
+    """An uncertain lifetime forbids deleting its containing storage."""
+    if cleanup is not None:
+        if primary is not None:
+            raise BaseExceptionGroup("primary failure and process cleanup failure", [primary, cleanup])
+        raise cleanup
+    try:
+        delete()
+    except BaseException as error:
+        if primary is not None:
+            raise BaseExceptionGroup("primary failure and storage cleanup failure", [primary, error])
+        raise
+    if primary is not None and raise_primary:
+        raise primary
+
+
+class _ProcessOwner:
+    """One canonical owner for every explicit worker and nested runner.
+
+    The root retains Popen handles. Requests are bound to the caller's inherited
+    endpoint, and cancellation closes the complete logical subtree atomically
+    against new launches. No name scan, caller-supplied PID or cooperative exit.
+    """
+
+    def __init__(self):
+        if os.name != 'posix' or not all(hasattr(os, name) for name in
+                ('waitid', 'WNOWAIT', 'P_PID', 'WEXITED', 'WNOHANG')):
+            raise RuntimeError('owned process supervision requires POSIX waitid/WNOWAIT')
+        self.lock = threading.RLock()
+        self.nodes = []
+
+    def _serve(self, connection, parent):
+        jobs = {}
+
+        def dispatch(job, request):
+            try:
+                job['result'] = self.run(parent=parent, **request)
+            except Exception as error:
+                job['result'] = dict(returncode=125, stdout='', stderr=repr(error),
+                                     cleanup_error='dispatch failed; storage retained', timed_out=False)
+
+        try:
+            while True:
+                message = json.loads(connection.recv_bytes())
+                if message['op'] == 'launch':
+                    key = str(len(jobs))
+                    job = {}
+                    jobs[key] = job
+                    request = message['request']
+                    request['submitted'] = time.monotonic()
+                    threading.Thread(target=dispatch, args=(job, request), daemon=True).start()
+                    answer = {'job': key}
+                else:
+                    answer = {'result': jobs[message['job']].get('result')}
+                connection.send_bytes(json.dumps(answer).encode())
+        except (EOFError, BrokenPipeError, OSError):
+            return
+        finally:
+            connection.close()
+
+    def _subtree(self, node):
+        owned = [node]
+        for candidate in self.nodes:
+            if any(candidate['parent'] is item for item in owned):
+                owned.append(candidate)
+        return owned
+
+    def _close(self, node):
+        import signal
+        import psutil
+
+        with self.lock:
+            if node['closed']:
+                return node['cleanup_error']
+            owned = self._subtree(node)
+            for item in owned:
+                item['closing'] = True
+            errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
+            # Each leader is our unreaped child, so its PID/session cannot be
+            # recycled between identity capture, killpg and absence observation.
+            for item in reversed(owned):
+                proc = item['proc']
+                if item['closed']:
+                    continue
+                try:
+                    if os.getsid(proc.pid) != proc.pid or os.getpgid(proc.pid) != proc.pid:
+                        raise RuntimeError(f'owned session identity changed: {proc.pid}')
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
+                except ProcessLookupError as error:
+                    errors.append(f'owned unreaped leader missing: {proc.pid}: {error}')
+                except (OSError, RuntimeError) as error:
+                    errors.append(f'owned kill failed: {proc.pid}: {error}')
+            deadline = time.monotonic() + 5
+            pending = {item['proc'].pid for item in owned if not item['closed']}
+            while pending and time.monotonic() < deadline:
+                members = set()
+                for process in psutil.process_iter(['pid']):
+                    try:
+                        session = os.getsid(process.pid)
+                        if session in pending and process.pid != session:
+                            members.add(session)
+                    except ProcessLookupError:
+                        continue
+                ready = {item['proc'].pid for item in owned
+                         if item['proc'].pid in pending and item['proc'].poll() is not None}
+                pending &= members | (pending - ready)
+                if pending:
+                    time.sleep(0.02)
+            if pending:
+                errors.append(f'owned process residue; storage retained: {sorted(pending)}')
+            for item in owned:
+                if item['closed']:
+                    continue
+                proc = item['proc']
+                if proc.pid not in pending:
+                    os.waitpid(proc.pid, 0)
+                item['closed'] = True
+                item['closed_at'] = time.monotonic()
+                item['cleanup_error'] = '; '.join(errors) or None
+            return '; '.join(errors) or None
+
+    def run(self, *, cmd, cwd, env, timeout, input=None, parent=None, submitted=None):
+        from multiprocessing import Pipe
+        import math
+
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('owned dispatch requires a finite positive deadline')
+        started = time.monotonic() if submitted is None else submitted
+        captured = {}
+        primary = None
+        with self.lock:
+            deadline = started + timeout
+            if parent is not None:
+                deadline = min(deadline, parent['deadline'])
+            if time.monotonic() >= deadline:
+                return dict(returncode=124, stdout='', stderr='deadline before launch', cleanup_error=None, timed_out=True)
+            if parent is not None and (parent['closing'] or parent['proc'].poll() is not None):
+                return dict(returncode=125, stdout='', stderr='', cleanup_error='owner already closing', timed_out=False)
+            cmd = list(cmd)
+            root = Path(__file__).resolve().parent.parent
+            if Path(cwd).resolve() != root:
+                raise ValueError('owned dispatch requires canonical checkout cwd')
+            lease = None
+            task = None
+            if cmd[:3] == [sys.executable, '-m', 'pytest']:
+                from scripts.runner_scratch import receive_worker, worker_receipt
+                receipts = [i for i, value in enumerate(cmd) if value.startswith('--runner-owned-scratch=')]
+                if len(receipts) != 1:
+                    raise ValueError('owned pytest requires one canonical lease')
+                i = receipts[0]
+                lease = receive_worker(cmd[i].split('=', 1)[1],
+                                       expected_parent=parent['proc'].pid if parent else os.getpid())
+                if parent is not None and lease.task != parent['task']:
+                    raise ValueError('owned pytest lease must belong to its canonical runner task')
+                task = lease.task
+                cmd[i] = '--runner-owned-scratch=' + worker_receipt(lease)
+            else:
+                # This endpoint is not an arbitrary unguarded process executor.
+                # Match the POSIX real_bash fixture against the owner's PATH,
+                # never the child's supplied executable search environment.
+                bash = shutil.which('bash')
+                launcher = shutil.which(cmd[0]) if cmd else None
+                if (not bash or not launcher or Path(launcher).resolve() != Path(bash).resolve()
+                        or len(cmd) < 4 or cmd[1:3] != [str(root / 'scripts/run_tests.sh'), '--scratch-root']
+                        or parent is None or parent['lease'] is None):
+                    raise ValueError('owned dispatch accepts only canonical explicit shell launches')
+                from scripts.runner_scratch import validate_scratch_root
+                parent['lease'].verify()
+                task = Path(validate_scratch_root(cmd[3], new=True))
+                if not task.is_relative_to(parent['lease'].worker):
+                    raise ValueError('nested runner task must remain in its submitting worker')
+                if env.get('HERMES_PYTHON') != sys.executable or any(k.startswith('__HERMES_') for k in env):
+                    raise ValueError('nested runner requires prepared interpreter without activation')
+                cmd[0] = bash
+            server, child = Pipe(duplex=True)
+            env = dict(env, **{_OWNER_ENV: str(child.fileno())})
+            try:
+                proc = _HeldPopen(cmd, cwd=cwd, env=env, start_new_session=True,
+                                  pass_fds=(child.fileno(),), stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, encoding='utf-8', errors='replace')
+            except BaseException as error:
+                server.close()
+                return dict(returncode=125, stdout='', stderr=repr(error),
+                            cleanup_error=None, timed_out=False, launch_failed=True)
+            finally:
+                child.close()
+            node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
+                              started=time.monotonic(), closed_at=None,
+                              cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
+                              test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
+            if parent is not None:
+                node['deadline'] = min(node['deadline'], parent['deadline'])
+            self.nodes.append(node)
+
+            def collect():
+                try:
+                    captured['streams'] = proc.communicate(input=input)
+                except BaseException as error:
+                    captured['error'] = repr(error)
+
+            reader = threading.Thread(target=collect, daemon=True)
+            node['reader'] = reader
+            try:
+                reader.start()
+                threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
+            except Exception as error:
+                primary = repr(error)
+                server.close()
+        timed_out = False
+        original_rc = 125
+        try:
+            if primary is None:
+                while proc.poll() is None and time.monotonic() < node['deadline']:
+                    time.sleep(0.02)
+                timed_out = time.monotonic() >= node['deadline']
+                original_rc = proc.returncode
+        except BaseException as error:
+            primary = repr(error)
+        with self.lock:
+            try:
+                cleanup = self._close(node)
+            except Exception as error:
+                # Record uncertainty before an enclosing closer can proceed.
+                cleanup = f'owned cleanup failed; storage retained: {error!r}'
+            if cleanup:
+                node['cleanup_error'] = cleanup
+        # One shared output-reclamation budget, not five seconds per descendant.
+        output_deadline = time.monotonic() + 5
+        with self.lock:
+            owned = self._subtree(node)
+        observations = []
+        for item in owned:
+            data = item['captured']
+            if item['reader'].ident is None:
+                data['error'] = 'output collector did not start'
+                for stream in (item['proc'].stdin, item['proc'].stdout, item['proc'].stderr):
+                    if stream is not None:
+                        stream.close()
+            else:
+                item['reader'].join(timeout=max(0, output_deadline - time.monotonic()))
+            if item['reader'].is_alive() or 'error' in data:
+                cleanup = (cleanup or '') + '; output reclamation failed: ' + data.get('error', 'pipe still open')
+            observations.append(dict(pid=item['proc'].pid, session=item['proc'].pid,
+                                     test_file=item['test_file'], deadline=item['deadline'],
+                                     started=item['started'], closed_at=item['closed_at'],
+                                     stdout=data.get('streams', ('', ''))[0]))
+        stdout, stderr = captured.get('streams', ('', ''))
+        if primary:
+            stderr += '\nowner failure: ' + primary
+        if cleanup:
+            with self.lock:
+                node['cleanup_error'] = cleanup
+        return dict(returncode=124 if timed_out else (125 if primary else original_rc),
+                    stdout=stdout, stderr=stderr, cleanup_error=cleanup,
+                    timed_out=timed_out, deadline=node['deadline'], observations=observations)
+
+
+def _owned_run(cmd, *, cwd, env, timeout, input=None):
+    """Canonical dispatch for explicit workers and their compatibility callers."""
+    global _process_owner
+    inherited = os.environ.get(_OWNER_ENV)
+    request = dict(cmd=list(map(str, cmd)), cwd=str(cwd), env=env, timeout=timeout, input=input)
+    if inherited is not None:
+        from multiprocessing.connection import Connection
+
+        # Duplicate only this process's capability. Never adopt a guessed PID or
+        # path. One request at a time per caller; descendants receive new pipes.
+        def exchange(message):
+            with _client_lock:
+                connection = Connection(os.dup(int(inherited)))
+                try:
+                    connection.send_bytes(json.dumps(message).encode())
+                    return json.loads(connection.recv_bytes())
+                finally:
+                    connection.close()
+        job = exchange({'op': 'launch', 'request': request})['job']
+        while True:
+            result = exchange({'op': 'poll', 'job': job})['result']
+            if result is not None:
+                return result
+            time.sleep(0.02)
+    with _process_owner_lock:
+        if _process_owner is None:
+            _process_owner = _ProcessOwner()
+    return _process_owner.run(**request)
+
+
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
@@ -547,6 +867,48 @@ def _cleanup_worker(temproot: str, lease: ScratchLease | None) -> None:
     _rmtree_force(temproot)
 
 
+def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_root):
+    from scripts.runner_scratch import worker_receipt
+
+    started = time.monotonic()
+    lease = scratch_root.create_worker()
+    temp = str(lease.worker)
+    try:
+        cmd = [sys.executable, '-m', 'pytest', str(file), *pytest_args,
+               '--basetemp', str(lease.worker / 'pytest'),
+               '-o', f'cache_dir={lease.worker / "cache"}',
+               '--runner-owned-scratch=' + worker_receipt(lease)]
+        env = dict(os.environ, TMPDIR=temp, TMP=temp, TEMP=temp,
+                   PYTEST_DEBUG_TEMPROOT=temp, PYTHONDONTWRITEBYTECODE='1')
+    except BaseException as error:
+        _finish_owned_attempt(error, None, lambda: _cleanup_worker(temp, lease))
+        raise AssertionError('unreachable')
+    # If IPC/ownership is lost, no containing storage is deleted on assumption.
+    try:
+        result = _owned_run(cmd, cwd=repo_root, env=env, timeout=file_timeout)
+    except BaseException as error:
+        error.add_note(f'process ownership unresolved; worker retained: {temp}')
+        raise
+    output = result['stdout'] + result['stderr']
+    rc = result['returncode']
+    if result['timed_out']:
+        output = f'({file_timeout:.0f}s exceeded; owned process deadline)\n' + output
+    cleanup = RuntimeError(result['cleanup_error']) if result['cleanup_error'] else None
+    primary = RuntimeError(f'pytest child exited {rc}\n{output}') if rc not in (0, 5) else None
+    _finish_owned_attempt(primary, cleanup, lambda: _cleanup_worker(temp, lease),
+                          raise_primary=False)
+    if rc not in (0, 5) and not output.strip():
+        output = f'pytest child exited {rc} with no output: {file}\n'
+    if rc == 5:
+        rc = 0
+    summary = _parse_pytest_summary(output)
+    crash = _describe_interpreter_crash(rc, output) if rc else None
+    if crash:
+        summary['crashed'] = 1
+        output = f'(interpreter crashed: {crash})\n{output}'
+    return file, rc, output, summary, time.monotonic() - started
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
@@ -555,6 +917,8 @@ def _run_one_file_once(
     scratch_root: ScratchClaim | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    if scratch_root is not None:
+        return _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_root)
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
     # Give this subprocess its own pytest temp root.
@@ -1462,7 +1826,7 @@ def main() -> int:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                _effective_file_timeout(
+                args.file_timeout if args.scratch_root is not None else _effective_file_timeout(
                     file, repo_root, args.file_timeout, timeout_durations
                 ),
                 args.file_retries,

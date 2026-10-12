@@ -19,7 +19,10 @@ def test_connect_succeeds_under_test_home(tmp_path, monkeypatch):
         conn.execute('CREATE TABLE compatibility_canary(value TEXT)')
         conn.execute("INSERT INTO compatibility_canary VALUES ('owned')")
         conn.commit()
-        assert conn.execute('SELECT value FROM compatibility_canary').fetchall() == [('owned',)]
+        rows = conn.execute('SELECT value FROM compatibility_canary').fetchall()
+        assert len(rows) == 1
+        assert isinstance(rows[0], sqlite3.Row)
+        assert rows[0]['value'] == 'owned'
     finally:
         conn.close()
 

@@ -269,10 +269,16 @@ def test_pre_spawn_failures_clean_only_owned_worker(tmp_path, monkeypatch, failu
         raise OSError('inert injected ' + failure)
     if failure == 'receipt':
         monkeypatch.setattr(scratch, 'worker_receipt', fail)
+        with pytest.raises(OSError, match='inert injected'):
+            runner._run_one_file_once(Path('inert.py'), [], tmp_path, 2, claim)
     else:
-        monkeypatch.setattr(runner.subprocess, 'Popen', fail)
-    with pytest.raises(OSError, match='inert injected'):
-        runner._run_one_file_once(Path('inert.py'), [], tmp_path, 2, claim)
+        # Confirmed no-launch reply from the canonical owner; an IPC exception
+        # is different and must retain storage because ownership is uncertain.
+        monkeypatch.setattr(runner, '_owned_run', lambda *a, **kw: dict(
+            returncode=125, stdout='', stderr='inert injected spawn',
+            cleanup_error=None, timed_out=False, launch_failed=True))
+        result = runner._run_one_file_once(Path('inert.py'), [], tmp_path, 2, claim)
+        assert result[1] == 125 and 'inert injected spawn' in result[2]
     assert list(claim.task.iterdir()) == []
 
 
@@ -461,29 +467,20 @@ def test_default_duration_destination_and_no_receipt_remain_unchanged(tmp_path, 
 
 @pytest.mark.platforms('posix')
 def test_timeout_cleanup_and_no_retry_use_original_worker(tmp_path, monkeypatch):
-    import subprocess
     from scripts import run_tests_parallel as runner
     claim = scratch.claim_scratch_root(str(tmp_path / 'task'))
     events = []
-    class Child:
-        pid = os.getpid()
-        returncode = -9
-        calls = 0
-        def communicate(self, timeout):
-            self.calls += 1
-            if self.calls == 1:
-                raise subprocess.TimeoutExpired('inert-child', timeout)
-            return 'inert timeout output', None
-    def spawn(cmd, **kwargs):
+    def dispatch(cmd, **kwargs):
         raw = next(arg.split('=', 1)[1] for arg in cmd if arg.startswith('--runner-owned-scratch='))
         lease = scratch.receive_worker(raw, expected_parent=os.getpid())
-        events.append(('spawn', lease.worker))
-        return Child()
-    monkeypatch.setattr(runner.subprocess, 'Popen', spawn)
-    monkeypatch.setattr(runner, '_kill_tree', lambda *args, **kwargs: events.append(('kill-tree', kwargs['pgid'])))
+        events.append(('dispatch', lease.worker))
+        return dict(returncode=124, stdout='inert timeout output', stderr='',
+                    cleanup_error=None, timed_out=True)
+    monkeypatch.setattr(runner, '_owned_run', dispatch)
     result = runner._run_one_file(Path('inert.py'), [], tmp_path, 2, retries=1, scratch_root=claim)
     assert result[1] == 124
-    assert [event[0] for event in events] == ['spawn', 'kill-tree']
+    assert [event[0] for event in events] == ['dispatch']
+    assert 'inert timeout output' in result[2]
     assert not events[0][1].exists()
     claim.verify()
 

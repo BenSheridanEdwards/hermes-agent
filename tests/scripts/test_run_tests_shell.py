@@ -5,7 +5,9 @@ from tests.scripts.fixtures.compatibility_runner import run
 
 
 @pytest.mark.platforms('posix')
-def test_shell_runner_executes_tests_and_propagates_failure(tmp_path):
+def test_shell_runner_executes_tests_and_propagates_failure(tmp_path, real_bash, monkeypatch):
+    from tests.scripts.fixtures import compatibility_runner
+    monkeypatch.setattr(compatibility_runner, '_BASH', real_bash)
     case = tmp_path / 'test_runner_canary.py'
     case.write_text(
         'import os\nfrom tests.scratch_isolation import LEASE\n'

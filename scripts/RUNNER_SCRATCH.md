@@ -169,3 +169,46 @@ an uncontained Windows default path. The frozen runner/lease scope requires an
 explicit disposition for a supported Windows containment path before this increment
 can be considered cross-platform compatible or merge-ready. No new compatibility
 tests have run; correction-4's 151 passes are evidence only for its earlier head.
+
+## Composed cancellation source candidate
+
+Explicit workers and nested canonical wrappers now request launches from the
+outer canonical runner's process owner. The inherited descriptor identifies the
+submitting node, not a caller-supplied PID. The actual spawner verifies and
+restamps the existing lease receipt; no lease or I/O protection is relaxed.
+Nested wrappers must use the native Bash resolver, the prepared interpreter and
+an absent task inside their submitting worker. This is trusted test infrastructure,
+not an OS sandbox for hostile test code or arbitrary detached subprocesses.
+
+Each canonical launch has its own session. The owner retains an unreaped leader
+using POSIX waitid/WNOWAIT, so group/session identities stay pinned during cleanup.
+Cancellation closes its logical subtree against new launches, kills those owned
+groups, checks session-member absence and reaps leaders before permitting worker
+storage deletion. An uncertain identity, observation failure or remaining member
+retains storage and is reported alongside the original output. Directory cleanup
+failure also retains the primary failure. Default-mode execution is unchanged.
+
+Nested deadlines are absolute and clamped to the enclosing node; retries and
+later files cannot reset that enclosing deadline. Explicit file caps are literal,
+not duration-cache scaled. The proposed outer cap remains 180 seconds and nested
+file cap 30 seconds. Cleanup has a five-second absence observation budget and a
+shared five-second output-drain budget per subtree. These are cooperative polling
+budgets, not a real-time guarantee on kernel calls or scheduler latency.
+
+New source regressions cover direct helper timeout, enclosing canonical worker
+timeout after a nested session starts, concurrent files, sequential retry attempts,
+process/storage cleanup errors, owned sibling preservation and a separate canary
+not registered with the process owner. That canary is created and reaped by the
+outer test, outside the cancelled nested sessions; it inherits the enclosing test
+group for last-resort containment. Live preservation excludes zombies. Negative
+leaves have independent 50-second caps, but success requires identity absence
+before that cap, never self-expiry. All these behavioral regressions remain unrun.
+
+Windows is still blocked at runner_scratch.validate_scratch_root/_identity and
+_ProcessOwner's POSIX waitid/pass_fds boundary. Existing real_bash selects Git Bash
+on native Windows, but that cannot supply lease or process ownership. The existing
+hermes_cli.local_runtime.processes.spawn_server/_WindowsJob supplies suspended
+assignment and kill-on-close job handles, not the complete scratch ACL/identity,
+owner IPC or verified-empty-job protocol required here. Reuse/adaptation needs a
+separately approved narrow scope and native Windows evidence. No Windows protection
+rewrite or held SIGSEGV execution is part of this source candidate.
