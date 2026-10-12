@@ -371,6 +371,12 @@ class _HeldPopen(subprocess.Popen):
 
     _waitpid_lock: threading.Lock
 
+    def _execute_child(self, *args, **kwargs):
+        # Constructor return is not the launch boundary. Once entered, even an
+        # exception before _child_created is assigned is treated as uncertain.
+        self._launch_entered = True
+        return super()._execute_child(*args, **kwargs)
+
     def _internal_poll(self, _deadstate=None):
         with self._waitpid_lock:
             if self.returncode is None:
@@ -405,6 +411,21 @@ def _finish_owned_attempt(primary, cleanup, delete, *, raise_primary=True):
         raise primary
 
 
+def _captured_output(proc, captured):
+    """Snapshot observed CPython communicate chunks, even before its return.
+
+    The explicit owner is POSIX-only. CPython's POSIX collector appends bytes
+    to _fileobj2output before wait/decode. A failed/unfinished communicate must
+    not replace those bytes with empty, supposedly complete streams.
+    """
+    if 'streams' in captured:
+        return captured['streams']
+    buffers = getattr(proc, '_fileobj2output', {})
+    return tuple(b''.join(tuple(buffers.get(getattr(proc, name, None), ()))).decode(
+        'utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')
+        for name in ('stdout', 'stderr'))
+
+
 class _ProcessOwner:
     """One canonical owner for every explicit worker and nested runner.
 
@@ -420,15 +441,55 @@ class _ProcessOwner:
         self.lock = threading.RLock()
         self.nodes = []
 
+    def _veto(self, node, error):
+        """Latch before replying; ordinary nonzero consumers cannot clear this."""
+        with self.lock:
+            while node is not None:
+                previous = node.get('cleanup_error')
+                node['cleanup_error'] = f'{previous}; {error}' if previous else str(error)
+                node = node['parent']
+
+    def cleanup(self, key, parent=None):
+        """Owner-side filesystem cleanup, serialized with ancestor cancellation."""
+        with self.lock:
+            node = None
+            try:
+                if type(key) is not int or not 0 <= key < len(self.nodes):
+                    raise ValueError('unknown owned cleanup node')
+                node = self.nodes[key]
+                if node['parent'] is not parent or node['lease'] is None:
+                    raise ValueError('cleanup endpoint does not own this worker')
+                if not node.get('finished'):
+                    raise RuntimeError('process/capture cleanup not acknowledged')
+                owned = self._subtree(node)
+                errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
+                errors.extend(error for item in owned for error in item.get('pending_storage', {}).values())
+                if errors:
+                    raise RuntimeError('; '.join(errors))
+                for item in owned:
+                    if item['lease'] is not None and not item.get('storage_cleaned'):
+                        item['lease'].verify()
+                _cleanup_worker(str(node['lease'].worker), node['lease'])
+                for item in owned:
+                    item['storage_cleaned'] = True
+                return {'cleanup_error': None}
+            except BaseException as error:
+                message = f'owned storage cleanup refused; storage retained: {error!r}'
+                # A malformed request may not nominate somebody else's node.
+                self._veto(node if node is not None and node['parent'] is parent else parent, message)
+                return {'cleanup_error': message}
+
     def _serve(self, connection, parent):
         jobs = {}
 
         def dispatch(job, request):
             try:
                 job['result'] = self.run(parent=parent, **request)
-            except Exception as error:
+            except BaseException as error:
+                self._veto(parent, f'dispatch failed; storage retained: {error!r}')
                 job['result'] = dict(returncode=125, stdout='', stderr=repr(error),
-                                     cleanup_error='dispatch failed; storage retained', timed_out=False)
+                                     cleanup_error='dispatch failed; storage retained', timed_out=False,
+                                     capture_complete=False)
 
         try:
             while True:
@@ -441,8 +502,32 @@ class _ProcessOwner:
                     request['submitted'] = time.monotonic()
                     threading.Thread(target=dispatch, args=(job, request), daemon=True).start()
                     answer = {'job': key}
-                else:
+                elif message['op'] == 'cleanup':
+                    answer = self.cleanup(message['node'], parent)
+                elif message['op'] == 'setup_cleanup':
+                    with self.lock:
+                        pending = parent.setdefault('pending_storage', {})
+                        key = message['worker']
+                        if message['phase'] == 'begin':
+                            if parent['closing']:
+                                self._veto(parent, 'setup cleanup requested after owner closure')
+                                answer = {'ack': False}
+                            else:
+                                pending[key] = 'setup storage cleanup acknowledgement pending: ' + key
+                                answer = {'ack': True}
+                        elif message['phase'] == 'end' and key in pending:
+                            if message.get('error'):
+                                self._veto(parent, message['error'])
+                            else:
+                                pending.pop(key)
+                            answer = {'ack': True}
+                        else:
+                            self._veto(parent, 'invalid setup cleanup acknowledgement')
+                            answer = {'ack': False}
+                elif message['op'] == 'poll':
                     answer = {'result': jobs[message['job']].get('result')}
+                else:
+                    raise ValueError('unknown owner operation')
                 connection.send_bytes(json.dumps(answer).encode())
         except (EOFError, BrokenPipeError, OSError):
             return
@@ -467,6 +552,7 @@ class _ProcessOwner:
             for item in owned:
                 item['closing'] = True
             errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
+            errors.extend(error for item in owned for error in item.get('pending_storage', {}).values())
             # Each leader is our unreaped child, so its PID/session cannot be
             # recycled between identity capture, killpg and absence observation.
             for item in reversed(owned):
@@ -493,7 +579,7 @@ class _ProcessOwner:
                     except ProcessLookupError:
                         continue
                 ready = {item['proc'].pid for item in owned
-                         if item['proc'].pid in pending and item['proc'].poll() is not None}
+                         if not item['closed'] and item['proc'].pid in pending and item['proc'].poll() is not None}
                 pending &= members | (pending - ready)
                 if pending:
                     time.sleep(0.02)
@@ -524,7 +610,8 @@ class _ProcessOwner:
             if parent is not None:
                 deadline = min(deadline, parent['deadline'])
             if time.monotonic() >= deadline:
-                return dict(returncode=124, stdout='', stderr='deadline before launch', cleanup_error=None, timed_out=True)
+                return dict(returncode=124, stdout='', stderr='deadline before launch', cleanup_error=None,
+                            timed_out=True, unlaunched=True, capture_complete=True)
             if parent is not None and (parent['closing'] or parent['proc'].poll() is not None):
                 return dict(returncode=125, stdout='', stderr='', cleanup_error='owner already closing', timed_out=False)
             cmd = list(cmd)
@@ -563,26 +650,62 @@ class _ProcessOwner:
                 if env.get('HERMES_PYTHON') != sys.executable or any(k.startswith('__HERMES_') for k in env):
                     raise ValueError('nested runner requires prepared interpreter without activation')
                 cmd[0] = bash
+            if sys.implementation.name != 'cpython':
+                raise RuntimeError('owned output recovery requires the CPython POSIX collector')
             server, child = Pipe(duplex=True)
-            env = dict(env, **{_OWNER_ENV: str(child.fileno())})
             try:
-                proc = _HeldPopen(cmd, cwd=cwd, env=env, start_new_session=True,
-                                  pass_fds=(child.fileno(),), stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, encoding='utf-8', errors='replace')
-            except BaseException as error:
+                env = dict(env, **{_OWNER_ENV: str(child.fileno())})
+                # Keep the object and ancestry even when __init__ raises after fork.
+                proc = _HeldPopen.__new__(_HeldPopen)
+                proc._launch_entered = False
+                node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
+                                  started=time.monotonic(), closed_at=None, reader=None,
+                                  cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
+                                  finished=False, capture_complete=False,
+                                  test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
+                key = len(self.nodes)
+                self.nodes.append(node)
+            except BaseException:
                 server.close()
-                return dict(returncode=125, stdout='', stderr=repr(error),
-                            cleanup_error=None, timed_out=False, launch_failed=True)
-            finally:
                 child.close()
-            node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
-                              started=time.monotonic(), closed_at=None,
-                              cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
-                              test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
-            if parent is not None:
-                node['deadline'] = min(node['deadline'], parent['deadline'])
-            self.nodes.append(node)
+                raise  # No constructor entered; caller still retains storage.
+            no_child = False
+            try:
+                proc.__init__(cmd, cwd=cwd, env=env, start_new_session=True,
+                              pass_fds=(child.fileno(),), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, encoding='utf-8', errors='replace')
+            except BaseException as error:
+                primary = repr(error)
+                try:
+                    server.close()
+                except BaseException as close_error:
+                    primary += f'; descriptor close failed: {close_error!r}'
+                    self._veto(node, primary)
+                no_child = not proc._launch_entered and not getattr(proc, '_child_created', False)
+                if no_child:
+                    node.update(closed=True, finished=True, capture_complete=True,
+                                closed_at=time.monotonic())
+                else:
+                    self._veto(node, f'constructor failed after launch entry; capture incomplete: {error!r}')
+                    # waitid validates unreaped direct-child ownership. An already
+                    # reaped exec-failure PID is not a safe signal target.
+                    try:
+                        if not getattr(proc, 'pid', None):
+                            raise RuntimeError('constructor did not retain a child PID')
+                        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    except (OSError, RuntimeError) as identity_error:
+                        node['closed'] = True  # unresolved, never eligible for deletion
+                        self._veto(node, f'constructor ownership uncertain: {identity_error!r}')
+            finally:
+                try:
+                    child.close()
+                except BaseException as error:
+                    self._veto(node, f'owner descriptor cleanup failed: {error!r}')
+                    primary = f'{primary or ""}; {error!r}'
+            if no_child:
+                return dict(returncode=125, stdout='', stderr=primary, cleanup_error=node['cleanup_error'],
+                            timed_out=False, launch_failed=True, node=key, capture_complete=True)
 
             def collect():
                 try:
@@ -590,14 +713,21 @@ class _ProcessOwner:
                 except BaseException as error:
                     captured['error'] = repr(error)
 
-            reader = threading.Thread(target=collect, daemon=True)
-            node['reader'] = reader
             try:
-                reader.start()
-                threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
-            except Exception as error:
+                if primary is None:
+                    reader = threading.Thread(target=collect, daemon=True)
+                    node['reader'] = reader
+                    reader.start()
+                    threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
+                else:
+                    server.close()
+            except BaseException as error:
                 primary = repr(error)
-                server.close()
+                self._veto(node, f'owner thread startup failed: {error!r}')
+                try:
+                    server.close()
+                except BaseException as close_error:
+                    self._veto(node, f'owner descriptor cleanup failed: {close_error!r}')
         timed_out = False
         original_rc = 125
         try:
@@ -611,40 +741,97 @@ class _ProcessOwner:
         with self.lock:
             try:
                 cleanup = self._close(node)
-            except Exception as error:
-                # Record uncertainty before an enclosing closer can proceed.
+            except BaseException as error:
                 cleanup = f'owned cleanup failed; storage retained: {error!r}'
             if cleanup:
-                node['cleanup_error'] = cleanup
-        # One shared output-reclamation budget, not five seconds per descendant.
-        output_deadline = time.monotonic() + 5
-        with self.lock:
+                self._veto(node, cleanup)
+            # Process closure and capture disposition are one deletion boundary.
+            # No enclosing closer can slip between absence and a capture veto.
+            output_deadline = time.monotonic() + 5
             owned = self._subtree(node)
-        observations = []
-        for item in owned:
-            data = item['captured']
-            if item['reader'].ident is None:
-                data['error'] = 'output collector did not start'
-                for stream in (item['proc'].stdin, item['proc'].stdout, item['proc'].stderr):
-                    if stream is not None:
-                        stream.close()
-            else:
-                item['reader'].join(timeout=max(0, output_deadline - time.monotonic()))
-            if item['reader'].is_alive() or 'error' in data:
-                cleanup = (cleanup or '') + '; output reclamation failed: ' + data.get('error', 'pipe still open')
-            observations.append(dict(pid=item['proc'].pid, session=item['proc'].pid,
-                                     test_file=item['test_file'], deadline=item['deadline'],
-                                     started=item['started'], closed_at=item['closed_at'],
-                                     stdout=data.get('streams', ('', ''))[0]))
-        stdout, stderr = captured.get('streams', ('', ''))
-        if primary:
-            stderr += '\nowner failure: ' + primary
-        if cleanup:
-            with self.lock:
-                node['cleanup_error'] = cleanup
-        return dict(returncode=124 if timed_out else (125 if primary else original_rc),
-                    stdout=stdout, stderr=stderr, cleanup_error=cleanup,
-                    timed_out=timed_out, deadline=node['deadline'], observations=observations)
+            observations = []
+            for item in owned:
+                data = item['captured']
+                reader = item['reader']
+                if reader is None and item.get('capture_complete'):
+                    pass  # Proven no-launch node has no output collector.
+                elif reader is None or reader.ident is None:
+                    data['error'] = 'output collector did not start'
+                    for name in ('stdin', 'stdout', 'stderr'):
+                        try:
+                            stream = getattr(item['proc'], name, None)
+                            if stream is not None and not stream.closed:
+                                stream.close()
+                        except BaseException as error:
+                            self._veto(item, f'collector descriptor cleanup failed: {error!r}')
+                else:
+                    reader.join(timeout=max(0, output_deadline - time.monotonic()))
+                complete = bool(item.get('capture_complete') or (
+                    reader is not None and not reader.is_alive() and 'streams' in data and 'error' not in data))
+                item['capture_complete'] = complete
+                if not complete:
+                    self._veto(item, 'capture incomplete; output reclamation failed: ' +
+                               data.get('error', 'pipe still open'))
+                out, err = _captured_output(item['proc'], data)
+                observations.append(dict(pid=getattr(item['proc'], 'pid', None),
+                                         session=getattr(item['proc'], 'pid', None),
+                                         test_file=item['test_file'], deadline=item['deadline'],
+                                         started=item['started'], closed_at=item['closed_at'],
+                                         stdout=out, stderr=err, capture_complete=complete))
+            stdout, stderr = _captured_output(proc, captured)
+            if primary:
+                stderr += '\nowner failure: ' + primary
+            node['finished'] = True
+            return dict(returncode=124 if timed_out else (125 if primary else original_rc),
+                        stdout=stdout, stderr=stderr, cleanup_error=node['cleanup_error'],
+                        timed_out=timed_out, deadline=node['deadline'], observations=observations,
+                        capture_complete=node['capture_complete'], node=key)
+
+
+def _owner_exchange(message):
+    from multiprocessing.connection import Connection
+
+    with _client_lock:
+        connection = Connection(os.dup(int(os.environ[_OWNER_ENV])))
+        try:
+            connection.send_bytes(json.dumps(message).encode())
+            return json.loads(connection.recv_bytes())
+        finally:
+            connection.close()
+
+
+def _owned_cleanup(result):
+    if _OWNER_ENV in os.environ:
+        reply = _owner_exchange({'op': 'cleanup', 'node': result['node']})
+    else:
+        reply = _process_owner.cleanup(result['node'])
+    if reply['cleanup_error']:
+        raise RuntimeError(reply['cleanup_error'])
+
+
+def _cleanup_unlaunched(temp, lease):
+    """Setup never launched a child, but storage refusal still crosses IPC."""
+    inherited = _OWNER_ENV in os.environ
+    if inherited:
+        reply = _owner_exchange(dict(op='setup_cleanup', phase='begin', worker=temp))
+        if not reply['ack']:
+            raise RuntimeError('setup cleanup refused by enclosing owner; storage retained')
+    try:
+        _cleanup_worker(temp, lease)
+    except BaseException as error:
+        if inherited:
+            try:
+                reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp,
+                                             error=f'setup storage cleanup refused: {error!r}'))
+                if not reply['ack']:
+                    raise RuntimeError('setup cleanup refusal was not acknowledged')
+            except BaseException as transport:
+                raise BaseExceptionGroup('storage refusal and acknowledgement failure', [error, transport])
+        raise
+    if inherited:
+        reply = _owner_exchange(dict(op='setup_cleanup', phase='end', worker=temp))
+        if not reply['ack']:
+            raise RuntimeError('setup cleanup completion was not acknowledged; ancestor storage retained')
 
 
 def _owned_run(cmd, *, cwd, env, timeout, input=None):
@@ -653,21 +840,9 @@ def _owned_run(cmd, *, cwd, env, timeout, input=None):
     inherited = os.environ.get(_OWNER_ENV)
     request = dict(cmd=list(map(str, cmd)), cwd=str(cwd), env=env, timeout=timeout, input=input)
     if inherited is not None:
-        from multiprocessing.connection import Connection
-
-        # Duplicate only this process's capability. Never adopt a guessed PID or
-        # path. One request at a time per caller; descendants receive new pipes.
-        def exchange(message):
-            with _client_lock:
-                connection = Connection(os.dup(int(inherited)))
-                try:
-                    connection.send_bytes(json.dumps(message).encode())
-                    return json.loads(connection.recv_bytes())
-                finally:
-                    connection.close()
-        job = exchange({'op': 'launch', 'request': request})['job']
+        job = _owner_exchange({'op': 'launch', 'request': request})['job']
         while True:
-            result = exchange({'op': 'poll', 'job': job})['result']
+            result = _owner_exchange({'op': 'poll', 'job': job})['result']
             if result is not None:
                 return result
             time.sleep(0.02)
@@ -881,7 +1056,7 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
         env = dict(os.environ, TMPDIR=temp, TMP=temp, TEMP=temp,
                    PYTEST_DEBUG_TEMPROOT=temp, PYTHONDONTWRITEBYTECODE='1')
     except BaseException as error:
-        _finish_owned_attempt(error, None, lambda: _cleanup_worker(temp, lease))
+        _finish_owned_attempt(error, None, lambda: _cleanup_unlaunched(temp, lease))
         raise AssertionError('unreachable')
     # If IPC/ownership is lost, no containing storage is deleted on assumption.
     try:
@@ -894,9 +1069,10 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
     if result['timed_out']:
         output = f'({file_timeout:.0f}s exceeded; owned process deadline)\n' + output
     cleanup = RuntimeError(result['cleanup_error']) if result['cleanup_error'] else None
-    primary = RuntimeError(f'pytest child exited {rc}\n{output}') if rc not in (0, 5) else None
-    _finish_owned_attempt(primary, cleanup, lambda: _cleanup_worker(temp, lease),
-                          raise_primary=False)
+    # Keep successful-child output too if the following storage cleanup fails.
+    primary = RuntimeError(f'pytest child exited {rc}\n{output}')
+    delete = (lambda: _cleanup_unlaunched(temp, lease)) if result.get('unlaunched') else lambda: _owned_cleanup(result)
+    _finish_owned_attempt(primary, cleanup, delete, raise_primary=False)
     if rc not in (0, 5) and not output.strip():
         output = f'pytest child exited {rc} with no output: {file}\n'
     if rc == 5:

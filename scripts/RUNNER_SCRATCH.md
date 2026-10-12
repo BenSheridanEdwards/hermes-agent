@@ -212,3 +212,36 @@ assignment and kill-on-close job handles, not the complete scratch ACL/identity,
 owner IPC or verified-empty-job protocol required here. Reuse/adaptation needs a
 separately approved narrow scope and native Windows evidence. No Windows protection
 rewrite or held SIGSEGV execution is part of this source candidate.
+
+### Residual failure transitions, source-only
+
+The owner registers the allocated Popen object before constructor entry. Only
+failure before its OS-launch seam is classified as proven no-child. A constructor
+exception after launch entry retains the object and ancestry, validates direct-child
+ownership without reaping before attempted reclamation, and latches uncertainty
+through all ancestors. A reaped or unavailable identity is never signalled by PID.
+
+Worker storage cleanup now executes in that same canonical owner, with its original
+immutable lease and the existing cleanup implementation, under the ownership lock.
+The endpoint may request only its own child node's cleanup after process/capture
+completion. Uncleaned descendant leases are verified before containing deletion.
+A refusal is recorded on the child and every ancestor before acknowledgement, so
+an expected assertion failure cannot consume it as an ordinary nonzero exit.
+Prelaunch setup cleanup uses a pending acknowledgement: interruption or refusal
+leaves a containing deletion veto, even though no process was launched.
+
+The POSIX CPython collector retains its already-read byte chunks when communicate
+fails or drain expires. Replies and observations explicitly mark capture incomplete
+and carry the partial stdout/stderr alongside the infrastructure error. This uses
+the prepared CPython collector's buffer contract, not a portable Windows claim.
+Ordinary nonzero output still returns normally after successful cleanup.
+
+New inert fault regressions enter the real constructor after child creation, fail
+the real collector after both streams are buffered, and exercise the actual nested
+caller, owner IPC cleanup and deliberate shell-failure consumer. For safe fault
+injection, these canary processes share the enclosing canonical test session; they
+are not another test executor. The fixture models thread-to-process receipt parent
+stamping and substitutes direct-child reclamation for group killing, while retaining
+actual Popen handles, independent finite child bounds, original errors and cleanup.
+Existing canonical cancellation/session-effect regressions remain distinct and
+unchanged. All new behavioral checks remain unrun pending source and workload gates.

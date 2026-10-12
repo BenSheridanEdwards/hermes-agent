@@ -224,7 +224,7 @@ def test_nonzero_attempt_preserves_output_with_cleanup_failure(tmp_path, monkeyp
         calls.append('delete')
         raise OSError('storage residue')
 
-    monkeypatch.setattr(runner, '_cleanup_worker', fail_storage)
+    monkeypatch.setattr(runner, '_owned_cleanup', fail_storage)
     with pytest.raises(BaseExceptionGroup) as caught:
         runner._run_one_file_once(Path('inert.py'), [], tmp_path, 30, claim)
     first, second = caught.value.exceptions
@@ -282,3 +282,319 @@ def test_owned_dispatch_rejects_noncanonical_requests_without_spawn(tmp_path, mo
     with pytest.raises(ValueError):
         runner._ProcessOwner().run(cmd=argv, cwd=helper.ROOT, env=env, timeout=10, parent=parent)
     assert not launches
+
+
+@contextmanager
+def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_fault=False, nested_refusal=False):
+    """Real Popen/collector/IPC, inert child in the enclosing test session.
+
+    No second session owner can escape outer cancellation. The fixture alone
+    reaps these direct children; the production group closer is not exercised
+    by this seam test (the cancellation tests above exercise that separately).
+    """
+    from multiprocessing import Pipe
+    import threading
+    from scripts import run_tests_parallel as runner
+    from scripts.runner_scratch import claim_scratch_root
+    from types import SimpleNamespace
+
+    owner = runner._ProcessOwner()
+    lease = claim_scratch_root(str(tmp_path / 'inert-owner')).create_worker()
+    parent: dict = dict(proc=SimpleNamespace(pid=os.getpid(), poll=lambda: None), parent=None,
+                  lease=lease, task=lease.task, deadline=time.monotonic() + 30,
+                  closing=False, closed=False, cleanup_error=None)
+    owner.nodes.append(parent)
+    created = []
+    original_init = runner._HeldPopen.__init__
+    original_execute = runner._HeldPopen._execute_child
+    original_communicate = runner._HeldPopen.communicate
+    endpoint = threading.local()
+    endpoint_lock = threading.Lock()
+
+    def close_endpoint(proc):
+        with endpoint_lock:
+            fd = getattr(proc, '_test_endpoint', None)
+            proc._test_endpoint = None
+        if fd is not None:
+            os.close(fd)
+
+    def inert_init(proc, cmd, **kwargs):
+        created.append(proc)  # Own fixture descriptors even if construction fails.
+        # These bytes are a canary, never pytest or a substitute executor.
+        code = ('import os,time; os.write(1,b"primary stdout\\n"); '
+                'os.write(2,b"primary stderr\\n"); time.sleep(0.1); raise SystemExit(1)')
+        if constructor_fault:
+            code = 'import time; time.sleep(15)'
+        if nested_refusal and cmd[:3] != [sys.executable, '-m', 'pytest']:
+            proc._test_task = Path(cmd[3])
+            proc._test_endpoint = os.dup(kwargs['pass_fds'][0])
+            code = ('import os,select,time; from pathlib import Path\n'
+                    'os.write(1,b"runner failure propagation canary\\n")\n'
+                    'os.write(2,b"shell primary stderr\\n")\n'
+                    'until=time.monotonic()+15; data=bytearray()\n'
+                    'while time.monotonic()<until:\n'
+                    '    if not select.select([0],[],[],max(0,until-time.monotonic()))[0]: break\n'
+                    '    chunk=os.read(0,8192)\n'
+                    '    if not chunk: break\n'
+                    '    data.extend(chunk)\n'
+                    f'Path({str(proc._test_task / "executed")!r}).write_text("executed")\n'
+                    'print(data.decode(),flush=True)\n'
+                    'raise SystemExit(1)')
+        kwargs.update(start_new_session=False, pass_fds=())
+        original_init(proc, [sys.executable, '-I', '-S', '-B', '-c', code], **kwargs)
+
+    def communicate(proc, input=None, **kwargs):
+        if not hasattr(proc, '_test_task'):
+            return original_communicate(proc, input=input, **kwargs)
+        # Run the actual nested caller in a thread instead of another test
+        # executor. Only OS-parent receipt stamping is modeled for this thread;
+        # the receiver, endpoint ancestry, transport and deletion are real.
+        endpoint.fd, endpoint.pid = proc._test_endpoint, proc.pid
+        try:
+            claim = claim_scratch_root(str(proc._test_task))
+            try:
+                runner._run_explicit_file_once(Path('inert.py'), [],
+                    Path(runner.__file__).resolve().parent.parent, 30, claim)
+            except BaseException as error:
+                input = repr(error)
+            else:
+                input = 'missing expected infrastructure refusal'
+        finally:
+            close_endpoint(proc)
+            del endpoint.fd, endpoint.pid
+        return original_communicate(proc, input=input, **kwargs)
+
+    if nested_refusal:
+        from multiprocessing.connection import Connection
+        from scripts import runner_scratch
+        original_exchange = runner._owner_exchange
+        original_receipt = runner_scratch.worker_receipt
+
+        def exchange(message):
+            if not hasattr(endpoint, 'fd'):
+                return original_exchange(message)
+            connection = Connection(os.dup(endpoint.fd))
+            try:
+                connection.send_bytes(json.dumps(message).encode())
+                return json.loads(connection.recv_bytes())
+            finally:
+                connection.close()
+
+        def receipt(lease):
+            raw = original_receipt(lease)
+            if not hasattr(endpoint, 'pid'):
+                return raw
+            data = json.loads(raw)
+            data['parent'] = endpoint.pid
+            return json.dumps(data)
+
+        monkeypatch.setattr(runner, '_owner_exchange', exchange)
+        monkeypatch.setattr(runner_scratch, 'worker_receipt', receipt)
+        monkeypatch.setattr(runner._HeldPopen, 'communicate', communicate)
+
+    def execute(proc, *args, **kwargs):
+        original_execute(proc, *args, **kwargs)
+        if constructor_fault:
+            assert proc._child_created and proc.pid
+            proc._test_identity = dict(pid=proc.pid, created=psutil.Process(proc.pid).create_time())
+            assert os.getsid(proc.pid) == os.getsid(0), 'inert child must remain outer-contained'
+            assert _running(proc._test_identity)
+            raise OSError('inert post-child constructor fault')
+
+    def close_direct(node):
+        # Retained unreaped direct child, no PID lookup/name scan. Group closure
+        # is inappropriate here because this inert child shares the test group.
+        proc = node['proc']
+        if not node['closed']:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            os.waitpid(proc.pid, 0)
+            node['closed'] = True
+            node['closed_at'] = time.monotonic()
+        return node['cleanup_error']
+
+    monkeypatch.setattr(runner._HeldPopen, '__init__', inert_init)
+    monkeypatch.setattr(runner._HeldPopen, '_execute_child', execute)
+    monkeypatch.setattr(owner, '_close', close_direct)
+    if capture_fault:
+        def fail_translation(*args):
+            raise OSError('inert collector failure after bytes')
+        monkeypatch.setattr(runner._HeldPopen, '_translate_newlines', fail_translation)
+    server, client = Pipe()
+    service = None
+    primary = None
+    errors = []
+    try:
+        service = threading.Thread(target=owner._serve, args=(server, parent), daemon=True)
+        service.start()
+        monkeypatch.setenv(runner._OWNER_ENV, str(client.fileno()))
+        yield runner, owner, parent, created
+    except BaseException as error:
+        primary = error
+    finally:
+        try:
+            client.close()
+            if service is not None and service.ident is not None:
+                service.join(timeout=5)
+                if service.is_alive():
+                    raise RuntimeError('inert owner service did not close')
+            else:
+                server.close()
+        except BaseException as error:
+            errors.append(error)
+        # Continue legitimate creator cleanup even if another resource failed.
+        for node in owner.nodes[1:]:
+            try:
+                if getattr(node['proc'], '_child_created', False) and not node['closed']:
+                    close_direct(node)
+            except BaseException as error:
+                errors.append(error)
+        active_readers = set()
+        for node in owner.nodes[1:]:
+            reader = node.get('reader')
+            if reader is not None and reader.ident is not None:
+                reader.join(timeout=5)
+                if reader.is_alive():
+                    active_readers.add(node['proc'])
+                    errors.append(RuntimeError('inert output reader did not close; descriptors retained'))
+        for proc in created:
+            if proc in active_readers:
+                continue  # Never block on a live reader's stream lock or reuse its endpoint FD.
+            try:
+                close_endpoint(proc)
+            except BaseException as error:
+                errors.append(error)
+            for name in ('stdin', 'stdout', 'stderr'):
+                try:
+                    stream = getattr(proc, name, None)
+                    if stream is not None and not stream.closed:
+                        stream.close()
+                except BaseException as error:
+                    errors.append(error)
+    if errors:
+        raise BaseExceptionGroup('inert fixture primary and cleanup', ([primary] if primary else []) + errors)
+    if primary is not None:
+        raise primary
+
+
+@pytest.mark.platforms('posix')
+def test_post_child_constructor_failure_retains_handle_and_ancestor_veto(tmp_path, monkeypatch):
+    from tests.scripts.fixtures import compatibility_runner as helper
+    with _inert_owner(monkeypatch, tmp_path, constructor_fault=True) as (_, owner, parent, created):
+        started = time.monotonic()
+        with pytest.raises(ExceptionGroup) as failure:
+            helper.run(parent['lease'].worker, '--help', timeout=10)
+        assert 'post-child constructor fault' in repr(failure.value)
+        assert len(created) == 1 and created[0]._child_created
+        assert not _alive(created[0]._test_identity)
+        assert time.monotonic() - started < 15, 'self-expiry is not constructor reclamation'
+        child = owner.nodes[-1]
+        assert child['proc'] is created[0] and child['parent'] is parent
+        assert child['closed'] and child['cleanup_error']
+        assert parent['cleanup_error'], 'constructor uncertainty must reach containing deletion'
+        parent['finished'] = True
+        assert owner.cleanup(0)['cleanup_error']
+        assert parent['lease'].worker.exists()
+
+
+@pytest.mark.platforms('posix')
+def test_collector_failure_preserves_observed_bytes_at_real_helper(tmp_path, monkeypatch):
+    from tests.scripts.fixtures import compatibility_runner as helper
+    with _inert_owner(monkeypatch, tmp_path, capture_fault=True) as (_, owner, parent, _):
+        with pytest.raises(ExceptionGroup) as failure:
+            helper.run(parent['lease'].worker, '--help', timeout=10)
+        primary, cleanup = failure.value.exceptions
+        assert 'primary stdout' in str(primary) and 'primary stderr' in str(primary)
+        assert 'collector failure after bytes' in str(cleanup)
+        assert 'capture incomplete' in str(cleanup)
+        assert owner.nodes[-1]['capture_complete'] is False
+        assert parent['cleanup_error'] and parent['lease'].worker.exists()
+
+
+@pytest.mark.platforms('posix')
+def test_nested_storage_refusal_cannot_pass_expected_shell_failure(tmp_path, monkeypatch, real_bash):
+    from tests.scripts.test_run_tests_shell import test_shell_runner_executes_tests_and_propagates_failure
+
+    with _inert_owner(monkeypatch, tmp_path, nested_refusal=True) as (runner, owner, parent, _):
+        refused = []
+        def refuse(temp, lease):
+            refused.append(lease)
+            (lease.worker / 'retained-primary').write_text('owned evidence')
+            raise OSError('inert nested storage refusal')
+        monkeypatch.setattr(runner, '_cleanup_worker', refuse)
+        # This is the actual expected-failure consumer, not a success-response
+        # mock. It must throw before accepting nonzero + assertion substring.
+        with pytest.raises(ExceptionGroup) as failure:
+            test_shell_runner_executes_tests_and_propagates_failure(
+                parent['lease'].worker, real_bash, monkeypatch)
+        primary, cleanup = failure.value.exceptions
+        assert 'runner failure propagation canary' in str(primary)
+        assert 'primary stdout' in str(primary) and 'primary stderr' in str(primary)
+        assert 'shell primary stderr' in str(primary)
+        assert 'inert nested storage refusal' in str(cleanup)
+        assert len(refused) == 1 and refused[0].worker.exists()
+        assert len(owner.nodes) == 3, 'enclosing worker, nested shell, nested pytest'
+        assert all(node['cleanup_error'] for node in owner.nodes)
+        parent['finished'] = True
+        reply = owner.cleanup(0)
+        assert reply['cleanup_error'] and len(refused) == 1, 'ancestor must veto before deletion'
+        assert (refused[0].worker / 'retained-primary').read_text() == 'owned evidence'
+        assert parent['lease'].worker.exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('mode', ['success', 'refusal', 'lost-ack', 'rejected-ack', 'closing'])
+def test_setup_cleanup_acknowledgement_controls_ancestor_deletion(tmp_path, monkeypatch, mode):
+    from scripts import runner_scratch
+
+    with _inert_owner(monkeypatch, tmp_path) as (runner, owner, parent, created):
+        claim = runner_scratch.claim_scratch_root(str(parent['lease'].worker / 'setup-task'))
+        original_cleanup = runner._cleanup_worker
+        original_exchange = runner._owner_exchange
+        deleted = []
+
+        def receipt_failure(lease):
+            raise OSError('inert setup receipt failure')
+
+        def cleanup(temp, lease):
+            assert str(lease.worker) in parent['pending_storage'], 'begin must precede deletion'
+            if mode == 'refusal':
+                raise OSError('inert setup storage refusal')
+            original_cleanup(temp, lease)
+            deleted.append(temp)
+
+        def exchange(message):
+            if message['op'] == 'setup_cleanup' and message['phase'] == 'end':
+                if mode == 'lost-ack':
+                    raise BrokenPipeError('inert lost setup acknowledgement')
+                if mode == 'rejected-ack':
+                    message = dict(message, worker=message['worker'] + '-not-pending')
+            return original_exchange(message)  # Actual IPC/server acknowledgement, not a reply mock.
+
+        monkeypatch.setattr(runner_scratch, 'worker_receipt', receipt_failure)
+        monkeypatch.setattr(runner, '_cleanup_worker', cleanup)
+        monkeypatch.setattr(runner, '_owner_exchange', exchange)
+        parent['closing'] = mode == 'closing'
+        expected = OSError if mode == 'success' else BaseExceptionGroup
+        with pytest.raises(expected) as failure:
+            runner._run_explicit_file_once(Path('inert.py'), [], tmp_path, 30, claim)
+        assert 'inert setup receipt failure' in repr(failure.value)
+        assert created == [], 'setup failure must not enter a process constructor'
+        if mode == 'success':
+            assert len(deleted) == 1 and list(claim.task.iterdir()) == []
+            assert parent['pending_storage'] == {} and parent['cleanup_error'] is None
+            parent['finished'] = True
+            monkeypatch.setattr(runner, '_cleanup_worker', original_cleanup)
+            assert owner.cleanup(0)['cleanup_error'] is None
+            assert not parent['lease'].worker.exists()
+        else:
+            assert parent.get('pending_storage') or parent['cleanup_error']
+            parent['finished'] = True
+            before = list(deleted)
+            assert owner.cleanup(0)['cleanup_error']
+            assert deleted == before and parent['lease'].worker.exists()
+            if mode in ('refusal', 'closing'):
+                assert len(list(claim.task.iterdir())) == 1 and not deleted
+            else:
+                assert len(deleted) == 1 and list(claim.task.iterdir()) == []

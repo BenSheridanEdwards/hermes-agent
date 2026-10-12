@@ -272,13 +272,23 @@ def test_pre_spawn_failures_clean_only_owned_worker(tmp_path, monkeypatch, failu
         with pytest.raises(OSError, match='inert injected'):
             runner._run_one_file_once(Path('inert.py'), [], tmp_path, 2, claim)
     else:
-        # Confirmed no-launch reply from the canonical owner; an IPC exception
-        # is different and must retain storage because ownership is uncertain.
-        monkeypatch.setattr(runner, '_owned_run', lambda *a, **kw: dict(
-            returncode=125, stdout='', stderr='inert injected spawn',
-            cleanup_error=None, timed_out=False, launch_failed=True))
-        result = runner._run_one_file_once(Path('inert.py'), [], tmp_path, 2, claim)
+        # Enter the real Popen constructor, fail before its OS launch seam,
+        # and use the real owner and deletion acknowledgement. No reply model.
+        owner = runner._ProcessOwner()
+        def no_handles(*args, **kwargs):
+            raise OSError('inert injected spawn')
+        monkeypatch.setattr(runner._HeldPopen, '_get_handles', no_handles)
+        monkeypatch.setattr(runner, '_owned_run', lambda cmd, **kw: owner.run(cmd=cmd, **kw))
+        def cleanup(result):
+            reply = owner.cleanup(result['node'])
+            assert reply['cleanup_error'] is None
+        monkeypatch.setattr(runner, '_owned_cleanup', cleanup)
+        root = Path(runner.__file__).resolve().parent.parent
+        result = runner._run_one_file_once(Path('inert.py'), [], root, 2, claim)
         assert result[1] == 125 and 'inert injected spawn' in result[2]
+        assert len(owner.nodes) == 1
+        assert not owner.nodes[0]['proc']._launch_entered
+        assert owner.nodes[0]['closed'] and owner.nodes[0]['cleanup_error'] is None
     assert list(claim.task.iterdir()) == []
 
 
@@ -475,8 +485,10 @@ def test_timeout_cleanup_and_no_retry_use_original_worker(tmp_path, monkeypatch)
         lease = scratch.receive_worker(raw, expected_parent=os.getpid())
         events.append(('dispatch', lease.worker))
         return dict(returncode=124, stdout='inert timeout output', stderr='',
-                    cleanup_error=None, timed_out=True)
+                    cleanup_error=None, timed_out=True, lease=lease)
     monkeypatch.setattr(runner, '_owned_run', dispatch)
+    monkeypatch.setattr(runner, '_owned_cleanup', lambda result:
+                        runner._cleanup_worker(str(result['lease'].worker), result['lease']))
     result = runner._run_one_file(Path('inert.py'), [], tmp_path, 2, retries=1, scratch_root=claim)
     assert result[1] == 124
     assert [event[0] for event in events] == ['dispatch']

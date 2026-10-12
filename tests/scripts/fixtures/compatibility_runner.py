@@ -51,7 +51,7 @@ def run_command(argv, *, timeout=60, input=None, **extra_env):
     if primary is not None:
         primary.ownership = measured
     cleanup = RuntimeError(measured['cleanup_error']) if measured['cleanup_error'] else None
-    if cleanup and primary is None and measured['returncode'] not in (0, 5):
+    if cleanup and primary is None:
         primary = RuntimeError(f'canonical child exited {measured["returncode"]}\n'
                                f'{measured["stdout"]}{measured["stderr"]}')
     if primary and cleanup:

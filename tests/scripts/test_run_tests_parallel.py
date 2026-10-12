@@ -166,8 +166,8 @@ def test_help_prints_usage_without_discovering_or_running_tests(tmp_path, help_f
 def test_unknown_bare_flag_errors_with_usage_instead_of_sweeping(tmp_path):
     probe = _make_probe_dir(tmp_path)
     proc = _run_runner(probe, '--jbs')
-    assert proc.returncode == 2, proc.stdout
-    assert 'usage:' in proc.stdout and 'unrecognized arguments: --jbs' in proc.stdout
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert 'usage:' in proc.stderr and 'unrecognized arguments: --jbs' in proc.stderr
     assert 'Discovered' not in proc.stdout
     proc = _run_runner(probe, '-rA', '-x')
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -176,8 +176,8 @@ def test_unknown_bare_flag_errors_with_usage_instead_of_sweeping(tmp_path):
 
 def test_known_flag_missing_value_errors_with_usage_instead_of_sweeping(tmp_path):
     proc = _run_runner(_make_probe_dir(tmp_path), '--tb')
-    assert proc.returncode == 2, proc.stdout
-    assert 'usage:' in proc.stdout and '--tb: expected one argument' in proc.stdout
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert 'usage:' in proc.stderr and '--tb: expected one argument' in proc.stderr
     assert 'Discovered' not in proc.stdout
 
 
