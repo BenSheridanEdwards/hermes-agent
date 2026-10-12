@@ -13,6 +13,8 @@ SEED = Path(__file__).with_name('shell_failure.canary')
 SOURCE = '''import json
 import os
 from pathlib import Path
+import pytest
+from tests import conftest
 from tests.scratch_isolation import LEASE
 
 
@@ -20,6 +22,11 @@ def test_canary(request):
     LEASE.verify()
     required = {'_hermetic_environment', '_forbid_real_hermes_home_io', '_kanban_write_guard'}
     assert required <= set(request.fixturenames)
+    assert request.config.pluginmanager.get_plugin(conftest.__file__) is conftest
+    # Exercise the installed normal fixture guard, not a replacement guard or
+    # a live negative target. Both spellings stay inside this owned task.
+    with pytest.raises(AssertionError, match='REAL hermes home'):
+        os.stat(LEASE.task / 'canary-source' / '..' / 'guard-probe')
     source = Path(__file__)
     assert source == LEASE.task / 'canary-source' / 'test_runner_canary.py'
     assert os.environ['PATHEXT'] == '.COM;.EXE;.BAT;.CMD'
@@ -28,6 +35,7 @@ def test_canary(request):
         'task': str(LEASE.task), 'worker_parent': str(LEASE.worker.parent),
         'source': str(source), 'home': os.environ['HOME'],
         'pathext': os.environ['PATHEXT'], 'fixtures': sorted(request.fixturenames),
+        'conftest': conftest.__file__, 'installed_guard_refused': True,
     }), encoding='utf-8')
     assert False, 'runner failure propagation canary'
 '''

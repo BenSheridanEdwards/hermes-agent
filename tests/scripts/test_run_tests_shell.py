@@ -3,7 +3,28 @@ import json
 import os
 import pytest
 
-from tests.scripts.fixtures.compatibility_runner import ROOT, run
+from tests.scripts.fixtures.compatibility_runner import ROOT, command, run
+
+
+def test_g2_seed_uses_normal_conftest_discovery(tmp_path):
+    arguments = (ROOT / 'tests/scripts/fixtures/shell_failure.canary',
+                 '--', '-p', 'tests.scripts.fixtures.shell_canary')
+    argv = command(tmp_path, *arguments)
+    assert argv[4:] == ['-j', '1', '--file-timeout', '30', '--file-retries', '0',
+                       *map(str, arguments)]
+
+
+@pytest.mark.parametrize('arguments', [
+    ('test_probe.py',),
+    ('--files', 'test_probe.py'),
+    ('--paths', 'probe'),
+    (ROOT / 'tests/scripts/fixtures/shell_failure.canary',),
+    ('other.canary', '--', '-p', 'tests.scripts.fixtures.shell_canary'),
+])
+def test_other_helper_routes_retain_explicit_conftest(tmp_path, arguments):
+    argv = command(tmp_path, *arguments)
+    assert argv[4:] == ['-j', '1', '--file-timeout', '30', '--file-retries', '0',
+                       '-p', 'tests.conftest', *map(str, arguments)]
 
 
 @pytest.mark.platforms('posix')
@@ -34,6 +55,8 @@ def test_shell_runner_executes_tests_and_propagates_failure(tmp_path, real_bash,
     assert receipt['worker_parent'] == str(result.task)
     assert receipt['home'] == os.environ['HOME']
     assert {'_hermetic_environment', '_forbid_real_hermes_home_io', '_kanban_write_guard'} <= set(receipt['fixtures'])
+    assert receipt['conftest'] == str(ROOT / 'tests/conftest.py')
+    assert receipt['installed_guard_refused'] is True
     assert result.returncode == 1, output
     assert 'runner failure propagation canary' in output
     assert '1 failed' in output

@@ -12,9 +12,15 @@ _BASH = 'bash'  # Test fixtures bind the repository's real_bash resolver.
 def command(parent, *arguments):
     """Name an absent task; only the unchanged runner may claim it exclusively."""
     task = Path(parent) / ('compat-' + uuid.uuid4().hex)
+    arguments = tuple(map(str, arguments))
+    # This checked-in seed discovers tests/conftest.py normally. Explicitly
+    # loading that same module under its dotted name registers it twice.
+    g2 = (str(ROOT / 'tests/scripts/fixtures/shell_failure.canary'),
+          '--', '-p', 'tests.scripts.fixtures.shell_canary')
+    conftest = () if arguments == g2 else ('-p', 'tests.conftest')
     return [_BASH, str(ROOT / 'scripts/run_tests.sh'), '--scratch-root', str(task),
             '-j', '1', '--file-timeout', '30', '--file-retries', '0',
-            '-p', 'tests.conftest', *map(str, arguments)]
+            *conftest, *arguments]
 
 
 def environment(**extra):
