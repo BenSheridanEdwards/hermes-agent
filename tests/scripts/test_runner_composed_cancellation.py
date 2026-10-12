@@ -138,7 +138,8 @@ def test_cancellation_reclaims_nested_sessions_before_storage(tmp_path, mode, re
                 identities.append(json.loads(line.removeprefix('CANCEL_LIVE ')))
     # Actual test-body handshake, not merely Popen flags or launcher existence.
     assert identities, evidence
-    assert all(identity['session'] == identity['pid'] for identity in identities)
+    assert all(any(row['worker_pid'] == identity['pid'] and row['session'] == identity['session']
+                   for row in evidence['observations']) for identity in identities)
     assert all(not _alive(identity) for identity in identities), evidence
     assert time.monotonic() - started < 50, 'self-expiry is not cancellation proof'
     record_property('cancelled_identities', json.dumps(identities))
@@ -314,6 +315,9 @@ def _inert_owner(monkeypatch, tmp_path, *, constructor_fault=False, capture_faul
     original_init = runner._HeldPopen.__init__
     original_execute = runner._HeldPopen._execute_child
     original_communicate = runner._HeldPopen.communicate
+    # This intentionally outer-contained canary fixture does not model an
+    # anchor session. Keep its direct collector/IPC seam explicit on every OS.
+    monkeypatch.setattr(runner, '_live_leader_platform', lambda: False)
     endpoint = threading.local()
     endpoint_lock = threading.Lock()
 

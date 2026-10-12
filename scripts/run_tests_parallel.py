@@ -367,6 +367,10 @@ _process_owner_lock = threading.Lock()
 _client_lock = threading.Lock()
 
 
+def _live_leader_platform():
+    return sys.platform == 'darwin'
+
+
 class _HeldPopen(subprocess.Popen):
     """Observe exit without reaping: the owned PID pins its session identity."""
 
@@ -761,6 +765,8 @@ class _ProcessOwner:
                 item['closing'] = True
             errors = [item['cleanup_error'] for item in owned if item['cleanup_error']]
             errors.extend(self._unresolved_storage(node))
+            close_deadline = time.monotonic() + 5
+            signalled_members = set()
             # Each leader is our unreaped child, so its PID/session cannot be
             # recycled between identity capture, killpg and absence observation.
             for item in reversed(owned):
@@ -770,8 +776,17 @@ class _ProcessOwner:
                 evidence = item.setdefault('cleanup_facts', {})
                 _record_cleanup(evidence, 'owner', pid=proc.pid,
                                 session_established=item.get('session_established'))
+                anchor = item.get('anchor')
+                if anchor is not None:
+                    try:
+                        _cleanup_call('anchor.close', proc.pid, anchor.prepare_close,
+                                      close_deadline, evidence=evidence)
+                    except BaseException as error:
+                        errors.append(f'anchor closure handshake failed: {_cleanup_error_text(error)}')
                 try:
-                    exited_unreaped(proc, evidence)  # also rejects a reaped/not-owned PID
+                    exited = exited_unreaped(proc, evidence)  # rejects a reaped/not-owned PID
+                    if anchor is not None and exited:
+                        raise RuntimeError('owned live anchor exited before cleanup signal')
                     try:
                         if (_cleanup_call('getsid', proc.pid, os.getsid, proc.pid, evidence=evidence) != proc.pid
                                 or _cleanup_call('getpgid', proc.pid, os.getpgid, proc.pid, evidence=evidence) != proc.pid):
@@ -781,14 +796,26 @@ class _ProcessOwner:
                         # still-unreaped leader. Successful Popen with setsid
                         # plus a fresh pinned-exit witness retains authority;
                         # constructor uncertainty must not infer that history.
-                        if not item.get('session_established') or not exited_unreaped(proc, evidence):
+                        if anchor is not None or not item.get('session_established') or not exited_unreaped(proc, evidence):
                             raise
+                    if anchor is not None and anchor.returncode is None and anchor.worker_pid is not None:
+                        # Timeout is not a worker-exit claim. Before cleanup, its
+                        # pinned worker must still belong to this signal target.
+                        if (_cleanup_call('anchor.worker.getsid', anchor.worker_pid, os.getsid,
+                                          anchor.worker_pid) != proc.pid
+                                or _cleanup_call('anchor.worker.getpgid', anchor.worker_pid, os.getpgid,
+                                                 anchor.worker_pid) != proc.pid):
+                            raise RuntimeError('uncompleted worker left its owned anchor group')
                     try:
                         _cleanup_call('killpg', proc.pid, os.killpg, proc.pid, signal.SIGKILL, evidence=evidence)  # windows-footgun: ok - POSIX owner only
+                        if anchor is not None:
+                            signalled_members.add(proc.pid)
+                            if anchor.worker_pid is not None:
+                                signalled_members.add(anchor.worker_pid)
                     except ProcessLookupError:
                         # Empty group after exit is normal, but ESRCH while the
                         # child is still live/unknown is not cleanup success.
-                        if not exited_unreaped(proc, evidence):
+                        if anchor is not None or not exited_unreaped(proc, evidence):
                             raise
                 except ProcessLookupError as error:
                     errors.append(f'owned unreaped leader missing: {proc.pid}: {_cleanup_error_text(error)}')
@@ -796,7 +823,7 @@ class _ProcessOwner:
                     errors.append(f'owned kill failed: {proc.pid}: {_cleanup_error_text(error)}')
             with _cleanup_stage('observation/reaping', node['proc'].pid, errors):
                 _record_cleanup(node.get('cleanup_facts'), 'observation', state='started')
-                deadline = time.monotonic() + 5
+                deadline = close_deadline if any(item.get('anchor') is not None for item in owned) else time.monotonic() + 5
                 pending = {item['proc'].pid for item in owned if not item['closed']}
                 while pending and time.monotonic() < deadline:
                     members = set()
@@ -806,6 +833,8 @@ class _ProcessOwner:
                             if session in pending and process.pid != session:
                                 members.add(session)
                         except ProcessLookupError:
+                            if any(item.get('anchor') is not None for item in owned) and process.pid not in signalled_members:
+                                raise  # An unclassified PID is not descendant absence.
                             continue
                     ready = {item['proc'].pid for item in owned
                              if not item['closed'] and item['proc'].pid in pending and _cleanup_call(
@@ -822,8 +851,16 @@ class _ProcessOwner:
                         continue
                     proc = item['proc']
                     if proc.pid not in pending:
-                        _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0,
-                                      evidence=item.get('cleanup_facts'))
+                        anchor = item.get('anchor')
+                        if anchor is not None:
+                            _cleanup_call('anchor.eof', proc.pid, anchor.finish, deadline,
+                                          evidence=item.get('cleanup_facts'))
+                        reaped = _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0,
+                                               evidence=item.get('cleanup_facts'))
+                        if anchor is not None and (not isinstance(reaped, tuple) or len(reaped) != 2
+                                or reaped[0] != proc.pid or not os.WIFSIGNALED(reaped[1])
+                                or os.WTERMSIG(reaped[1]) != signal.SIGKILL):  # windows-footgun: ok - POSIX owner, Darwin anchor only
+                            raise RuntimeError('anchor reap did not confirm owned cleanup signal')
                     item['closed'] = True
                     item['closed_at'] = time.monotonic()
                     item['cleanup_error'] = '; '.join(errors) or None
@@ -845,7 +882,9 @@ class _ProcessOwner:
             if time.monotonic() >= deadline:
                 return dict(returncode=124, stdout='', stderr='deadline before launch', cleanup_error=None,
                             timed_out=True, unlaunched=True, capture_complete=True)
-            if parent is not None and (parent['closing'] or parent['proc'].poll() is not None):
+            if parent is not None and (parent['closing'] or parent['proc'].poll() is not None
+                    or (parent.get('anchor') is not None and (
+                        parent['anchor'].returncode is not None or parent['anchor'].error is not None))):
                 return dict(returncode=125, stdout='', stderr='', cleanup_error='owner already closing', timed_out=False)
             cmd = list(cmd)
             root = Path(__file__).resolve().parent.parent
@@ -860,7 +899,7 @@ class _ProcessOwner:
                     raise ValueError('owned pytest requires one canonical lease')
                 i = receipts[0]
                 lease = receive_worker(cmd[i].split('=', 1)[1],
-                                       expected_parent=parent['proc'].pid if parent else os.getpid())
+                                       expected_parent=parent.get('worker_pid', parent['proc'].pid) if parent else os.getpid())
                 if parent is not None and lease.task != parent['task']:
                     raise ValueError('owned pytest lease must belong to its canonical runner task')
                 task = lease.task
@@ -898,7 +937,7 @@ class _ProcessOwner:
                 node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
                                   started=time.monotonic(), closed_at=None, reader=None,
                                   cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
-                                  finished=False, capture_complete=False, session_established=False, cleanup_facts={},
+                                  finished=False, capture_complete=False, session_established=False, cleanup_facts={}, anchor=None,
                                   test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
                 key = len(self.nodes)
                 self.nodes.append(node)
@@ -913,13 +952,23 @@ class _ProcessOwner:
                 raise  # No constructor entered; caller still retains storage.
             no_child = False
             try:
-                proc.__init__(cmd, cwd=cwd, env=env, start_new_session=True,
-                              pass_fds=(child.fileno(),), stdin=subprocess.PIPE,
+                launch_cmd, inherited_fds = cmd, (child.fileno(),)
+                if _live_leader_platform():
+                    from scripts.runner_anchor import AnchorChannel
+                    node['anchor'] = AnchorChannel(deadline)
+                    control_fd = node['anchor'].child.fileno()
+                    launch_cmd = [sys.executable, '-I', '-S', '-B', str(root / 'scripts/runner_anchor.py'),
+                                  str(control_fd), str(child.fileno())]
+                    inherited_fds += (control_fd,)
+                proc.__init__(launch_cmd, cwd=cwd, env=env, start_new_session=True,
+                              pass_fds=inherited_fds, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, encoding='utf-8', errors='replace')
                 # Successful constructor return confirms the requested setsid
                 # completed. An exception after launch entry cannot assert it.
                 node['session_established'] = True
+                if node['anchor'] is not None:
+                    node['worker_pid'] = node['anchor'].start(proc.pid, cmd)
             except BaseException as error:
                 primary = repr(error)
                 try:
@@ -950,6 +999,11 @@ class _ProcessOwner:
                     self._veto(node, f'owner descriptor cleanup failed: {error!r}')
                     primary = f'{primary or ""}; {error!r}'
             if no_child:
+                if node['anchor'] is not None:
+                    try:
+                        node['anchor'].dispose(time.monotonic() + 5)
+                    except BaseException as error:
+                        self._veto(node, f'anchor descriptor cleanup failed: {error!r}')
                 return dict(returncode=125, stdout='', stderr=primary, cleanup_error=node['cleanup_error'],
                             timed_out=False, launch_failed=True, node=key, capture_complete=True)
 
@@ -960,11 +1014,14 @@ class _ProcessOwner:
                     captured['error'] = repr(error)
 
             try:
-                if primary is None:
+                if primary is None or (node['anchor'] is not None and node['session_established']):
                     reader = threading.Thread(target=collect, daemon=True)
                     node['reader'] = reader
                     reader.start()
-                    threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
+                    if node['anchor'] is None or node.get('worker_pid') is not None:
+                        threading.Thread(target=self._serve, args=(server, node), daemon=True).start()
+                    else:
+                        server.close()
                 else:
                     server.close()
             except BaseException as error:
@@ -978,12 +1035,21 @@ class _ProcessOwner:
         original_rc = 125
         try:
             if primary is None:
-                while proc.poll() is None and time.monotonic() < node['deadline']:
-                    time.sleep(0.02)
-                timed_out = time.monotonic() >= node['deadline']
-                original_rc = proc.returncode
+                if node['anchor'] is not None:
+                    try:
+                        original_rc = node['anchor'].wait_result()
+                        timed_out = original_rc is None  # acknowledged ancestor cancellation
+                    except TimeoutError:
+                        timed_out = True
+                else:
+                    while proc.poll() is None and time.monotonic() < node['deadline']:
+                        time.sleep(0.02)
+                    timed_out = time.monotonic() >= node['deadline']
+                    original_rc = proc.returncode
         except BaseException as error:
             primary = repr(error)
+            if node['anchor'] is not None:
+                self._veto(node, f'anchor worker outcome uncertain: {_cleanup_error_text(error)}')
         with self.lock:
             if timed_out:
                 # This owner, not the vanished caller, now owes reclamation.
@@ -1004,6 +1070,14 @@ class _ProcessOwner:
             owned = self._subtree(node)
             observations = []
             for item in owned:
+                anchor = item.get('anchor')
+                if anchor is not None:
+                    _record_cleanup(item.get('cleanup_facts'), 'anchor',
+                                    worker_pid=anchor.worker_pid, worker_returncode=anchor.returncode)
+                    try:
+                        anchor.dispose(output_deadline)
+                    except BaseException as error:
+                        self._veto(item, f'anchor transport cleanup failed: {_cleanup_error_text(error)}')
                 data = item['captured']
                 reader = item['reader']
                 if reader is None and item.get('capture_complete'):
@@ -1027,18 +1101,23 @@ class _ProcessOwner:
                                data.get('error', 'pipe still open'))
                 out, err = _captured_output(item['proc'], data)
                 observations.append(dict(pid=getattr(item['proc'], 'pid', None),
+                                         worker_pid=item.get('worker_pid', getattr(item['proc'], 'pid', None)),
                                          session=getattr(item['proc'], 'pid', None),
                                          test_file=item['test_file'], deadline=item['deadline'],
                                          started=item['started'], closed_at=item['closed_at'],
                                          stdout=out, stderr=err, capture_complete=complete,
                                          cleanup_facts=item.get('cleanup_facts', {})))
             stdout, stderr = _captured_output(proc, captured)
-            if primary:
+            if primary and node['anchor'] is None:
                 stderr += '\nowner failure: ' + primary
             for error in self._unresolved_storage(node):
                 self._veto(node, error)
             node['finished'] = True
-            return dict(returncode=124 if timed_out else (125 if primary else original_rc),
+            if node['anchor'] is not None:
+                original_rc = node['anchor'].returncode
+            return dict(returncode=124 if timed_out else (
+                            (125 if original_rc is None else original_rc) if node['anchor'] is not None
+                            else (125 if primary else original_rc)),
                         stdout=stdout, stderr=stderr, cleanup_error=node['cleanup_error'],
                         timed_out=timed_out, deadline=node['deadline'], observations=observations,
                         capture_complete=node['capture_complete'], node=key)

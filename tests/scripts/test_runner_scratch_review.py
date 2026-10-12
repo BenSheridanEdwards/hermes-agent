@@ -146,6 +146,9 @@ def test_cleanup_diagnostic_preserves_stage_cause_and_consumer_veto(tmp_path, mo
     events = []
     cause = ValueError('original diagnostic cause')
     fault = PermissionError(errno.EPERM, 'inert permission failure')
+    # This fixture models direct-Popen syscall stages. Darwin's separate live
+    # leader protocol has its own owner/consumer regressions, not a fake peer here.
+    monkeypatch.setattr(runner, '_live_leader_platform', lambda: False)
 
     def operation(name, value):
         events.append(name)

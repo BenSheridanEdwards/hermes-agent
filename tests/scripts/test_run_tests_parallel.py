@@ -125,7 +125,9 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path, record_property):
         assert handoff.exists(), result.stdout + result.stderr
         receipt = json.loads(handoff.read_text())
         record_property('grandchild_identity', json.dumps(receipt, sort_keys=True))
-        assert receipt['pgid'] == receipt['test_pgid'] == receipt['test_pid']
+        assert receipt['pgid'] == receipt['test_pgid']
+        assert any(row['worker_pid'] == receipt['test_pid'] and row['session'] == receipt['pgid']
+                   for row in result.ownership['observations'])
         assert result.returncode == 0, result.stdout + result.stderr
         deadline = time.monotonic() + 5
         while owned_alive() and time.monotonic() < deadline:
