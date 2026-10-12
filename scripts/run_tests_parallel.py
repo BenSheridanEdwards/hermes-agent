@@ -58,7 +58,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 # The CI lane selector owns the platforms() spec resolver; share it so the
 # "skipped on this host" note and the lanes can never disagree.
@@ -439,9 +439,140 @@ def _cleanup_stage(operation, pid, prior_errors=()):
         raise
 
 
-def _cleanup_call(operation, pid, function, *args):
-    with _cleanup_stage(operation, pid):
-        return function(*args)
+def _diagnostic_value(value, depth=0) -> Any:
+    """Bounded JSON primitives only; never repr arbitrary objects or read files."""
+    if depth > 6:
+        return {'state': 'truncated'}
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is str:
+        return value[:512]
+    if type(value) in (list, tuple):
+        return [_diagnostic_value(v, depth + 1) for v in value[:64]]
+    if type(value) is dict:
+        return {k: _diagnostic_value(v, depth + 1)
+                for k, v in list(value.items())[:32] if type(k) is str}
+    return {'state': 'unknown'}
+
+
+def _record_cleanup(evidence, operation, **fields):
+    # Diagnostics are not authority. Even diagnostic serialization failure must
+    # neither replace the primary error nor prevent the original operation.
+    try:
+        if evidence is not None:
+            record = evidence.setdefault(operation, {})
+            safe = _diagnostic_value(fields)
+            if operation == 'waitid/witness' and 'outcome' in safe:
+                # Missing SID/PGID or ESRCH can request a second fresh witness.
+                # Retain both observations rather than overwrite that evidence.
+                history = record.setdefault('witnesses', [])
+                if len(history) < 3:
+                    history.append(safe['outcome'])
+            record.update(safe)
+    except BaseException:
+        pass
+
+
+def _session_snapshot(session):
+    """One racy, cooperative-budget census, NEVER an absence/ownership oracle.
+
+    Only PID/SID are inspected to filter candidates; status/PGID are queried
+    only for the already-owned leader or matching session. No argv/env/UIDs.
+    Individual OS metadata calls cannot be preempted here. No helper thread,
+    executor, signal or changed owner deadline is introduced to hide that limit.
+    """
+    import psutil
+
+    result: dict = dict(state='partial', scanned=0, unresolved=0, lookup_errors={}, members=[], leader={'pid': session})
+    deadline = time.monotonic() + 0.025
+    try:
+        result['leader']['status'] = psutil.Process(session).status()
+    except Exception as error:
+        result['leader']['error'] = type(error).__name__
+        result['unresolved'] += 1
+    try:
+        iterator = iter(psutil.process_iter(['pid']))
+        for _ in range(1024):
+            if time.monotonic() >= deadline:
+                result['reason'] = 'time_budget'
+                break
+            try:
+                process = next(iterator)
+            except StopIteration:
+                result['state'] = 'partial' if result['unresolved'] else 'complete_racy'
+                break
+            result['scanned'] += 1
+            try:
+                sid = os.getsid(process.pid)
+            except Exception as error:
+                # Unclassifiable candidates remain unknown, not proven outside.
+                result['unresolved'] += 1
+                name = type(error).__name__
+                result['lookup_errors'][name] = result['lookup_errors'].get(name, 0) + 1
+                continue
+            if sid != session:
+                continue
+            member: dict = {'pid': process.pid, 'sid': sid}
+            try:
+                member['pgid'] = os.getpgid(process.pid)
+                member['status'] = process.status()
+            except Exception as error:
+                member['error'] = type(error).__name__
+                result['unresolved'] += 1
+            result['members'].append(member)
+            if len(result['members']) == 64:
+                result['reason'] = 'member_limit'
+                break
+        else:
+            result['reason'] = 'pid_limit'
+    except Exception as error:
+        result['reason'] = 'enumeration_error'
+        result['error'] = type(error).__name__
+    return result
+
+
+def _signal_facts(pid, function, args):
+    import types
+
+    result = {'arguments': [int(arg) for arg in args], 'native_audit_origin': 'unknown'}
+    # Only built-in/function descriptors, not properties on callable objects.
+    metadata = {'type': type(function).__name__, 'is_posix_killpg':
+                function is vars(sys.modules['posix']).get('killpg')}
+    if type(function) in (types.FunctionType, types.BuiltinFunctionType):
+        metadata.update(module=function.__module__, qualname=function.__qualname__)
+        if type(function) is types.FunctionType:
+            metadata['code_file'] = function.__code__.co_filename
+    result['callable'] = metadata
+    try:
+        result['snapshot'] = _session_snapshot(pid)
+    except BaseException:
+        result['snapshot'] = {'state': 'unknown'}
+    return result
+
+
+def _cleanup_call(operation, pid, function, *args, evidence=None):
+    if evidence is not None and operation == 'killpg':
+        try:
+            _record_cleanup(evidence, operation, **_signal_facts(pid, function, args))
+        except BaseException:
+            _record_cleanup(evidence, operation, diagnostic_state='unknown')
+    try:
+        with _cleanup_stage(operation, pid):
+            result = function(*args)
+    except BaseException as error:
+        try:
+            _record_cleanup(evidence, operation, outcome={
+                'state': 'error', 'type': type(error).__name__, 'errno': getattr(error, 'errno', None)})
+        except BaseException:
+            pass
+        raise
+    try:
+        value = ({key: getattr(result, key, None) for key in ('si_pid', 'si_code', 'si_status')}
+                 if operation == 'waitid/witness' and result is not None else result)
+        _record_cleanup(evidence, operation, outcome={'state': 'returned', 'value': value})
+    except BaseException:
+        _record_cleanup(evidence, operation, outcome={'state': 'unknown'})
+    return result
 
 
 def _cleanup_iter(operation, pid, function, *args):
@@ -608,11 +739,12 @@ class _ProcessOwner:
         import signal
         import psutil
 
-        def exited_unreaped(proc):
+        def exited_unreaped(proc, evidence):
             # A fresh WNOWAIT witness, not cached returncode or a numeric PID,
             # proves this is still our unreaped direct child before signalling.
             result = _cleanup_call('waitid/witness', proc.pid, os.waitid,
-                                   os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                                   os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                                   evidence=evidence)
             if result is None:
                 return False
             if result.si_pid != proc.pid or result.si_code not in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED):
@@ -635,31 +767,35 @@ class _ProcessOwner:
                 proc = item['proc']
                 if item['closed']:
                     continue
+                evidence = item.setdefault('cleanup_facts', {})
+                _record_cleanup(evidence, 'owner', pid=proc.pid,
+                                session_established=item.get('session_established'))
                 try:
-                    exited_unreaped(proc)  # also rejects a reaped/not-owned PID
+                    exited_unreaped(proc, evidence)  # also rejects a reaped/not-owned PID
                     try:
-                        if (_cleanup_call('getsid', proc.pid, os.getsid, proc.pid) != proc.pid
-                                or _cleanup_call('getpgid', proc.pid, os.getpgid, proc.pid) != proc.pid):
+                        if (_cleanup_call('getsid', proc.pid, os.getsid, proc.pid, evidence=evidence) != proc.pid
+                                or _cleanup_call('getpgid', proc.pid, os.getpgid, proc.pid, evidence=evidence) != proc.pid):
                             raise RuntimeError(f'owned session identity changed: {proc.pid}')
                     except ProcessLookupError:
                         # Darwin can stop exposing the session of an exited,
                         # still-unreaped leader. Successful Popen with setsid
                         # plus a fresh pinned-exit witness retains authority;
                         # constructor uncertainty must not infer that history.
-                        if not item.get('session_established') or not exited_unreaped(proc):
+                        if not item.get('session_established') or not exited_unreaped(proc, evidence):
                             raise
                     try:
-                        _cleanup_call('killpg', proc.pid, os.killpg, proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX owner only
+                        _cleanup_call('killpg', proc.pid, os.killpg, proc.pid, signal.SIGKILL, evidence=evidence)  # windows-footgun: ok - POSIX owner only
                     except ProcessLookupError:
                         # Empty group after exit is normal, but ESRCH while the
                         # child is still live/unknown is not cleanup success.
-                        if not exited_unreaped(proc):
+                        if not exited_unreaped(proc, evidence):
                             raise
                 except ProcessLookupError as error:
                     errors.append(f'owned unreaped leader missing: {proc.pid}: {_cleanup_error_text(error)}')
                 except (OSError, RuntimeError) as error:
                     errors.append(f'owned kill failed: {proc.pid}: {_cleanup_error_text(error)}')
             with _cleanup_stage('observation/reaping', node['proc'].pid, errors):
+                _record_cleanup(node.get('cleanup_facts'), 'observation', state='started')
                 deadline = time.monotonic() + 5
                 pending = {item['proc'].pid for item in owned if not item['closed']}
                 while pending and time.monotonic() < deadline:
@@ -673,18 +809,21 @@ class _ProcessOwner:
                             continue
                     ready = {item['proc'].pid for item in owned
                              if not item['closed'] and item['proc'].pid in pending and _cleanup_call(
-                                 'observation.poll', item['proc'].pid, item['proc'].poll) is not None}
+                                 'observation.poll', item['proc'].pid, item['proc'].poll,
+                                 evidence=item.get('cleanup_facts')) is not None}
                     pending &= members | (pending - ready)
                     if pending:
                         time.sleep(0.02)
                 if pending:
                     errors.append(f'owned process residue; storage retained: {sorted(pending)}')
+                _record_cleanup(node.get('cleanup_facts'), 'observation', state='returned', pending=sorted(pending))
                 for item in owned:
                     if item['closed']:
                         continue
                     proc = item['proc']
                     if proc.pid not in pending:
-                        _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0)
+                        _cleanup_call('waitpid', proc.pid, os.waitpid, proc.pid, 0,
+                                      evidence=item.get('cleanup_facts'))
                     item['closed'] = True
                     item['closed_at'] = time.monotonic()
                     item['cleanup_error'] = '; '.join(errors) or None
@@ -759,7 +898,7 @@ class _ProcessOwner:
                 node: dict = dict(proc=proc, parent=parent, closing=False, closed=False,
                                   started=time.monotonic(), closed_at=None, reader=None,
                                   cleanup_error=None, deadline=deadline, captured=captured, lease=lease, task=task,
-                                  finished=False, capture_complete=False, session_established=False,
+                                  finished=False, capture_complete=False, session_established=False, cleanup_facts={},
                                   test_file=cmd[3] if cmd[:3] == [sys.executable, '-m', 'pytest'] else None)
                 key = len(self.nodes)
                 self.nodes.append(node)
@@ -856,6 +995,7 @@ class _ProcessOwner:
                 cleanup = self._close(node)
             except BaseException as error:
                 cleanup = f'owned cleanup failed; storage retained: {_cleanup_error_text(error)}'
+                _record_cleanup(node.get('cleanup_facts'), 'close', state='error', type=type(error).__name__)
             if cleanup:
                 self._veto(node, cleanup)
             # Process closure and capture disposition are one deletion boundary.
@@ -890,7 +1030,8 @@ class _ProcessOwner:
                                          session=getattr(item['proc'], 'pid', None),
                                          test_file=item['test_file'], deadline=item['deadline'],
                                          started=item['started'], closed_at=item['closed_at'],
-                                         stdout=out, stderr=err, capture_complete=complete))
+                                         stdout=out, stderr=err, capture_complete=complete,
+                                         cleanup_facts=item.get('cleanup_facts', {})))
             stdout, stderr = _captured_output(proc, captured)
             if primary:
                 stderr += '\nowner failure: ' + primary
@@ -1176,6 +1317,37 @@ def _cleanup_worker(temproot: str, lease: ScratchLease | None) -> None:
     _rmtree_force(temproot)
 
 
+def _owned_body_summary(result, output):
+    """Counts are known only from complete capture and a terminal summary.
+
+    A progress fragment or an absent summary is not a zero-test observation.
+    Keep the general parser unchanged for existing non-cleanup callers.
+    """
+    if result.get('capture_complete') is not True:
+        return {'counts_unknown': 1}
+    counts = r'\d+ (?:passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)'
+    for line in reversed(output.splitlines()):
+        line = line.strip().strip('= ').strip()
+        if re.fullmatch(rf'(?:{counts}(?:,\s*)?)+ in \d+(?:\.\d+)?s(?: \([^\n]*\))?', line):
+            summary = _parse_pytest_summary(line)
+            if summary:
+                return summary
+            if result['returncode'] == 5:
+                return {'zero_selected': 1}
+        if result['returncode'] == 5 and re.fullmatch(r'no tests ran in \d+(?:\.\d+)?s', line):
+            return {'zero_selected': 1}
+    return {'counts_unknown': 1}
+
+
+def _owned_facts_text(result):
+    try:
+        facts = [{'pid': item.get('pid'), 'facts': item.get('cleanup_facts', {})}
+                 for item in result.get('observations', [])[:64]]
+        return '\nowned cleanup facts: ' + json.dumps(facts, allow_nan=False)
+    except BaseException:
+        return '\nowned cleanup facts: unknown (diagnostic serialization failed)'
+
+
 def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_root):
     from scripts.runner_scratch import worker_receipt
 
@@ -1204,10 +1376,26 @@ def _run_explicit_file_once(file, pytest_args, repo_root, file_timeout, scratch_
     if result['timed_out']:
         output = f'({file_timeout:.0f}s exceeded; owned process deadline)\n' + output
     cleanup = RuntimeError(result['cleanup_error']) if result['cleanup_error'] else None
+    # Attach this to the SAME exception on failure, never convert uncertainty
+    # into an ordinary retryable child rc. Raw streams remain independently held.
+    child_outcome: dict = dict(returncode=rc, stdout=result['stdout'], stderr=result['stderr'],
+                         capture_complete=result.get('capture_complete'),
+                         summary=_owned_body_summary(result, output), diagnostic_text=_owned_facts_text(result))
+    if rc and _describe_interpreter_crash(rc, output):
+        child_outcome['summary']['crashed'] = 1
     # Keep successful-child output too if the following storage cleanup fails.
-    primary = RuntimeError(f'pytest child exited {rc}\n{output}')
+    primary = RuntimeError(f'pytest child exited {rc}\n{output}' + child_outcome['diagnostic_text'])
     delete = (lambda: _cleanup_unlaunched(temp, lease, reservation)) if result.get('unlaunched') else lambda: _owned_cleanup(result)
-    _finish_owned_attempt(primary, cleanup, delete, raise_primary=False)
+    try:
+        _finish_owned_attempt(primary, cleanup, delete, raise_primary=False)
+    except BaseException as error:
+        setattr(error, '_runner_child_outcome', child_outcome)
+        raise
+    # Emit independently of child streams and rc. main suppresses successful
+    # child output, and a retry can replace this attempt's returned tuple.
+    # One print keeps each bounded observation together in the canonical log.
+    print(f'\n=== Owned cleanup observation: {_format_file(file, repo_root)} ==='
+          + child_outcome['diagnostic_text'], flush=True)
     if rc not in (0, 5) and not output.strip():
         output = f'pytest child exited {rc} with no output: {file}\n'
     if rc == 5:
@@ -1459,6 +1647,10 @@ def _print_progress(
             parts.append(f"{xp}xp")
         if file_summary.get("crashed"):
             parts.append("CRASHED")
+        if file_summary.get('counts_unknown'):
+            parts.append('COUNTS UNKNOWN')
+        if file_summary.get('cleanup_failed'):
+            parts.append('CLEANUP FAILED')
         test_str = " ".join(parts) + ", " if parts else ""
     else:
         n_tests = test_counts.get(file, 0)
@@ -2070,28 +2262,25 @@ def main() -> int:
     # nothing at all and must.
     tests_collected = 0
     files_crashed = 0
+    files_unknown = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, Dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed, tests_skipped
-        nonlocal tests_collected, files_crashed
+        nonlocal tests_collected, files_crashed, files_unknown
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
-            with lock:
-                files_done += 1
-                tests_done += n_tests
-                fail_count += 1
-                failures.append((file, f"runner crashed: {exc!r}", {}))
-                _print_progress(
-                    tests_done, approx_total_tests, file, 1,
-                    time.monotonic() - started_at,
-                    repo_root, tests_passed, tests_failed,
-                    test_counts,
-                    subproc_wall=0.0,
-                )
-            return
+            outcome = getattr(exc, '_runner_child_outcome', None)
+            fpath, rc, subproc_wall = file, 1, time.monotonic() - started_at
+            if outcome is not None:
+                summary = dict(outcome['summary'], cleanup_failed=1)
+                output = (f"runner CLEANUP FAILED (child exited {outcome['returncode']}): {exc!r}\n"
+                          + outcome['stdout'] + outcome['stderr'] + outcome['diagnostic_text'])
+            else:
+                summary = {'counts_unknown': 1}
+                output = f"runner crashed: {exc!r}"
         with lock:
             files_done += 1
             tests_done += n_tests
@@ -2100,6 +2289,7 @@ def main() -> int:
             tests_failed += summary.get("failed", 0)
             tests_skipped += summary.get("skipped", 0)
             files_crashed += summary.get("crashed", 0)
+            files_unknown += summary.get('counts_unknown', 0)
             tests_collected += sum(
                 summary.get(k, 0)
                 for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
@@ -2161,7 +2351,10 @@ def main() -> int:
         f", {files_crashed} file{'s' if files_crashed != 1 else ''} CRASHED"
         if files_crashed else ""
     )
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{crashed_note}{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    unknown_note = f", body counts UNKNOWN for {files_unknown} files (other counts are observed only)" if files_unknown else ""
+    body_counts = (f"observed {tests_passed} passes, {tests_failed} failures" if files_unknown
+                   else f"{tests_passed} tests passed, {tests_failed} failed")
+    print(f"=== Summary: {len(files)} files, {body_counts}{crashed_note}{skipped_note}{unknown_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -2184,7 +2377,7 @@ def main() -> int:
     # The summary line above reads green at a glance ("0 failed ... 100%
     # complete"), which has been misread as a successful verification, so say
     # it plainly AND fail the exit code.
-    no_tests_ran_at_all = bool(files) and tests_collected == 0 and not files_crashed
+    no_tests_ran_at_all = bool(files) and tests_collected == 0 and not files_crashed and not files_unknown
     if no_tests_ran_at_all:
         print()
         print(
@@ -2255,10 +2448,20 @@ def main() -> int:
         crashed_files = [(f, o, s) for f, o, s in failures if s.get("crashed")]
         rest = [(f, s) for f, _o, s in failures if not s.get("crashed")]
         test_fail_files = [(f, s) for f, s in rest if s.get("failed", 0) > 0]
+        cleanup_failed_files = [(f, s) for f, s in rest if s.get('cleanup_failed')]
+        unknown_files = [(f, s) for f, s in rest if s.get('counts_unknown')]
         all_passed_but_nonzero = [(f, s) for f, s in rest
-                                  if s.get("failed", 0) == 0 and s.get("passed", 0) > 0]
+                                  if s.get("failed", 0) == 0 and s.get("passed", 0) > 0
+                                  and not s.get('cleanup_failed')]
         no_tests_ran = [(f, s) for f, s in rest
-                        if s.get("failed", 0) == 0 and s.get("passed", 0) == 0]
+                        if s.get("failed", 0) == 0 and s.get("passed", 0) == 0
+                        and not s.get('cleanup_failed') and not s.get('counts_unknown')]
+        if cleanup_failed_files:
+            print(f"=== {len(cleanup_failed_files)} files CLEANUP FAILED: child outcomes do not pass the canonical gate ===")
+            for file, _s in cleanup_failed_files:
+                print(f"  {_format_file(file, repo_root)}")
+        if unknown_files:
+            print(f"=== {len(unknown_files)} files: body counts UNKNOWN, not evidence that no tests ran ===")
         if crashed_files:
             print(f"=== {len(crashed_files)} file{'s' if len(crashed_files) != 1 else ''} where the interpreter CRASHED mid-run (native fault — a real bug, not a collection error; the tests that did run are not counted) ===")
             for file, output, _s in crashed_files:

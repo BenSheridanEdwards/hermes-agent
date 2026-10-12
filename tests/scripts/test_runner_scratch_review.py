@@ -30,6 +30,8 @@ def test_exited_owned_session_keeps_unreaped_identity_when_lookup_is_gone(tmp_pa
     from scripts.runner_scratch import claim_scratch_root
     import psutil
 
+    # This fixture owns no real PID. Model the added diagnostic-only census too.
+    monkeypatch.setattr(runner, '_session_snapshot', lambda pid: {'state': 'inert'})
     lease = claim_scratch_root(str(tmp_path / 'dead-session')).create_worker()
     pid = 12345
     proc = SimpleNamespace(pid=pid, poll=lambda: 0)
@@ -83,6 +85,8 @@ def test_unproven_session_still_vetoes_signalling_and_storage(tmp_path, monkeypa
     from scripts.runner_scratch import claim_scratch_root
     import psutil
 
+    # This fixture owns no real PID. Model the added diagnostic-only census too.
+    monkeypatch.setattr(runner, '_session_snapshot', lambda pid: {'state': 'inert'})
     lease = claim_scratch_root(str(tmp_path / 'uncertain-session')).create_worker()
     pid = 12345
     proc = SimpleNamespace(pid=pid, poll=lambda: 0)
@@ -136,6 +140,7 @@ def test_cleanup_diagnostic_preserves_stage_cause_and_consumer_veto(tmp_path, mo
     from scripts import run_tests_parallel as runner
     from scripts.runner_scratch import claim_scratch_root, worker_receipt
 
+    monkeypatch.setattr(runner, '_session_snapshot', lambda pid: {'state': 'inert'})
     lease = claim_scratch_root(str(tmp_path / 'diagnostic')).create_worker()
     pid = 12345
     events = []
@@ -187,6 +192,13 @@ def test_cleanup_diagnostic_preserves_stage_cause_and_consumer_veto(tmp_path, mo
                        env={}, timeout=30)
     assert result['returncode'] == 1
     assert result['stdout'] == 'original stdout' and result['stderr'] == 'original stderr'
+    facts = result['observations'][0]['cleanup_facts']
+    assert facts['owner'] == {'pid': pid, 'session_established': True}
+    if stage not in ('waitid/witness', 'getsid', 'getpgid'):
+        assert facts['killpg']['arguments'][0] == pid
+        assert facts['killpg']['snapshot'] == {'state': 'inert'}
+        assert facts['killpg']['native_audit_origin'] == 'unknown'
+    json.dumps(facts, allow_nan=False)
     diagnostic = result['cleanup_error']
     assert f'operation={stage}' in diagnostic
     assert 'earlier cleanup canary' in diagnostic
