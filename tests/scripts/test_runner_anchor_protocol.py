@@ -1,10 +1,53 @@
-"""Inert protocol contracts. Behavioral execution is held for safety review."""
+"""Inert protocol contracts with dependency-local fakes."""
+import asyncio
 import json
 import struct
+from types import SimpleNamespace
 
 import pytest
 
 from scripts import runner_anchor as anchor
+
+
+def _isolate_anchor_dependencies(patch):
+    # Rebinding the consumer's dependency is local; mutating the imported
+    # stdlib module also changes asyncio/pytest and survives into their teardown.
+    for name in ('select', 'time', 'threading', 'os', 'subprocess', 'sys'):
+        patch.setattr(anchor, name, SimpleNamespace(**vars(getattr(anchor, name))))
+    anchor.sys.path = list(anchor.sys.path)
+    from scripts import runner_scratch
+    # Receipt validation/reminting must see the same modeled process parent,
+    # without changing os.getpid/getppid for unrelated consumers.
+    patch.setattr(runner_scratch, 'os', anchor.os)
+
+
+def _assert_asyncio_loop_works():
+    loop = asyncio.new_event_loop()
+    try:
+        assert loop.run_until_complete(asyncio.sleep(0, result='real loop')) == 'real loop'
+    finally:
+        loop.close()
+    assert loop.is_closed()
+
+
+@pytest.fixture
+def local_anchor():
+    with pytest.MonkeyPatch.context() as patch:
+        _isolate_anchor_dependencies(patch)
+        yield patch
+    # Includes each former failing row, before normal canonical fixture teardown.
+    _assert_asyncio_loop_works()
+
+
+def test_asyncio_loop_creation_and_close_after_fake_scope():
+    with pytest.MonkeyPatch.context() as patch:
+        _isolate_anchor_dependencies(patch)
+        patch.setattr(anchor.select, 'kevent', lambda ident, **kwargs: {}, raising=False)
+        patch.setattr(anchor.select, 'kqueue', lambda: None, raising=False)
+        patch.setattr(anchor.time, 'monotonic', lambda: 5.0)
+        # Also prove unrelated consumers work while the local fakes are active.
+        _assert_asyncio_loop_works()
+    _assert_asyncio_loop_works()
 
 
 class Wire:
@@ -25,7 +68,8 @@ def frame(value):
 @pytest.mark.parametrize('payload', [b'', b'\x00', struct.pack('!I', 8) + b'{}',
                                     struct.pack('!I', 1000000),
                                     frame({'type': 'ready'}) + b''])
-def test_bounded_frame_rejects_missing_truncated_or_invalid_record(monkeypatch, payload):
+def test_bounded_frame_rejects_missing_truncated_or_invalid_record(local_anchor, payload):
+    monkeypatch = local_anchor
     monkeypatch.setattr(anchor.select, 'select', lambda *args: ([args[0][0]], [], []))
     if payload == frame({'type': 'ready'}):
         assert anchor.receive(Wire(payload), 10**20) == {'type': 'ready'}
@@ -36,7 +80,8 @@ def test_bounded_frame_rejects_missing_truncated_or_invalid_record(monkeypatch, 
             anchor.receive(Wire(payload), 10**20)
 
 
-def test_duplicate_json_keys_are_not_a_second_identity(monkeypatch):
+def test_duplicate_json_keys_are_not_a_second_identity(local_anchor):
+    monkeypatch = local_anchor
     raw = b'{"type":"ready","pid":1,"pid":2}'
     monkeypatch.setattr(anchor.select, 'select', lambda *args: ([args[0][0]], [], []))
     with pytest.raises(ValueError):
@@ -107,7 +152,8 @@ def test_timeout_closure_does_not_invent_worker_result():
 @pytest.mark.platforms('posix')
 @pytest.mark.parametrize('parent_dead,spawn_failure', [(False, False), (True, False), (False, True)])
 def test_helper_preserves_stdio_receipt_and_requires_parent_death_for_self_signal(
-        tmp_path, monkeypatch, parent_dead, spawn_failure):
+        tmp_path, local_anchor, parent_dead, spawn_failure):
+    monkeypatch = local_anchor
     import os
     import signal
     from types import SimpleNamespace
@@ -177,7 +223,8 @@ def test_helper_preserves_stdio_receipt_and_requires_parent_death_for_self_signa
 
 
 @pytest.mark.parametrize('event_kind', ['exit', 'none', 'foreign', 'error'])
-def test_parent_exit_watch_requires_bound_kernel_event(monkeypatch, event_kind):
+def test_parent_exit_watch_requires_bound_kernel_event(local_anchor, event_kind):
+    monkeypatch = local_anchor
     from types import SimpleNamespace
     calls = []
     constants = dict(KQ_FILTER_PROC=-5, KQ_EV_ADD=1, KQ_EV_ENABLE=4,

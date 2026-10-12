@@ -1,4 +1,4 @@
-"""Inert Darwin live-leader contracts. No executed RED/GREEN is claimed.
+"""Inert Darwin live-leader contracts with consumer-local dependencies.
 
 Adapted from the retained exhausted-child contract: a valid signal to a live
 owned anchor is required, not forbidden. Kernel calls and the helper peer are
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -17,7 +18,8 @@ import pytest
 
 
 @pytest.fixture
-def owned_model(tmp_path, monkeypatch):
+def owned_model(tmp_path):
+    monkeypatch = pytest.MonkeyPatch()
     import psutil
     from scripts import run_tests_parallel as runner
     from scripts import runner_anchor as wire
@@ -27,6 +29,21 @@ def owned_model(tmp_path, monkeypatch):
                             rc=0, live=False, events=[], procs={}, peers=[], threads=[],
                             waiting=threading.Event(), timeout=2,
                             stdout='=== 8 passed in 0.01s ===\n', stderr='raw stderr\n')
+    # Do not mutate the shared os/threading modules used by pytest, asyncio,
+    # multiprocessing or the live enclosing owner. Keep real unrelated APIs.
+    monkeypatch.setattr(runner, 'os', SimpleNamespace(**vars(os)))
+    runner.os.environ = dict(os.environ)
+    monkeypatch.setattr(runner, 'sys', SimpleNamespace(**vars(runner.sys)))
+    monkeypatch.setattr(runner, 'tempfile', SimpleNamespace(**vars(runner.tempfile)))
+
+    class ModelThread(threading.Thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            state.threads.append(self)
+
+    for consumer in (runner, wire):
+        monkeypatch.setattr(consumer, 'threading', SimpleNamespace(**vars(threading)))
+        monkeypatch.setattr(consumer.threading, 'Thread', ModelThread)
     owner = runner._ProcessOwner()
     state.owner, state.runner = owner, runner
     state.wait_condition, state.wait_pids = threading.Condition(), set()
@@ -189,7 +206,7 @@ def owned_model(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, '_HeldPopen', Process)
     monkeypatch.setattr(runner, '_process_owner', owner)
     monkeypatch.setattr(runner, '_live_leader_platform', lambda: True, raising=False)
-    monkeypatch.delenv(runner._OWNER_ENV, raising=False)
+    runner.os.environ.pop(runner._OWNER_ENV, None)
     monkeypatch.setattr(wire, 'HANDSHAKE_SECONDS', 0.2)
     monkeypatch.setattr(wire.AnchorChannel, 'wait_result', wait_result)
     monkeypatch.setattr(runner.os, 'waitid', waitid)
@@ -197,8 +214,17 @@ def owned_model(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.os, 'getpgid', getsid)
     monkeypatch.setattr(runner.os, 'killpg', killpg)
     monkeypatch.setattr(runner.os, 'waitpid', waitpid)
-    monkeypatch.setattr(psutil, 'pids', lambda: [state.pid, state.foreign, state.foreign + 1])
-    monkeypatch.setattr(psutil, 'process_iter', processes)
+    original_cleanup_iter = runner._cleanup_iter
+
+    def cleanup_iter(stage, pid, function, *args):
+        # _close imports psutil locally. Intercept its observation dependency at
+        # the existing runner seam, not on the shared process-inspection module.
+        if stage == 'observation.process_iter':
+            assert function is psutil.process_iter
+            function = processes
+        return original_cleanup_iter(stage, pid, function, *args)
+
+    monkeypatch.setattr(runner, '_cleanup_iter', cleanup_iter)
     monkeypatch.setattr(runner, '_session_snapshot', lambda pid: {
         'state': 'partial', 'unresolved': 1, 'members': []})
 
@@ -209,18 +235,39 @@ def owned_model(tmp_path, monkeypatch):
                          cwd=Path(runner.__file__).resolve().parent.parent, env={}, timeout=state.timeout)
 
     state.run = run
-    yield state
-    for proc in state.procs.values():
-        proc.stopped.set()
-    for control in state.peers:
-        try:
-            control.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        control.close()
-    for thread in state.threads:
-        thread.join(timeout=2)
-        assert not thread.is_alive(), 'inert fixture peer leaked'
+    try:
+        yield state
+    finally:
+        for proc in list(state.procs.values()):
+            proc.stopped.set()
+        for control in list(state.peers):
+            try:
+                control.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            control.close()
+        for thread in state.threads:
+            if thread.ident is not None:
+                thread.join(timeout=30)
+        # Join collectors/control readers/dispatchers as well as fixture peers.
+        # If quiescence fails, leave only the consumer-local inert dependencies
+        # installed: a failed test must never expose fake PIDs to native calls.
+        assert not any(thread.is_alive() for thread in state.threads), 'inert fixture thread leaked; fakes retained'
+        monkeypatch.undo()
+
+
+@pytest.mark.platforms('posix')
+def test_owned_fakes_leave_unrelated_asyncio_and_os_intact(owned_model):
+    import asyncio
+    assert owned_model.runner.os.killpg is not os.killpg
+    assert owned_model.runner.os.waitpid is not os.waitpid
+    assert owned_model.runner.os.environ is not os.environ
+    loop = asyncio.new_event_loop()
+    try:
+        assert loop.run_until_complete(asyncio.sleep(0, result='unrelated')) == 'unrelated'
+    finally:
+        loop.close()
+    assert loop.is_closed()
 
 
 @pytest.mark.platforms('posix')
@@ -323,6 +370,7 @@ def test_owner_cancellation_wakes_result_waiter_and_closes_before_delete(owned_m
     model.mode, model.timeout = 'cancelled', 10
     results = []
     thread = threading.Thread(target=lambda: results.append(model.run()))
+    model.threads.append(thread)
     thread.start()
     try:
         assert model.waiting.wait(2), 'worker did not enter result wait'
@@ -343,6 +391,7 @@ def test_registered_anchor_subtree_closes_before_containing_lease(owned_model):
     model.mode, model.timeout = 'cancelled', 10
     results = []
     root_thread = threading.Thread(target=lambda: results.append(model.run()))
+    model.threads.append(root_thread)
     root_thread.start()
     assert model.waiting.wait(2)
     parent = model.owner.nodes[0]
@@ -352,6 +401,7 @@ def test_registered_anchor_subtree_closes_before_containing_lease(owned_model):
     nested_thread = threading.Thread(target=lambda: results.append(model.owner.run(
         cmd=cmd, cwd=Path(runner.__file__).resolve().parent.parent,
         env={'HERMES_PYTHON': runner.sys.executable}, timeout=10, parent=parent)))
+    model.threads.append(nested_thread)
     nested_thread.start()
     try:
         with model.wait_condition:
@@ -391,13 +441,12 @@ def test_real_main_keeps_child_accounting_and_uncertain_cleanup_veto(
     monkeypatch.setattr(runner, '_off_host_marker_files', lambda files: {})
     monkeypatch.setattr(runner, '_save_durations', lambda *args: saved.append(args))
     monkeypatch.setattr(runner, '_FLAKY_RESULTS', [])
-    for key in ('TMPDIR', 'TMP', 'TEMP', 'PYTHONDONTWRITEBYTECODE'):
-        monkeypatch.setenv(key, os.environ.get(key, ''))
-    monkeypatch.setattr(runner.tempfile, 'tempdir', runner.tempfile.tempdir)
-    monkeypatch.setattr(runner.sys, 'dont_write_bytecode', runner.sys.dont_write_bytecode)
     task = tmp_path / 'actual-main'
-    monkeypatch.setattr(runner.sys, 'argv', ['run_tests_parallel.py', '--scratch-root', str(task),
-                        '-j', '1', '--file-retries', '2', '--files', 'inert.py', '--', '-q'])
+    # main reads its local sys.argv and passes explicit tokens to argparse.
+    # Keep current capture streams without changing the shared sys module.
+    runner.sys.stdout, runner.sys.stderr = sys.stdout, sys.stderr
+    runner.sys.argv = ['run_tests_parallel.py', '--scratch-root', str(task),
+                       '-j', '1', '--file-retries', '2', '--files', 'inert.py', '--', '-q']
     result = runner.main()
     text = capsys.readouterr().out
     assert '8 tests passed' in text and 'NO TESTS RAN' not in text
