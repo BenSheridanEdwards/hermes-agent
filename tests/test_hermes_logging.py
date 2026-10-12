@@ -22,37 +22,14 @@ from hermes_logging import RotatingFileHandler
 
 
 @pytest.fixture(autouse=True)
-def _reset_logging_state():
-    """Reset the module-level sentinel and clean up root logger handlers
-    added by setup_logging() so tests don't leak state.
+def _reset_logging_state(monkeypatch):
+    """Own test queues without closing the previous session's resources."""
+    from tests.scripts.fixtures.compatibility_logging import compatibility_logging_state
 
-    Under a shared-process run, other test modules may have called
-    setup_logging() in the same process, leaving RotatingFileHandlers on the
-    root logger.  We strip ALL RotatingFileHandlers before each test so the
-    count assertions are stable regardless of test ordering.
-    """
-    hermes_logging._logging_initialized = False
-    # File handlers now live behind the async QueueListener, not on the root
-    # logger; tear down any leaked from other tests in this process.
-    hermes_logging._reset_queued_handlers()
-    root = logging.getLogger()
-    prev_root_level = root.level
-    root.setLevel(logging.NOTSET)
-    # Snapshot the remaining (non-file) handlers so we can strip whatever the
-    # test adds.
-    pre_existing = list(root.handlers)
-    # Ensure the record factory is installed (it's idempotent).
-    hermes_logging._install_session_record_factory()
-    yield
-    # Restore — tear down async file logging + remove handlers added by the test.
-    hermes_logging._reset_queued_handlers()
-    for h in list(root.handlers):
-        if h not in pre_existing:
-            root.removeHandler(h)
-            h.close()
-    root.setLevel(prev_root_level)
-    hermes_logging._logging_initialized = False
-    hermes_logging.clear_session_context()
+    with compatibility_logging_state():
+        logging.getLogger().setLevel(logging.NOTSET)
+        hermes_logging._install_session_record_factory()
+        yield
 
 
 @pytest.fixture
@@ -715,6 +692,31 @@ class TestWindowsConcurrentLogLockTimeout:
         finally:
             handler.close()
 
+
+def test_compatibility_logging_scope_restores_listener_and_capture_after_failure(hermes_home, tmp_path, caplog):
+    from tests.scripts.fixtures.compatibility_logging import compatibility_logging_state
+
+    hermes_logging.setup_logging(hermes_home=hermes_home)
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    listener = hermes_logging._queue_listener
+    queue = hermes_logging._log_queue
+    files = hermes_logging._queued_file_handlers
+    with pytest.raises(RuntimeError, match='inert model failure'):
+        with compatibility_logging_state():
+            hermes_logging.setup_logging(hermes_home=tmp_path / 'model-home')
+            with caplog.at_level(logging.WARNING):
+                logging.getLogger('agent.compatibility').warning('capture stays active')
+            assert 'capture stays active' in caplog.text
+            raise RuntimeError('inert model failure')
+    assert root.handlers == handlers
+    assert hermes_logging._queue_listener is listener
+    assert hermes_logging._log_queue is queue
+    assert hermes_logging._queued_file_handlers is files
+    assert listener._thread.is_alive()
+    logging.getLogger('agent.compatibility').warning('prior listener resumed')
+    hermes_logging.flush_log_queue()
+    assert 'prior listener resumed' in (hermes_home / 'logs' / 'agent.log').read_text()
 
 
 class TestReadLoggingConfig:

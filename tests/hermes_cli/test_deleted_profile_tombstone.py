@@ -34,13 +34,39 @@ from hermes_constants import (
 from hermes_logging import setup_logging
 
 
+@pytest.fixture(autouse=True)
+def owned_logging(monkeypatch):
+    from tests.scripts.fixtures.compatibility_logging import compatibility_logging_state
+
+    # Join model listeners while test resolver/environment patches still exist.
+    with compatibility_logging_state():
+        yield
+
+
 @pytest.fixture()
 def profile_env(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    default_home = tmp_path / ".hermes"
+    import os
+    import hermes_constants as constants
+    import hermes_cli.profiles as profiles
+    from hermes_state_guard import _real_platform_state_root
+
+    real_home, native = os.environ['HOME'], _real_platform_state_root()
+    path_home = Path.home()
+    default_home = tmp_path / '.hermes'
     default_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(default_home))
-    return tmp_path
+    monkeypatch.setenv('HERMES_HOME', str(default_home))
+    monkeypatch.setattr(constants, '_get_platform_default_hermes_home', lambda: default_home)
+    monkeypatch.setattr(profiles, '_get_wrapper_dir', lambda: tmp_path / 'model-bin')
+    # This suite tests tombstone/filesystem behavior, not running gateways or
+    # service managers. Intercept their precise side-effect seams, never guards.
+    for name in ('_maybe_register_gateway_service', '_maybe_unregister_gateway_service',
+                 '_notify_multiplexer', '_stop_bot_desktop'):
+        monkeypatch.setattr(profiles, name, lambda *a, **kw: None)
+    monkeypatch.setattr(profiles, '_check_gateway_running', lambda *a, **kw: False)
+    monkeypatch.setattr(profiles, '_purge_identity', lambda *a, **kw: True)
+    yield tmp_path
+    assert os.environ['HOME'] == real_home and Path.home() == path_home
+    assert _real_platform_state_root() == native
 
 
 def _named_homes(tmp_path: Path) -> list[str]:

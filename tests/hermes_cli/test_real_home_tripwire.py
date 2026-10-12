@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import subprocess
+import runpy
 import sys
-import textwrap
+import tempfile
 
 import pytest
 
@@ -23,10 +23,11 @@ def protected_home(tmp_path, monkeypatch):
     root.mkdir()
     (root / "file.txt").write_text("unchanged", encoding="utf-8")
     (root / "empty").mkdir()
-    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [root])
-    yield root
-    # Restore access before tmp_path/pytest cleanup even when an assertion fails.
-    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [])
+    original_roots = list(conftest._REAL_HERMES_ROOT_CANDIDATES)
+    with monkeypatch.context() as model:
+        model.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [*original_roots, root])
+        yield root
+    # Only our disposable model is removed; native/sibling protection remains.
 
 
 def _open_close(path):
@@ -198,31 +199,56 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
-def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
-    """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
-    HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
-    sandbox, basetemp and every tempfile default inside the guarded root; the
-    conftest must drop Hermes' own export before anything allocates temp space."""
-    home = tmp_path / "home"
-    scratch = home / "cache" / "scratch"
-    scratch.mkdir(parents=True)
-    probe = tmp_path / "test_probe.py"
-    probe.write_text(textwrap.dedent(f"""
-        import tempfile
-        from pathlib import Path
+@pytest.mark.parametrize('exported', [True, False], ids=['reject-exported', 'retain-owned'])
+def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path, monkeypatch, exported):
+    """Execute the actual complete conftest body after supplying the bad input.
 
-        def test_temp_root_is_outside_the_honored_home():
-            home = Path({str(home)!r}).resolve()
-            assert not Path(tempfile.gettempdir()).resolve().is_relative_to(home)
+    The canonical parent must not scrub this input before the decision. No
+    subprocess, fake HOME, plugin disabling or extracted decision replica.
+    TMP/TEMP retain the owned worker as the safe real tempfile fallback.
+    """
+    import hermes_constants as constants
+    from hermes_state_guard import _real_platform_state_root
+    from tests.scratch_isolation import LEASE
+
+    native, real_home = _real_platform_state_root(), os.environ['HOME']
+    owned_temp = LEASE.worker if LEASE is not None else tmp_path / 'safe-temp'
+    if LEASE is None:
+        owned_temp.mkdir()
+    home = tmp_path / 'home'
+    scratch = home / 'cache' / 'scratch'
+    scratch.mkdir(parents=True)
+    before = dict(os.environ)
+    old_tempdir = tempfile.tempdir
+    old_prefix = sys.pycache_prefix
+    try:
+        with monkeypatch.context() as model:
+            # run_path installs collection-time resolvers by assignment. Capture
+            # their exact previous objects for restoration, not new substitutes.
+            model.setattr(constants, '_get_platform_default_hermes_home',
+                          constants._get_platform_default_hermes_home)
+            model.setattr(constants, 'named_profile_home', constants.named_profile_home)
+            os.environ['HERMES_HOME'] = str(home)
+            os.environ['TMPDIR'] = str(scratch if exported else owned_temp)
+            os.environ['TMP'] = os.environ['TEMP'] = str(owned_temp)
+            if exported:
+                os.environ['HERMES_SCRATCH_DIR'] = str(scratch)
+            else:
+                os.environ.pop('HERMES_SCRATCH_DIR', None)
+            # Assert input immediately before the real decision is loaded.
+            assert os.environ['TMPDIR'] == str(scratch if exported else owned_temp)
+            namespace = runpy.run_path(str(PROJECT_ROOT / 'tests/conftest.py'),
+                                      run_name='compatibility_conftest_decision')
+            assert namespace['_HERMES_EXPORTED_TMP'] == (str(scratch) if exported else '')
+            assert 'HERMES_SCRATCH_DIR' not in os.environ
+            assert Path(tempfile.gettempdir()) == owned_temp
             with tempfile.TemporaryDirectory() as made:
-                assert not Path(made).resolve().is_relative_to(home)
-        """), encoding="utf-8")
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("TMPDIR", "TMP", "TEMP", "HERMES_SCRATCH_DIR", "HERMES_TEST_SANDBOX_HOME")}
-    env.update(HERMES_HOME=str(home), TMPDIR=str(scratch), HERMES_SCRATCH_DIR=str(scratch))
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "tests.conftest", "-p", "no:cacheprovider", "-q", str(probe)],
-        cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "1 passed" in result.stdout
+                assert Path(made).is_relative_to(owned_temp)
+                assert not Path(made).is_relative_to(home)
+            assert os.environ['HOME'] == real_home
+            assert _real_platform_state_root() == native
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
+        tempfile.tempdir = old_tempdir
+        sys.pycache_prefix = old_prefix

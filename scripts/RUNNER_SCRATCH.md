@@ -63,8 +63,8 @@ No HOME substitution or production state-guard changes are made.
 
 Default rationale remains relevant: system temporary storage may be Linux tmpfs; hidden ancestors alter
 search semantics; long paths can exceed AF_UNIX limits. Explicit mode does not turn
-all suites into path-independent tests. Existing nested default-runner tests still
-need their own authorized environment; they are not silently skipped or redirected.
+all suites into path-independent tests. The compatibility fixtures below use explicit
+nested tasks. Their platform and crash-report limits need independent disposition.
 
 ## Historical correction-2 proposal, not execution approval
 
@@ -122,11 +122,50 @@ are not claimed; serial fixture use and unprivileged POSIX cleanup are the test 
   tempfile/cache child. This does not turn function-scoped guards into an import-time
   sandbox. Plugin startup and full source/venv/native pre/post footprints remain
   executor evidence, as do real timeout/grandchild cleanup and host platform results.
-- Existing default runner suites and tripwire's exported-temp subprocess need their
-  separate compatible execution gate. They were not run, modified, or silently skipped.
+- Compatibility fixture changes below replace the earlier default-runner and bare-pytest
+  paths. Their new workload remains unexecuted pending its separate safety gate.
 
 This remains a Python test tripwire, not an OS sandbox against malicious same-user
 code or arbitrary native/subprocess writes. Existing open-descriptor/native-library
 limits and check/use races are not claimed solved. The runner is the trusted receipt
 producer; the receipt is identity binding, not a secret credential. Independent
 review must examine this boundary and bind the complete source before execution.
+
+## Contained compatibility candidate, not runtime evidence
+
+The compatibility authoring increment routes every nested runner through the real
+canonical shell, using a new exclusively claimed task and the prepared interpreter.
+No miniature runner remains, so no copied helper can silently drift or be omitted.
+Normal conftest and plugin discovery apply to external generated probes. Witnesses,
+retry markers, process receipts, pytest cache and duration outputs live in the new
+task; no fixture writes them into a parent worker from a nested worker.
+
+The grandchild test retains real process-group cleanup with no bypass marker. It
+records PID/creation/session/group identity, bounds the child to 45 seconds, and
+requests failure cleanup through a private stop file rather than a PID-only signal.
+Success must precede self-expiry. Original failure and cleanup failure both survive.
+The real SIGSEGV contract remains present and unexecuted. OS crash-report writes
+cannot be confined by TMPDIR or a Python guard; its workload requires a separate
+explicit boundary disposition, not an undocumented filter or a replacement signal.
+
+Kanban negatives now use disposable models with real connect, zero downstream
+SQLite calls and preserved bytes/rows/sidecar inventory. The normal native/sibling
+I/O guard stays installed. Exported-temp coverage executes the complete actual
+conftest body after supplying the export, rather than letting the shell scrub the
+input first. An owned-positive case and environment/resolver restoration accompany
+that negative. Default scratch selection is called with inert I/O dependencies,
+not a globally patched os module or an actual shared temporary directory.
+
+Logging and profile deletion reuse the reviewed queue owner with pytest capture
+handlers preserved. Profile deletion resolves a disposable default-home model,
+keeps HOME and Path.home intact, and stubs explicit service/process side-effect
+seams. This does not verify service teardown or durable identity settlement.
+Atomic-writer tests remain unchanged: their concrete targets are already inert.
+
+Open implementation boundary: explicit --scratch-root rejects hosts without
+getuid. The new nested launcher therefore cannot preserve native-Windows runner
+coverage yet. Do not mark those tests POSIX-only to hide this regression or invoke
+an uncontained Windows default path. The frozen runner/lease scope requires an
+explicit disposition for a supported Windows containment path before this increment
+can be considered cross-platform compatible or merge-ready. No new compatibility
+tests have run; correction-4's 151 passes are evidence only for its earlier head.
