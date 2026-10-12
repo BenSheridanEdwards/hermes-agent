@@ -1,0 +1,2 @@
+# Explicit collection seed for tests.scripts.fixtures.shell_canary.
+# The real failing Python module is created in the canonical nested task.

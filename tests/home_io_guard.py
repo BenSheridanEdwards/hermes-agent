@@ -60,7 +60,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, metadata_operation=None):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -97,8 +97,12 @@ class HomeIOGuard:
             if self.scratch is not None:
                 task = _normcase(os.fspath(self.scratch.task))
                 if _within(absolute, task):
-                    if (not self.scratch.allows(absolute, roots)
-                            or (destructive and absolute == task)):
+                    allowed = self.scratch.allows(absolute, roots)
+                    if (not allowed and metadata and not destructive
+                            and metadata_operation in ('stat', 'lstat', 'readlink')):
+                        allowed = self.scratch.allows_missing_metadata(
+                            absolute, roots, operation=metadata_operation)
+                    if not allowed or (destructive and absolute == task):
                         self.refuse(value)
                     return
                 # realpath/mkdir traverses ancestors. Only metadata on the
@@ -186,7 +190,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               metadata_operation=name if module is os and metadata else None)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)

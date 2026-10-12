@@ -174,6 +174,32 @@ can be considered cross-platform compatible or merge-ready. No new compatibility
 tests ran at the earlier source-only handoff. Current execution status is stated
 at the top of this document; correction-4's 151 passes belong only to its earlier head.
 
+## Bounded dangling-marker metadata and shell fixture repair
+
+A separate operation-aware lease predicate permits only stat, lstat and readlink
+of a contained dangling leaf link. Every existing component and link target is
+checked inside the original task, outside nested deny roots, without erasing
+parent traversal. A parent alias must reach an existing owned directory; an
+absent final target suffix is allowed only after that proof. Cycles, excessive
+link depth, escapes, missing outside targets, multiply-linked regular targets,
+non-ENOENT uncertainty and changed task/worker/HOME identity remain refusals.
+The following stat must still return ENOENT. The original production profile
+identity functions and their dangling config.yaml regression remain unchanged.
+
+This does not change contains/allows, the Kanban allowance, generic metadata=True,
+access(), reads, writes, SQLite or destructive operations. The installed wrappers
+supply the concrete operation; no environment or test marker grants the exception.
+It does not make Python path validation atomic against hostile concurrent swaps.
+
+The shell failure fixture uses an explicitly selected non-Python collection seed.
+A test-only pytest collector materializes the actual failing source in the newly
+claimed nested task, then returns a normal pytest Module. Normal canonical
+worker receipts, plugins, fixtures, limits and lifecycle remain in place. No
+parent-source allowance or alternate pytest executor is introduced. The actual
+PATHEXT assertion, executed witness and intentional failure remain; parent checks
+also require nested source ownership, exact failure exit and no INTERNALERROR.
+These B2/G2 changes require affected source-safety clearance before runtime tests.
+
 ## Composed cancellation source candidate
 
 Explicit workers and nested canonical wrappers now request launches from the

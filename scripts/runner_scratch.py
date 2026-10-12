@@ -5,6 +5,7 @@ No production guard imports, HOME rewriting, or environment-based bypass.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,11 @@ import stat
 import sys
 import tempfile
 
-# Capture before pytest installs file wrappers. Only for selected directory
-# identity, never for opening protected state through those wrappers.
+# Capture before pytest installs file wrappers. Used for lease identity and
+# the operation-specific, contained missing-marker proof, never data reads.
 _STAT = os.stat
 _LSTAT = os.lstat
+_READLINK = os.readlink
 
 
 def native_root() -> Path:
@@ -176,6 +178,81 @@ class ScratchLease:
             if root.is_relative_to(self.task) and (path.is_relative_to(root) or resolved.is_relative_to(root)):
                 return False
         return True
+
+    def allows_missing_metadata(self, value, roots, *, operation: str) -> bool:
+        """Only stat/lstat/readlink of a proven contained dangling leaf link.
+
+        A following stat must still report missing, and no data operation gains
+        the general lease allowance. Inspect the whole chain, not realpath's
+        best-effort missing suffix. This is a cooperative guard, not atomic path
+        pinning against concurrent hostile replacement.
+        """
+        if operation not in ('stat', 'lstat', 'readlink'):
+            return False
+        try:
+            self.verify()
+            denied = tuple(Path(root) for root in roots if Path(root).is_relative_to(self.task))
+            seen = set()
+
+            def checked(path):
+                if not path.is_absolute():
+                    path = Path.cwd() / path
+                if ('..' in path.parts or not path.is_relative_to(self.task)
+                        or any(path.is_relative_to(root) for root in denied)):
+                    raise ValueError('metadata chain leaves owned allowance')
+                return path
+
+            def walk(path):
+                path = checked(path)
+                current = self.task
+                parts = path.relative_to(self.task).parts
+                info = _LSTAT(current)
+                for index, part in enumerate(parts):
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ValueError('metadata parent is not a directory')
+                    current = checked(current / part)
+                    try:
+                        info = _LSTAT(current)
+                    except FileNotFoundError as exc:
+                        if exc.errno != errno.ENOENT:
+                            raise
+                        # No unresolved parent alias reached this suffix: each
+                        # previous component was inspected without following it.
+                        return checked(current.joinpath(*parts[index + 1:])), None, False
+                    if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                        raise ValueError('metadata target has multiple links')
+                    if stat.S_ISLNK(info.st_mode):
+                        if current in seen or len(seen) >= 40:
+                            raise ValueError('metadata link cycle or depth limit')
+                        seen.add(current)
+                        target = Path(_READLINK(current))
+                        if not target.is_absolute():
+                            target = current.parent / target
+                        resolved, target_info, _ = walk(target)
+                        if index == len(parts) - 1:
+                            return resolved, target_info, True
+                        # A dangling parent is not a missing marker. Existing
+                        # owned directory aliases can continue to a leaf link.
+                        if target_info is None or not stat.S_ISDIR(target_info.st_mode):
+                            raise ValueError('metadata parent alias is unresolved')
+                        current, info = resolved, target_info
+                return current, info, False
+
+            path = checked(Path(os.fsdecode(value)))
+            _, info, leaf_link = walk(path)
+            if not leaf_link or info is not None:
+                return False
+            try:
+                _STAT(path)
+            except FileNotFoundError as exc:
+                if exc.errno != errno.ENOENT:
+                    return False
+            else:
+                return False
+            self.verify()
+            return True
+        except (OSError, ValueError, RuntimeError):
+            return False
 
     def ancestor_metadata(self, value) -> bool:
         path = Path(os.fsdecode(value))
