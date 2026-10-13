@@ -12,6 +12,8 @@
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
 #   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
+#   * Caller-selected TMPDIR / PYTHONPYCACHEPREFIX / PYTHONDONTWRITEBYTECODE
+#     survive env -i. Create writable scratch/cache directories before calling.
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -36,6 +38,27 @@ set -euo pipefail
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# These standard location/cache controls are deliberately narrow: no credential
+# or arbitrary Python environment forwarding. Validate selected directories so
+# tempfile cannot silently fall back outside the caller's scratch boundary.
+LOCATION_ENV=()
+for _location_var in TMPDIR PYTHONPYCACHEPREFIX; do
+  if [ -n "${!_location_var:-}" ]; then
+    case "${!_location_var}" in
+      /*|[a-zA-Z]:[\\/]*) ;;
+      *) echo "error: $_location_var must be an absolute directory" >&2; exit 2 ;;
+    esac
+    if [ ! -d "${!_location_var}" ] || [ ! -w "${!_location_var}" ]; then
+      echo "error: $_location_var must be an existing writable directory" >&2
+      exit 2
+    fi
+    LOCATION_ENV+=("$_location_var=${!_location_var}")
+  fi
+done
+if [ -n "${PYTHONDONTWRITEBYTECODE:-}" ]; then
+  LOCATION_ENV+=("PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE")
+fi
 
 # ── Locate python ───────────────────────────────────────────────────────────
 # Probe local venvs first; fall back to the Nix devShell's editable venv
@@ -162,8 +185,13 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+# compileall writes explicitly even under PYTHONDONTWRITEBYTECODE. Honour the
+# caller's no-cache contract here as well as in the interpreter subprocesses.
+# Otherwise compileall inherits PYTHONPYCACHEPREFIX, if selected, just like imports.
+if [ -z "${PYTHONDONTWRITEBYTECODE:-}" ]; then
+  echo "▶ pre-compiling bytecode cache"
+  "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+fi
 
 echo "▶ launching test runner"
 exec env -i \
@@ -171,6 +199,7 @@ exec env -i \
   HOME="$HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
+  ${LOCATION_ENV[@]+"${LOCATION_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
