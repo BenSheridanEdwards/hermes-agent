@@ -15,6 +15,8 @@ behaviours that make the feature work:
 from __future__ import annotations
 
 import time
+import shlex
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -94,14 +96,13 @@ class TestCaching:
     def test_token_is_cached_between_calls(self):
         """Without caching the command would run on every request."""
         # A command whose output changes each run: equal results prove caching.
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(f"{shlex.quote(sys.executable)} -c 'import uuid; print(uuid.uuid4())'", "dbx")
         assert source() == source()
 
     def test_expired_token_is_reminted(self):
-        # date +%s%N changes every run; $RANDOM would be bash-only (empty
-        # under dash, which is what /bin/sh is on Debian-family CI).
+        # A portable real command: BSD date leaves %N literal within a second.
         source = CommandTokenSource(
-            """printf '{"access_token":"tok-%s","expires_in":3600}' "$(date +%s%N)" """,
+            shlex.quote(sys.executable) + " -c " + shlex.quote('import uuid,json; print(json.dumps({"access_token":str(uuid.uuid4()),"expires_in":3600}))'),
             "dbx",
         )
         first = source()
@@ -119,7 +120,7 @@ class TestCaching:
         """
         from agent.command_token_source import _NO_TTL_REFRESH_SECONDS
 
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(f"{shlex.quote(sys.executable)} -c 'import uuid; print(uuid.uuid4())'", "dbx")
         first = source()
         assert 0 < source._expires_at - time.monotonic() <= _NO_TTL_REFRESH_SECONDS
         assert source() == first  # cached inside the window

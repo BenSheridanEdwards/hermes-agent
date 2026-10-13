@@ -295,9 +295,16 @@ async def list_credential_pool():
 
     def _run():
         providers = []
+        from agent.credential_policy import load_policy
+        from hermes_cli.credential_authority import providers_for_environment
+        policy = load_policy()
+        provider_ids = set(read_credential_pool())
+        if policy:
+            for name in policy.environment:
+                provider_ids.update(providers_for_environment(name))
         # read_credential_pool(None) lists every provider with pooled entries;
         # load_pool() gives the rich PooledCredential objects per provider.
-        for provider_id in sorted(read_credential_pool().keys()):
+        for provider_id in sorted(provider_ids):
             try:
                 pool = load_pool(provider_id)
             except Exception:
@@ -307,6 +314,7 @@ async def list_credential_pool():
             if entries:
                 providers.append({
                     "provider": provider_id,
+                    "editable": policy is None,
                     "entries": [_pool_entry_summary(e, i) for i, e in enumerate(entries, start=1)],
                 })
         return {"providers": providers}
@@ -331,6 +339,8 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
         raise HTTPException(status_code=400, detail="provider and api_key are required")
 
     def _run():
+        from hermes_cli.credential_authority import require_web_credential_authority
+        require_web_credential_authority()
         try:
             pool = load_pool(provider)
             label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
@@ -392,6 +402,8 @@ async def remove_credential_pool_entry(provider: str, index: int):
     provider = (provider or "").strip().lower()
 
     def _run():
+        from hermes_cli.credential_authority import require_web_credential_authority
+        require_web_credential_authority()
         try:
             pool = load_pool(provider)
             removed = pool.remove_index(index)

@@ -166,7 +166,11 @@ async def test_websocket_loop_keeps_an_idle_connection_whose_pong_returns(monkey
     async def idle_anext():
         await asyncio.Event().wait()  # a quiet channel: no data frames
 
+    probes_observed = asyncio.Event()
+
     async def pong():
+        if sockets[0].pings >= 3:
+            probes_observed.set()
         return None  # the relay answers the probe
 
     def fake_connect(*args, **kwargs):
@@ -182,7 +186,7 @@ async def test_websocket_loop_keeps_an_idle_connection_whose_pong_returns(monkey
     task = asyncio.create_task(adapter._websocket_loop())
     try:
         # Several idle bounds pass; each must be answered by a probe, not a reconnect.
-        await asyncio.sleep(0.4)
+        await asyncio.wait_for(probes_observed.wait(), timeout=5.0)
         # Observed while the loop is still running: teardown below closes it.
         still_open = bool(sockets) and not sockets[0].exited
     finally:

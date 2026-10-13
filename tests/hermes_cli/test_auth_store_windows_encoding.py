@@ -151,7 +151,7 @@ class TestExplicitEncodingPassed:
         _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
 
         with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
+            Path, "read_text", autospec=True, side_effect=Path.read_text
         ) as spy:
             auth._load_auth_store(auth_path)
 

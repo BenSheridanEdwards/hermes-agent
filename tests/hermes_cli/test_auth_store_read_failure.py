@@ -6,8 +6,8 @@ roughly fifteen places, so an ``OSError`` (EMFILE under fd exhaustion, EACCES,
 EIO, a stalled mount) followed by any ``_save_auth_store`` rewrote auth.json
 with an empty provider set and destroyed every stored credential.
 
-Genuine corruption still degrades, still preserves a copy, and now only claims
-to have preserved one when the copy actually landed.
+Present corruption now also fails closed, preserving the original bytes.
+Neither empty-store recovery nor extra credential copies are implicit repairs.
 """
 
 import errno
@@ -17,6 +17,7 @@ import logging
 import pytest
 
 import hermes_cli.auth as auth
+from agent.credential_policy import CredentialPolicyError
 
 
 @pytest.fixture
@@ -50,7 +51,7 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     before = store_file.read_bytes()
     monkeypatch.setattr(Path, "read_text", _fail_read(exc))
 
-    with pytest.raises(OSError):
+    with pytest.raises(CredentialPolicyError, match="Credential store is invalid or unreadable"):
         auth._load_auth_store(store_file)
 
     assert store_file.read_bytes() == before, "the store on disk was modified"
@@ -59,15 +60,14 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     )
 
 
-def test_unparseable_json_still_degrades_and_preserves_a_copy(store_file):
+def test_unparseable_json_fails_closed_and_preserves_the_original(store_file):
     store_file.write_text("{ not json", encoding="utf-8")
 
-    result = auth._load_auth_store(store_file)
-
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    with pytest.raises(CredentialPolicyError, match="Credential store is invalid or unreadable"):
+        auth._load_auth_store(store_file)
     corrupt = store_file.with_suffix(".json.corrupt")
-    assert corrupt.exists(), "genuine corruption must still be preserved"
-    assert corrupt.read_text(encoding="utf-8") == "{ not json"
+    assert not corrupt.exists(), "a consumer must not create another credential holder"
+    assert store_file.read_text(encoding="utf-8") == "{ not json"
 
 
 def test_healthy_store_is_returned_unchanged(store_file):
@@ -89,10 +89,11 @@ def test_log_does_not_claim_a_backup_that_was_not_written(
     monkeypatch.setattr(shutil, "copy2", _no_copy)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
-        result = auth._load_auth_store(store_file)
+        with pytest.raises(CredentialPolicyError):
+            auth._load_auth_store(store_file)
 
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    assert store_file.read_text(encoding="utf-8") == "{ not json"
     assert not store_file.with_suffix(".json.corrupt").exists()
     text = caplog.text
-    assert "could NOT be preserved" in text
+    assert "secret" not in text
     assert "Corrupt file preserved at" not in text

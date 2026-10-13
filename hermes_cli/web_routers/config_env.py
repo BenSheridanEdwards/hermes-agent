@@ -22,6 +22,8 @@ from hermes_cli.web_server_profiles import (
 from fastapi import HTTPException, Request
 from hermes_cli.config import DEFAULT_CONFIG, OPTIONAL_ENV_VARS, read_raw_config, custom_endpoint_key_env, coerce_provider_id, find_provider_entry, redact_key, _deep_merge
 from hermes_cli.web_models import ConfigUpdate, EnvVarUpdate, EnvVarDelete, EnvVarReveal, CustomEndpointUpdate
+from agent.credential_policy import CredentialPolicyError, load_policy
+from hermes_cli.credential_authority import environment_status
 from typing import Any, Dict, List, Optional, Tuple
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -61,6 +63,8 @@ def _env_write_errors(log_msg: str, *, http_passthrough: bool):
     becomes 500 "Internal server error"."""
     try:
         yield
+    except CredentialPolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except HTTPException:
         if http_passthrough:
             raise
@@ -221,6 +225,14 @@ async def get_env_vars(profile: Optional[str] = None):
 def _get_env_vars_sync(profile: Optional[str] = None):
     with _profile_scope(profile):
         env_on_disk = load_env()
+        policy = load_policy()
+        # Resolve scoped effective delivery before leaving the selected profile.
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        names = set(env_on_disk) | set(OPTIONAL_ENV_VARS)
+        names.update(n for p in PROVIDER_REGISTRY.values() for n in (p.api_key_env_vars or ()))
+        if policy:
+            names.update(policy.managed_environment)
+        assigned = {name: environment_status(policy, name) for name in names}
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
 
@@ -248,6 +260,7 @@ def _get_env_vars_sync(profile: Optional[str] = None):
             # True for a .env key in no catalog at all — an arbitrary/custom var
             # the user added directly, listed so the Keys page can manage it.
             "custom": custom,
+            **(assigned.get(var_name) or {}),
         }
 
     result = {}
@@ -261,7 +274,7 @@ def _get_env_vars_sync(profile: Optional[str] = None):
     # default (is_password=True -> redacted, reveal-gated) since an
     # unrecognised key could hold anything. Channel-managed credentials belong
     # to the Channels page. A key added via "add a custom key" round-trips here.
-    for var_name in env_on_disk:
+    for var_name in set(env_on_disk) | (set(policy.managed_environment) if policy else set()):
         if var_name in result or var_name in channel_keys:
             continue
         row = _row(var_name, {}, custom=True)

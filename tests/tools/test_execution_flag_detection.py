@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import time
 
+import sys
+import tempfile
+
 import pytest
 
 from tools.approval import detect_dangerous_command, detect_hardline_command
@@ -49,10 +52,12 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "man" and sys.platform != "linux":
+        pytest.skip("this integration exercises GNU man pager flags; Darwin ships BSD man")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
-    payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
+    payload.write_text("#!/bin/sh\nprintf executed >> \"$MARKER\"\ncat\n")
     payload.chmod(0o755)
     input_file = tmp_path / "input.txt"
     input_file.write_text("needle\n")
@@ -70,11 +75,32 @@ def test_real_binaries_execute_leading_dash_program_payload(
     }
     argv = [tool, *resolved_args]
     if needs_tty:
-        argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        argv = (["script", "-q", "/dev/null", *argv] if sys.platform == "darwin"
+                else ["script", "-qec", shlex.join(argv), "/dev/null"])
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    # We prove invocation, not successful compression/pager completion. The
+    # marker's cat is deliberately not a compressor; waiting for its inherited
+    # pipes can hang even after subprocess.run(timeout=...) kills the parent.
+    # Feed a file (no pipe backpressure), then reap our owned process. Appending
+    # markers avoids racing the several compressor children truncating a file.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as feed:
+        feed.write(input_text or "")
+        feed.seek(0)
+        process = subprocess.Popen(argv, stdin=feed, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 20
+            while not (marker.exists() and "executed" in marker.read_text(encoding="utf-8")) and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
 
-    assert marker.read_text() == "executed"
+    assert "executed" in marker.read_text()
 
 
 @pytest.mark.parametrize(

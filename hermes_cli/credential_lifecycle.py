@@ -182,6 +182,9 @@ def save_provider_env_credential(env_var: str, value: str) -> Dict[str, Any]:
     """
     from hermes_cli.config import load_env, save_env_value
 
+    from hermes_cli.credential_authority import require_local_credential_authority
+    require_local_credential_authority(env_var)
+
     old_value = load_env().get(env_var)
     save_env_value(env_var, value)
 
@@ -204,6 +207,9 @@ def remove_provider_env_credential(env_var: str) -> Dict[str, Any]:
     """Remove a credential from EVERY store: ``.env`` (and process env), env-seeded
     ``credential_pool`` entries, model-cache rows, config.yaml mirrors of the same value."""
     from hermes_cli.config import load_env, remove_env_value
+
+    from hermes_cli.credential_authority import require_local_credential_authority
+    require_local_credential_authority(env_var)
 
     old_value = load_env().get(env_var)
     removed_from_env = remove_env_value(env_var)

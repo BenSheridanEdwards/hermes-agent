@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 
 import pytest
 
 
 @pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
+    sys.platform != "linux", reason="abstract Unix sockets are a Linux kernel facility"
 )
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
@@ -63,14 +64,20 @@ async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
 
     import gateway.systemd_notify as notify_mod
 
-    monkeypatch.setattr(
-        notify_mod, "notify", lambda message: calls.append(message) or True
-    )
+    heartbeat_observed = asyncio.Event()
+
+    def record_notify(message):
+        calls.append(message)
+        if message == "WATCHDOG=1":
+            heartbeat_observed.set()
+        return True
+
+    monkeypatch.setattr(notify_mod, "notify", record_notify)
     watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=1.0)
 
     assert watchdog.start() is True
     assert watchdog.ready("Gateway running") is True
-    await asyncio.sleep(0.04)
+    await asyncio.wait_for(heartbeat_observed.wait(), timeout=5.0)
     await watchdog.stop()
 
     assert any(message.startswith("READY=1") for message in calls)

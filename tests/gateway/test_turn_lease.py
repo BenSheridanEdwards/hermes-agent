@@ -201,7 +201,7 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
     )
     assert holder is not None
-    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "30")
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
     runner.session_store.load_transcript.side_effect = AssertionError(
@@ -214,7 +214,9 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation = AsyncMock()
 
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        # Include dispatch/fixture startup under load; still far below the
+        # inactivity timeout, so confusing the two clocks continues to fail.
+        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
     finally:
         assert runner._turn_leases.release(holder) is True
 

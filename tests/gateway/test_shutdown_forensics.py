@@ -91,6 +91,9 @@ class TestFormatters:
 class TestSpawnAsyncDiagnostic:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
     def test_spawns_subprocess_and_writes_output(self, tmp_path):
+        import shutil
+        if shutil.which("timeout") is None:
+            pytest.skip("real diagnostic requires GNU timeout; no substitute executable")
         log_path = tmp_path / "diag.log"
         pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)
         assert pid is not None and pid > 0

@@ -3,7 +3,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
+
+// These are Node unit tests of the probe contract, not Electron integration.
+// Importing electron's binary locator must not be required to test a rejected
+// decode. A throwing native boundary exercises the documented fail-soft path.
+vi.mock('electron', () => ({ nativeImage: { createFromPath: () => { throw new Error('decode rejected') } } }))
 
 import { appIconCandidates, decodingFileProbe, resolveAppIcon } from './app-icon'
 

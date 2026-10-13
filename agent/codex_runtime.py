@@ -920,6 +920,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
+        from agent.credential_policy import check_managed_codex_client
+        check_managed_codex_client(getattr(agent, "_credential_pool", None), active_client)
         return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
 
     def _log_failure(exc: BaseException) -> None:

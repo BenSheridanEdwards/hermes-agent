@@ -647,6 +647,14 @@ if _argv_selects_acp():
 # Profile flags have already been stripped above, so the first remaining argument is the authoritative
 # argparse subcommand. Dotenv/managed config still loads; only external secret fetches are unnecessary for
 # installation maintenance. See #73381.
+# This literal metadata query has no credential reads, writes, or provider I/O.
+# It must remain usable to repair an incomplete authority publication. Do not
+# exempt auth/config commands generally: their credential policy still applies.
+if sys.argv[1:] == ["auth", "policy-capabilities"]:
+    from agent.credential_policy import capabilities_command as _policy_capabilities
+    _policy_capabilities(None)
+    raise SystemExit(0)
+
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
     load_external_secrets=sys.argv[1:2] != ["update"],

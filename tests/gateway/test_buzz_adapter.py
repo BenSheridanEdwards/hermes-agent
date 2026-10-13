@@ -4206,12 +4206,16 @@ class TestInboundMediaAuthorizationGate:
     async def test_live_media_redacts_long_path_before_bounding(self, tmp_path):
         parent = tmp_path
         private_parts = []
+        # Exceed the 900-character diagnostic bound without exceeding Darwin's
+        # 1024-byte pathname limit. Keep this a real-file redaction test.
+        width = (940 - len(str(tmp_path)) - 6 * len("/private-0-")) // 6
         for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
+            part = f"private-{index}-" + ("x" * width)
             private_parts.append(part)
             parent = parent / part
             parent.mkdir()
         media = parent / "handoff.txt"
+        assert 900 < len(str(media)) < 1000
         media.write_text("safe handoff", encoding="utf-8")
         adapter = _make_adapter()
         adapter._run_cli = AsyncMock(

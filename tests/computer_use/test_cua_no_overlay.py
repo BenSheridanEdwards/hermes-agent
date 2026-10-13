@@ -227,7 +227,8 @@ class TestMcpArgsOverlayFlag:
 
 
 class TestEmbeddedDaemonOverlayFlag:
-    def test_serve_process_disables_overlay_when_policy_requires_it(self):
+    @patch("tools.computer_use.cua_backend_daemon.sys.platform", "linux")
+    def test_linux_serve_process_disables_overlay_when_policy_requires_it(self):
         daemon = cua_backend._EmbeddedCuaDaemon("/usr/bin/cua-driver", "unrestricted")
         process = MagicMock()
         process.poll.return_value = None

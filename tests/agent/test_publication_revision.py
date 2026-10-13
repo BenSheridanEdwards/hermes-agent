@@ -71,6 +71,27 @@ def test_publication_stages_never_fall_back_to_an_older_grant(tmp_path, state):
     assert json.loads(policy.read_text(encoding="utf-8")) == data
 
 
+def test_capabilities_are_available_during_incomplete_publication(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    root = tmp_path / '.hermes'
+    home = root / 'profiles' / 'one'
+    home.mkdir(parents=True)
+    assignment = home / 'assignments.json'
+    publication = root / 'authority-publication.json'
+    (home / 'config.yaml').write_text(f'credential_policy:\n  file: {assignment}\n', encoding='utf-8')
+    assignment.write_text(json.dumps({'version': 2, 'profile': 'one', 'environment': {}, 'accounts': {}, 'managed_environment': [], 'publication': {'file': str(publication), 'revision': 1}}), encoding='utf-8')
+    publication.write_text(json.dumps({'version': 1, 'revision': 1, 'state': 'publishing'}), encoding='utf-8')
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, '-m', 'hermes_cli.main', '--profile', 'one', 'auth', 'policy-capabilities'], cwd=repo,
+        env={'HOME': str(tmp_path), 'PATH': os.environ.get('PATH', ''), 'PYTHONPATH': str(repo), 'PYTHONDONTWRITEBYTECODE': '1'},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['credential_policy'] == 2
+
+
 def test_revision_two_requires_coherent_republication_and_retains_revocations(tmp_path):
     home, policy, gate, data = setup(tmp_path)
     original = load_policy(home)

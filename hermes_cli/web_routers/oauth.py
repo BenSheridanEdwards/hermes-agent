@@ -21,6 +21,7 @@ from hermes_cli.web_server_oauth import (
 )
 from hermes_cli.web_models import OAuthSubmitBody
 from hermes_cli.web_routers._common import scoped_to_thread
+from hermes_cli.credential_authority import assigned_oauth_status, require_web_credential_authority
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -239,6 +240,7 @@ def _codex_full_login_worker(session_id: str) -> None:
             if _codex_cancelled(sess, session_id, " before token save"):
                 return
             with _profile_scope(session_profile):
+                require_web_credential_authority()
                 _save_codex_tokens(tokens)
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
@@ -499,14 +501,16 @@ async def list_oauth_providers(profile: Optional[str] = None):
     def _run():
         providers = []
         for p in _build_oauth_catalog():
-            status = _resolve_provider_status(p["id"], p.get("status_fn"))
+            assigned = assigned_oauth_status(p["id"])
+            status = assigned if assigned is not None else _resolve_provider_status(p["id"], p.get("status_fn"))
             disconnect_hint = _oauth_provider_disconnect_hint(p, status)
             providers.append({
                 "id": p["id"], "name": p["name"], "flow": p["flow"],
                 "cli_command": _external_process_cli_command(p["id"], p["cli_command"]),
                 "docs_url": p["docs_url"], "disconnect_hint": disconnect_hint,
                 "disconnect_command": _oauth_provider_disconnect_command(p),
-                "disconnectable": disconnect_hint is None, "status": status,
+                "disconnectable": assigned is None and disconnect_hint is None, "status": status,
+                "editable": assigned is None,
             })
         return {"providers": providers}
 
@@ -545,6 +549,7 @@ async def disconnect_oauth_provider(provider_id: str, request: Request, profile:
 
     def _run():
         catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
+        require_web_credential_authority()
         provider = catalog_by_id.get(provider_id)
         if provider is None:
             raise HTTPException(400, f"Unknown provider: {provider_id}. Available: {', '.join(sorted(catalog_by_id))}")
@@ -599,6 +604,7 @@ async def start_oauth_login(provider_id: str, request: Request, profile: Optiona
     _require_token(request)
     _gc_oauth_sessions()
     _validate_oauth_profile(profile)
+    await scoped_to_thread(profile, require_web_credential_authority)
     catalog_entry = next((p for p in _OAUTH_PROVIDER_CATALOG if p["id"] == provider_id), None)
     if catalog_entry is None:
         raise HTTPException(status_code=400, detail=f"Unknown provider {provider_id}")
