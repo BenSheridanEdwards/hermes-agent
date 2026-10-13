@@ -110,6 +110,51 @@ class _ConcurrentTimeoutTransport(_SequencedTransport):
         raise httpx.ReadTimeout(f"request {index} timed out")
 
 
+class _AbortingPool(httpx.AsyncBaseTransport):
+    """Models a real httpx pool: ``aclose()`` aborts requests still in flight with ``httpx.ReadError``."""
+
+    def __init__(self, calls):
+        self.calls = calls
+        self.closed = False
+        self.healthy_entered = asyncio.Event()
+        self.healthy_release = asyncio.Event()
+        self._aborted = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append((self, request.url.path))
+        if self.closed:
+            raise httpx.ReadError("pool closed")
+        if request.url.path.endswith("/timeout"):
+            raise httpx.ReadTimeout("sibling response timed out")
+        self.healthy_entered.set()
+        release = asyncio.create_task(self.healthy_release.wait())
+        aborted = asyncio.create_task(self._aborted.wait())
+        await asyncio.wait({release, aborted}, return_when=asyncio.FIRST_COMPLETED)
+        release.cancel()
+        aborted.cancel()
+        if self._aborted.is_set():
+            raise httpx.ReadError("connection closed by pool shutdown")
+        return httpx.Response(200, request=request, text="delivered")
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self._aborted.set()
+
+
+async def _send_like_text_adapter(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Mirror the adapter's text-send retry: PTB maps ``httpx.ReadError`` to a non-timeout
+    ``NetworkError`` that is retried, while a read timeout is never replayed."""
+    for attempt in range(3):
+        try:
+            return await client.post(url, content=b"text")
+        except httpx.ReadTimeout:
+            raise
+        except httpx.TransportError:
+            if attempt >= 2:
+                raise
+    raise AssertionError("unreachable")
+
+
 def _factory(behavior, closed_log, kwargs_log=None):
     def factory(**kwargs):
         if kwargs_log is not None:
@@ -303,9 +348,12 @@ async def test_response_body_read_timeout_retires_fallback_pool(monkeypatch):
             await response.aread()
 
         assert calls == ["149.154.167.220"]
-        assert instances[1].closed is True
         assert transport._fallbacks == {}
         assert transport._sticky_ip is tnet._UNSET
+        # The unclosed response still holds the retired generation; httpx closes it on error.
+        assert instances[1].closed is False
+        await response.aclose()
+        assert instances[1].closed is True
     finally:
         await transport.aclose()
 
@@ -353,6 +401,97 @@ async def test_stale_read_timeout_does_not_close_replacement_fallback_pool(monke
                 task.cancel()
         await asyncio.gather(first, second, return_exceptions=True)
         await transport.aclose()
+
+
+@pytest.mark.parametrize("route", ["fallback", "primary"])
+@pytest.mark.asyncio
+async def test_read_timeout_drains_old_pool_without_aborting_healthy_sibling(monkeypatch, route):
+    """A read timeout retires its pool generation, but a healthy request already in flight on that
+    generation must finish rather than be aborted (ReadError -> PTB NetworkError -> re-sent message)."""
+    for key in (
+        "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy",
+        "http_proxy", "all_proxy", "TELEGRAM_PROXY", "NO_PROXY", "no_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    calls = []
+    instances = []
+    old_pool_index = 1 if route == "fallback" else 0
+
+    def factory(**kwargs):
+        instance = _AbortingPool(calls) if len(instances) == old_pool_index else _SequencedTransport(
+            {"api.telegram.org": ["replacement"] * 3, "149.154.167.220": ["replacement"] * 3}, calls)
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+    transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+    if route == "fallback":
+        await transport._get_fallback("149.154.167.220")
+        transport._sticky_ip = "149.154.167.220"
+    else:
+        transport._sticky_ip = None
+    old_pool = instances[old_pool_index]
+    assert isinstance(old_pool, _AbortingPool)
+    client = httpx.AsyncClient(transport=transport)
+    healthy = asyncio.create_task(
+        _send_like_text_adapter(client, "https://api.telegram.org/botTOKEN/sendMessage/healthy"))
+    try:
+        await old_pool.healthy_entered.wait()
+
+        with pytest.raises(httpx.ReadTimeout):
+            await client.post("https://api.telegram.org/botTOKEN/sendMessage/timeout", content=b"text")
+
+        # New requests are routed away from the retired generation at once...
+        replacement = transport._primary if route == "primary" else await transport._get_fallback("149.154.167.220")
+        assert replacement is not old_pool
+        closed_while_sibling_in_flight = old_pool.closed
+
+        old_pool.healthy_release.set()
+        response = await healthy
+        assert response.text == "delivered"
+        healthy_sends = [path for _, path in calls if path.endswith("/healthy")]
+        assert healthy_sends == ["/botTOKEN/sendMessage/healthy"], "healthy send was replayed"
+        # ...but the old pool stayed open while the healthy sibling was still in flight on it.
+        assert closed_while_sibling_in_flight is False
+        # The drained generation is closed once its last request finishes.
+        assert old_pool.closed is True
+        assert transport._draining == set()
+        assert transport._inflight == {}
+    finally:
+        if not healthy.done():
+            healthy.cancel()
+        await asyncio.gather(healthy, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transport_aclose_closes_generation_still_draining(monkeypatch):
+    """Shutting the transport down must not leak a retired generation still waiting on a request."""
+    calls = []
+    instances = []
+
+    def factory(**kwargs):
+        instance = _AbortingPool(calls) if len(instances) == 1 else _SequencedTransport({}, calls)
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+    transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+    healthy = asyncio.create_task(transport.handle_async_request(
+        httpx.Request("POST", "https://api.telegram.org/botTOKEN/sendMessage/healthy")))
+    await asyncio.sleep(0)
+    old_pool = instances[1]
+    await old_pool.healthy_entered.wait()
+    with pytest.raises(httpx.ReadTimeout):
+        await transport.handle_async_request(
+            httpx.Request("POST", "https://api.telegram.org/botTOKEN/sendMessage/timeout"))
+    assert old_pool.closed is False and old_pool in transport._draining
+
+    await transport.aclose()
+    assert old_pool.closed is True
+    with pytest.raises(httpx.ReadError):
+        await healthy
+    assert transport._draining == set()
 
 
 def test_pool_default_limits_applied_when_caller_omits(monkeypatch):
