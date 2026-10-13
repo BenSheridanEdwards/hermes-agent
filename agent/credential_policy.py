@@ -278,6 +278,31 @@ def check_pool_revision(pool) -> None:
         raise CredentialPolicyError("Credential assignments changed; reload this agent before continuing")
 
 
+def check_managed_codex_client(pool, client) -> None:
+    """Authorize the held SDK credential at each physical Responses dispatch.
+
+    Read the owning recipient, not an ambient profile or a new pool selection.
+    A publication for another recipient may advance the shared revision without
+    revoking this account. Validate the held row/token against current committed
+    authority instead of invalidating every client on a global revision change.
+    This never refreshes, rebinds, writes a receipt, or changes the shared account.
+    """
+    expected = getattr(pool, "_credential_policy", None)
+    if expected is None:
+        return  # Existing unmanaged callers keep their normal dispatch behavior.
+    current = load_policy(expected.home)
+    if current is None:
+        raise CredentialPolicyError("Credential assignments removed; reload this agent before continuing")
+    key = client.api_key
+    entry_id = pool.entry_id_for_api_key(key)
+    row = next((row for row in current.rows("openai-codex") if row.get("id") == entry_id), None)
+    if row is None or not key or row.get("access_token") != key:
+        raise CredentialPolicyError("Held Codex account changed or was revoked; reload this agent before continuing")
+    # Do not dispatch from a snapshot read across publication or config change.
+    if load_policy(expected.home) != current:
+        raise CredentialPolicyError("Credential assignments changed during dispatch; reload this agent before continuing")
+
+
 def sync_managed_entry(pool, entry):
     policy = getattr(pool, "_credential_policy", None)
     if policy is None:
