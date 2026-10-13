@@ -7,7 +7,8 @@ import asyncio
 import ipaddress
 import logging
 import socket
-from typing import Iterable, Optional
+from collections.abc import Awaitable, Callable
+from typing import Iterable, Optional, cast
 
 import httpx
 
@@ -60,6 +61,42 @@ SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
 _UNSET = object()
 
 
+class _TrackedResponseStream(httpx.AsyncByteStream):
+    """Hold a pool generation's in-flight slot until the response is closed, and retire the generation
+    when reading the body times out."""
+
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        on_close: Callable[[], Awaitable[None]],
+        on_timeout: Optional[Callable[[httpx.ReadTimeout], Awaitable[None]]] = None,
+    ):
+        self._stream = stream
+        self._on_close = on_close
+        self._on_timeout = on_timeout
+        self._timeout_handled = False
+        self._closed = False
+
+    async def __aiter__(self):
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        except httpx.ReadTimeout as exc:
+            if self._on_timeout is not None and not self._timeout_handled:
+                self._timeout_handled = True
+                await self._on_timeout(exc)
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._stream.aclose()
+        finally:
+            await self._on_close()
+
+
 def _resolve_proxy_url(target_hosts=None) -> str | None:
     from gateway.platforms.base import resolve_proxy_url  # env vars + macOS system proxy
     return resolve_proxy_url("TELEGRAM_PROXY", target_hosts=target_hosts)
@@ -91,6 +128,12 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._sticky_ip: object = _UNSET
         self._sticky_lock = asyncio.Lock()
         self._last_failure: tuple[str, str] | None = None
+        # Requests (including unread response bodies) currently using each pool generation, and the
+        # generations already swapped out that still await their last in-flight request. Closing a pool
+        # aborts its in-flight requests with httpx.ReadError, which PTB surfaces as a retryable
+        # NetworkError: a healthy sibling send that already reached Telegram would then be re-sent.
+        self._inflight: dict[httpx.AsyncBaseTransport, int] = {}
+        self._draining: set[httpx.AsyncBaseTransport] = set()
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -100,32 +143,101 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 self._fallbacks[ip] = transport
             return transport
 
-    async def _reset_primary(self, transport: httpx.AsyncHTTPTransport) -> None:
+    async def _send(
+        self,
+        transport: httpx.AsyncBaseTransport,
+        request: httpx.Request,
+        on_timeout: Optional[Callable[[httpx.ReadTimeout], Awaitable[None]]] = None,
+    ) -> httpx.Response:
+        """Send on ``transport`` while counting the request against that pool generation until the
+        response is closed, so a retirement drains the generation instead of aborting it."""
+        self._inflight[transport] = self._inflight.get(transport, 0) + 1
+        try:
+            response = await transport.handle_async_request(request)
+        except BaseException:
+            await self._release(transport)
+            raise
+        if response.is_closed:  # already-buffered body: nothing left to read from this generation
+            await self._release(transport)
+            return response
+        response.stream = _TrackedResponseStream(
+            cast(httpx.AsyncByteStream, response.stream),
+            lambda: self._release(transport),
+            on_timeout,
+        )
+        return response
+
+    async def _release(self, transport: httpx.AsyncBaseTransport) -> None:
+        remaining = self._inflight.get(transport, 0) - 1
+        if remaining > 0:
+            self._inflight[transport] = remaining
+            return
+        self._inflight.pop(transport, None)
+        if transport in self._draining:
+            self._draining.discard(transport)
+            await self._close_generation(transport, "drained")
+
+    async def _retire(self, transport: httpx.AsyncBaseTransport, label: str) -> None:
+        """Close a generation that is no longer reachable by new requests once its last in-flight
+        request finishes; close it now when nothing is using it."""
+        if self._inflight.get(transport, 0) > 0:
+            self._draining.add(transport)
+            return
+        await self._close_generation(transport, label)
+
+    @staticmethod
+    async def _close_generation(transport: httpx.AsyncBaseTransport, label: str) -> None:
+        try:
+            await transport.aclose()
+        except Exception as exc:  # closing a broken pool must never mask the real error
+            logger.debug("[Telegram] Error closing %s transport: %s", label, exc)
+
+    async def _reset_primary(self, transport: httpx.AsyncHTTPTransport) -> bool:
         # Retryable primary failures leave half-closed sockets in the pool; replace the generation first.
         async with self._primary_lock:
             if self._primary_closed or transport is not self._primary:
-                return
+                return False
             self._primary = httpx.AsyncHTTPTransport(**self._transport_kwargs)
-        try:
-            await transport.aclose()
-        except Exception as exc:
-            logger.debug("[Telegram] Error closing primary transport: %s", exc)
+        await self._retire(transport, "primary")
+        return True
 
-    async def _reset_fallback(self, ip: str) -> None:
+    async def _reset_fallback(self, ip: str, failed_transport: httpx.AsyncHTTPTransport) -> bool:
         """Discard a failed fallback pool: a peer-closed connect leaves a CLOSE_WAIT socket in it, and the
         poisoned pool would leak one fd per retry.
 
         Retaining the poisoned pool leaks one descriptor per retry until the process hits its file limit and
-        can no longer accept connections or resolve DNS (#63311).
+        can no longer accept connections or resolve DNS (#63311). New requests get a fresh pool at once; the
+        old one closes when its last in-flight request finishes.
         """
         async with self._fallback_lock:
-            transport = self._fallbacks.pop(ip, None)
-        if transport is None:
+            if self._fallbacks.get(ip) is not failed_transport:
+                return False
+            transport = self._fallbacks.pop(ip)
+        await self._retire(transport, f"fallback {ip}")
+        return True
+
+    async def _retire_read_timeout(
+        self, ip: Optional[str], transport: httpx.AsyncHTTPTransport, exc: httpx.ReadTimeout,
+    ) -> None:
+        """Retire only the generation that timed out; the ambiguous request is never replayed."""
+        retired = (
+            await self._reset_primary(transport)
+            if ip is None
+            else await self._reset_fallback(ip, transport)
+        )
+        if not retired:
             return
-        try:
-            await transport.aclose()
-        except Exception as exc:  # closing a broken pool must never mask the real error
-            logger.debug("[Telegram] Error closing fallback transport %s: %s", ip, exc)
+        path = ip or _TELEGRAM_API_HOST
+        failure = _describe_transport_error(exc)
+        self._last_failure = (path, failure)
+        if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
+            async with self._sticky_lock:
+                if self._sticky_ip is not _UNSET and self._sticky_ip == ip:
+                    self._sticky_ip = _UNSET
+        logger.warning(
+            "[Telegram] Telegram API path %s read timed out; reset its pool without replaying the ambiguous request",
+            path,
+        )
 
     def _attempt_order(self) -> list[Optional[str]]:
         """Sticky path first, then IPv4 literals, dual-stack hostname last (a blackholed IPv6 path never
@@ -140,13 +252,19 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
-            return await self._primary.handle_async_request(request)
+            return await self._send(self._primary, request)
         last_error: Exception | None = None
         for ip in self._attempt_order():
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
-                response = await transport.handle_async_request(candidate)
+                response = await self._send(
+                    transport,
+                    candidate,
+                    lambda exc, route=ip, generation=transport: self._retire_read_timeout(
+                        route, generation, exc
+                    ),
+                )
                 if self._last_failure is not None:
                     failed_path, failure = self._last_failure
                     self._last_failure = None
@@ -166,10 +284,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 return response
             except Exception as exc:
                 last_error = exc
-                if not _is_retryable_connect_error(exc):
-                    raise
                 path = ip or _TELEGRAM_API_HOST
                 failure = _describe_transport_error(exc)
+                if isinstance(exc, httpx.ReadTimeout):
+                    await self._retire_read_timeout(ip, transport, exc)
+                    raise
+                if not _is_retryable_connect_error(exc):
+                    raise
                 self._last_failure = (path, failure)
                 if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
                     async with self._sticky_lock:
@@ -183,7 +304,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                     logger.warning("[Telegram] Dual-stack api.telegram.org path failed (%s)", failure)
                     continue
                 logger.warning("[Telegram] IPv4 Telegram API IP %s failed: %s", ip, failure)
-                await self._reset_fallback(ip)
+                await self._reset_fallback(ip, transport)
                 continue
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
@@ -197,6 +318,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         async with self._fallback_lock:
             transports = list(self._fallbacks.values())
             self._fallbacks.clear()
+        transports.extend(self._draining)
+        self._draining.clear()
         for transport in transports:
             await transport.aclose()
 
