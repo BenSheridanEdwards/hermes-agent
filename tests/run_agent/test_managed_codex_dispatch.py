@@ -165,6 +165,17 @@ def test_retained_managed_codex_agent_denies_revoked_recipient_and_preserves_pee
             assert reused is held_clients["beta"], "unaffected peer retained its authorized transport"
             agents["beta"]._close_request_openai_client(reused, reason="request_complete")
         assert store.read_bytes() == store_before, "revocation must not invalidate the shared account"
+        # After proving peer transport continuity across coherent revocation,
+        # exercise studio's publication reader at the physical dispatch boundary.
+        # A refused request legitimately closes its transport, so do not inject
+        # these global publication failures into the unaffected-peer scenario.
+        before_incomplete = len(seen)
+        for state in ("publishing", "committed"):
+            gate.write_text(json.dumps({"version": 1, "state": state, "revision": 3}))
+            with pytest.raises(CredentialPolicyError):
+                infer("beta")
+            assert len(seen) == before_incomplete
+        assert store.read_bytes() == store_before
     finally:
         for agent in agents.values():
             agent._close_cached_request_openai_client(reason="test_teardown")
