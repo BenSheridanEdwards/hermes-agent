@@ -1781,6 +1781,10 @@ DEFAULT_CONFIG = {
         # DENIES unless transport_fallback is "builtin". Presentation only: plugins cannot detect,
         # suppress, or auto-approve commands outside a correlated human response.
         "approval": {"transport": "builtin", "transport_fallback": "deny"},
+        # launchd job labels agents may (re)load with `launchctl bootstrap`/`submit` from inside the
+        # gateway, e.g. ["ai.fleet.desktop"] for an app installer. A command or script that also names
+        # a hermes-gateway label is still refused. Empty = every bootstrap/submit is refused.
+        "launchd_allowed_labels": [],
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/.cursorrules, project-local
         # .hermes config) always need human approval, even under yolo. Extra patterns are fnmatch
         # globs on the basename (e.g. "*.mdc").

@@ -119,7 +119,20 @@ an inspection of the target plist. It also rejects independent scheduled jobs
 with `RunAtLoad=false` and no `KeepAlive` key; rejection does **not** establish that
 the job uses KeepAlive or controls Hermes.
 
-For authorized LaunchAgent maintenance, use a separate shell outside the running
+To let agents (re)load specific apps' LaunchAgents, list their labels:
+
+```yaml
+security:
+  launchd_allowed_labels:
+    - ai.fleet.desktop
+```
+
+A `bootstrap`/`submit` passes only when the command, or the script it runs, names an
+allowed label and names no hermes-gateway label, so an app installer can restart its own
+app but cannot carry a gateway restart helper. Empty by default: every `bootstrap`/`submit`
+is refused.
+
+For other authorized LaunchAgent maintenance, use a separate shell outside the running
 gateway. Some independent `load`/`unload` commands currently pass the label-based
 checks, but that is not a target-verified exemption or a supported way to evade a
 `bootstrap` rejection. Read-only `launchctl print` is not a lifecycle operation.

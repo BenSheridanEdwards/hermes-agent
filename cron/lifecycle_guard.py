@@ -714,8 +714,24 @@ def contains_launchctl_submit_command(command: str) -> bool:
         if index is not None and _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
-                return True
+                return not _names_only_allowed_launchd_jobs(command)
     return False
+
+
+def _names_only_allowed_launchd_jobs(text: str) -> bool:
+    """True when *text* names an operator-allowed launchd label (``security.launchd_allowed_labels``)
+    and no hermes-gateway label. An app's own installer (Fleet's ``ai.fleet.desktop``) must be able to
+    reload its LaunchAgent from inside the gateway; the label-independent block exists for jobs that
+    could restart the gateway, which a script naming a gateway label still is."""
+    if _HERMES_GATEWAY_LABEL_RE.search(text):
+        return False
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    labels = cfg_get(load_config_readonly(), "security", "launchd_allowed_labels", default=[]) or []
+    return any(
+        re.search(rf"(?<![\w.-]){re.escape(label)}(?![\w.-])", text)
+        for label in labels if isinstance(label, str) and label.strip()
+    )
 
 
 def _mask_data_sink_arguments(text: str) -> str:
