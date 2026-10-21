@@ -25,6 +25,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_refusals import RefusalLog, dedupe_notices, notice_key
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -70,6 +71,10 @@ _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 # Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
 # 2 s drain cadence instead of the watcher's check interval (#140899).
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+# However its refusal is classified, a watch event refused for this long is dropped. It outlasts a
+# restart's after-turn wait (agent.restart_after_turn_timeout, 1800 s by default) and a full FIFO;
+# a watch match an hour old is no longer news, and its output stays in process(action='log').
+_WATCH_REFUSAL_MAX_AGE_S = 3600.0
 
 
 def _refusal_retry_at(step: int) -> float:
@@ -718,7 +723,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         See #9290.
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
+        # Identical queued copies of one notice are offered (and requeued) once.
+        watch_events = dedupe_notices(_drain_gateway_watch_events(completion_queue))
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
             if next_retry_at is not None and next_retry_at > time.monotonic():
@@ -752,25 +758,31 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
         """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
 
-        Only a refusal proven permanent (``WakeNotAccepted.permanent``: the route has no session,
-        or the payload is invalid) counts toward the cap that drops it. A transient one (a restart's
-        after-turn wait, a parked profile, a full owner FIFO) or one whose owner may still appear (an
-        unowned or foreign-pinned notice) waits it out however long it lasts.
+        A refusal proven permanent (``WakeNotAccepted.permanent``: the route has no session, or the
+        payload is invalid) drops it after ``_MAX_COMPLETION_INJECTION_ATTEMPTS``. A transient one (a
+        restart's after-turn wait, a parked profile, a full owner FIFO) or one whose owner may still
+        appear (an unowned or foreign-pinned notice) keeps backing off, until the event has been
+        refused for ``_WATCH_REFUSAL_MAX_AGE_S``. Either drop logs one WARNING naming the last refusal.
         """
+        now = time.monotonic()
         step = int(evt.get("_watch_retry_step") or 0) + 1
         evt["_watch_retry_step"] = step
+        reason = evt.pop("_refusal_reason", None) or "not delivered"
+        refused_for = now - evt.setdefault("_watch_first_refused_at", now)
+        exhausted = False
         if evt.pop("_refusal_permanent", False):
             refusals = int(evt.get("_watch_injection_attempts") or 0) + 1
             evt["_watch_injection_attempts"] = refusals
-            if refusals >= _MAX_COMPLETION_INJECTION_ATTEMPTS:
-                logger.warning(
-                    "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
-                    "%d times; dropping the queued event (output remains available via "
-                    "process(action='log'))",
-                    evt.get("platform") or "?", evt.get("chat_id") or "?",
-                    evt.get("type") or "?", evt.get("session_id", "unknown"), refusals,
-                )
-                return
+            exhausted = refusals >= _MAX_COMPLETION_INJECTION_ATTEMPTS
+        if exhausted or refused_for >= _WATCH_REFUSAL_MAX_AGE_S:
+            logger.warning(
+                "Watch notification for %s chat=%s (type=%s session_id=%s) was not admitted "
+                "%d time(s) over %.0f min (last: %s); dropping the queued event (output remains "
+                "available via process(action='log'))",
+                evt.get("platform") or "?", evt.get("chat_id") or "?",
+                evt.get("type") or "?", evt.get("session_id", "unknown"), step, refused_for / 60, reason,
+            )
+            return
         evt["_watch_next_retry_at"] = _refusal_retry_at(step)
         completion_queue.put(evt)
 
@@ -928,10 +940,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
             )
-            logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
-                platform_name, source.chat_id, source.thread_id,
-            )
             # Relay egress priming: post-restart routing caches are cold (they warm only on inbound), so
             # replies would egress without tenant discriminators and be declined by the connector.
             _prime = getattr(adapter, "prime_routing_cache", None)
@@ -948,6 +956,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
             else:
                 await admit_internal_event(adapter, synth_event)
+            # Logged on admission only: a refused notice is retried, and its retries must not repeat it.
+            logger.info(
+                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                platform_name, source.chat_id, source.thread_id,
+            )
             return True
         except WakeNotAccepted as exc:
             # Permanent only on proof: a pin the authority's state shows gone (/new, #141562) or a
@@ -959,8 +972,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return None
             if not raise_not_accepted:
                 evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
-            logger.warning("Watch notification not admitted for %s chat=%s: %s",
-                           platform_name, source.chat_id, exc)
+                evt["_refusal_reason"] = exc.reason or "adapter_not_accepted"
+            self._log_refused_notice(evt, platform_name, source.chat_id, exc)
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise
@@ -968,6 +981,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
+
+    def _log_refused_notice(self, evt: dict, platform_name: str, chat_id, exc) -> None:
+        """INFO naming why a notice was not admitted: its first refusal, then at most once per
+        ``REFUSAL_LOG_INTERVAL_S`` per notice, counting the refusals in between. A notice is retried
+        while its refusal may clear, so a line per refusal flooded agent.log."""
+        refusal_log = self.__dict__.setdefault("_notice_refusal_log", RefusalLog())
+        key = self._completion_delivery_identity(evt) or notice_key(evt)
+        if refusals := refusal_log.due(key, time.monotonic()):
+            logger.info("Watch notification not admitted for %s chat=%s: %s (%d refusal(s) since the last line)",
+                        platform_name, chat_id, exc, refusals)
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:

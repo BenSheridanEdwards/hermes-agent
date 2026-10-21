@@ -148,7 +148,8 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
     """A refused watch notice is retried on a bounded backoff, never on every 2 s tick (#140899). A
     proven-permanent refusal (``not_found``: the route holds no session) drops it at the cap. A
     notice pinned to another chat's live session (``admission_conflict``) or refused by a restart's
-    after-turn wait (``runtime_draining``) is never dropped: it waits however long it takes."""
+    after-turn wait (``runtime_draining``) is not dropped at that cap: it keeps waiting, up to the
+    age cap (``tests/gateway/test_watch_notice_refusal_flood.py``)."""
     from gateway import run_notifications
     from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
     runner, authority, entry = await _gateway(monkeypatch)
@@ -161,6 +162,13 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
         pending = queue.Queue()
         pending.put(_notice(entry, pinned))
         clock = install_module_clock(monkeypatch, run_notifications)
+        attempts = []
+        inject = runner._inject_watch_notification
+
+        async def counted(*args, **kwargs):
+            attempts.append(args)
+            return await inject(*args, **kwargs)
+        monkeypatch.setattr(runner, '_inject_watch_notification', counted)
 
         with caplog.at_level(logging.WARNING, logger='gateway.run'):
             for _ in range(2000):  # ~33 simulated minutes of drain ticks
@@ -170,7 +178,7 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
                 clock.now += 1
 
         messages = [r.getMessage() for r in caplog.records]
-        refused = sum('not admitted' in m for m in messages)
+        refused = len(attempts)
         if refusal == 'permanent':
             assert pending.empty()
             assert refused == _MAX_COMPLETION_INJECTION_ATTEMPTS
