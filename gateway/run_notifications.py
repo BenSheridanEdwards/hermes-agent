@@ -1266,7 +1266,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         except WakeNotAccepted as exc:
             # A proven-permanent refusal spends its durable attempt, so the row converges to
             # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
-            # not yet proven) is refunded and never drops a completion the owner will take later.
+            # not yet proven) is deferred without spending an attempt, until the completion is older
+            # than ``_MAX_COMPLETION_REPLAY_AGE_S``: that deferral drops it (``deferred_past_age_cap``).
             refused = not exc.permanent
             defer_reason = exc.reason or "adapter_not_accepted"
             return False

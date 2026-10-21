@@ -575,15 +575,21 @@ def defer_completion_delivery(delegation_id: str, claim_id: str, *, reason: Opti
                                 delegation_id, claim_id)).rowcount
     if changed != 1:
         return False
-    if expired:
+    log_deferral(delegation_id, reason, deferrals, now - completed_at if expired else 0.0, dropped=expired)
+    return True
+
+
+def log_deferral(delegation_id: str, reason: Optional[str], deferrals: int, age_s: float, *, dropped: bool) -> None:
+    """The log line of a settled deferral, for the in-process ledger and a managed worker's alike: one
+    WARNING when it dropped a completion past the age cap, else INFO on deferral 1, 2, 4, 8, ... only."""
+    if dropped:
         logger.warning("Async delegation %s: completion is %.1fh old (cap %.1fh) and its delivery was deferred "
                        "again (%s, %d deferral(s)); terminally dropping it (result remains queryable).",
-                       delegation_id, (now - completed_at) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
+                       delegation_id, age_s / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
                        reason or "unspecified", deferrals)
     elif deferrals & (deferrals - 1) == 0:
         logger.info("Async delegation %s: delivery deferred without spending an attempt (%s); "
                     "%d deferral(s) so far", delegation_id, reason or "unspecified", deferrals)
-    return True
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:

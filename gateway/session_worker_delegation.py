@@ -164,14 +164,20 @@ def _delivery(db, conn, session_id, payload, *, execution_id, action):
     _text(payload['claim_id'])
     now = time.time()
     # Only constant, closed statement fragments enter this query.
-    changed = conn.execute('UPDATE async_delegations SET ' + _DELIVERY_UPDATES[action] +
+    settled = conn.execute('UPDATE async_delegations SET ' + _DELIVERY_UPDATES[action] +
         ",updated_at=:now,delivery_claim=NULL,delivery_claimed_at=NULL WHERE delegation_id=:delegation_id "
-        "AND delivery_state='pending' AND delivery_claim=:claim_id",
+        "AND delivery_state='pending' AND delivery_claim=:claim_id "
+        'RETURNING delivery_state,delivery_deferrals,COALESCE(completed_at,dispatched_at)',
         payload | {'now': now, 'cap': ledger._MAX_DELIVERY_ATTEMPTS,
                    'stale_before': now - ledger._MAX_COMPLETION_REPLAY_AGE_S,
                    'target_gone': ledger.DROP_TARGET_GONE, 'deferral_age_cap': ledger.DROP_DEFERRAL_AGE_CAP,
-                   'attempts_exhausted': ledger.DROP_ATTEMPTS_EXHAUSTED}).rowcount
-    return {'value': changed == 1}
+                   'attempts_exhausted': ledger.DROP_ATTEMPTS_EXHAUSTED}).fetchall()
+    if action == 'defer' and settled:
+        # Logged as the in-process ledger logs it; the worker's wire shape carries no refusal code.
+        state, deferrals, completed_at = settled[0]
+        ledger.log_deferral(payload['delegation_id'], None, deferrals, now - (completed_at or now),
+                            dropped=state == 'dropped')
+    return {'value': len(settled) == 1}
 
 
 def _unscheduled(db, conn, session_id, payload, *, execution_id):

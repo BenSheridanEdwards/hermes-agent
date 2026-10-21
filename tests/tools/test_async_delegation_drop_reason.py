@@ -7,6 +7,7 @@ only in a log line, or nowhere (a deferral logged nothing above DEBUG). The colu
 existing ledger gains them on its next open and keeps its rows.
 """
 
+import logging
 import os
 import queue
 import sqlite3
@@ -210,5 +211,23 @@ def test_worker_ledger_counts_deferrals_and_persists_drop_reasons(tmp_path):
         assert row("w-gone")["drop_reason"] == ad.DROP_TARGET_GONE
         assert row("w-spent") == {"state": "dropped", "attempts": ad._MAX_DELIVERY_ATTEMPTS, "deferrals": 0,
                                   "drop_reason": ad.DROP_ATTEMPTS_EXHAUSTED}
+    finally:
+        db.close()
+
+
+def test_worker_deferral_past_the_age_cap_says_it_dropped_the_completion(tmp_path, caplog):
+    """A managed worker's deferral that drops a stale completion logs the same single WARNING as the
+    in-process ledger, instead of a drop visible only in the database."""
+    db, apply, row, persisted = _worker_apply(tmp_path)
+    try:
+        persisted("w-stale", time.time() - ad._MAX_COMPLETION_REPLAY_AGE_S - 60)
+        assert apply("claim", delegation_id="w-stale", claim_id="c")
+
+        with caplog.at_level(logging.INFO):
+            assert apply("defer", delegation_id="w-stale", claim_id="c")
+
+        assert row("w-stale")["state"] == "dropped"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1 and "w-stale" in warnings[0] and "terminally dropping" in warnings[0], warnings
     finally:
         db.close()
