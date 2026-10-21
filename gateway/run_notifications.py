@@ -763,24 +763,29 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         restart's after-turn wait, a parked profile, a full owner FIFO) or one whose owner may still
         appear (an unowned or foreign-pinned notice) keeps backing off, until the event has been
         refused for ``_WATCH_REFUSAL_MAX_AGE_S``. Either drop logs one WARNING naming the last refusal.
+        A result that is no refusal (no adapter to carry it, an injection error) never starts or
+        trips that age clock: the notice backs off for as long as the outage lasts.
         """
         now = time.monotonic()
         step = int(evt.get("_watch_retry_step") or 0) + 1
         evt["_watch_retry_step"] = step
-        reason = evt.pop("_refusal_reason", None) or "not delivered"
-        refused_for = now - evt.setdefault("_watch_first_refused_at", now)
+        reason = evt.pop("_refusal_reason", None)
+        if reason is not None:
+            evt.setdefault("_watch_first_refused_at", now)
+        refused_for = now - evt.get("_watch_first_refused_at", now)
         exhausted = False
         if evt.pop("_refusal_permanent", False):
             refusals = int(evt.get("_watch_injection_attempts") or 0) + 1
             evt["_watch_injection_attempts"] = refusals
             exhausted = refusals >= _MAX_COMPLETION_INJECTION_ATTEMPTS
-        if exhausted or refused_for >= _WATCH_REFUSAL_MAX_AGE_S:
+        if exhausted or (reason is not None and refused_for >= _WATCH_REFUSAL_MAX_AGE_S):
             logger.warning(
                 "Watch notification for %s chat=%s (type=%s session_id=%s) was not admitted "
                 "%d time(s) over %.0f min (last: %s); dropping the queued event (output remains "
                 "available via process(action='log'))",
                 evt.get("platform") or "?", evt.get("chat_id") or "?",
-                evt.get("type") or "?", evt.get("session_id", "unknown"), step, refused_for / 60, reason,
+                evt.get("type") or "?", evt.get("session_id", "unknown"), step, refused_for / 60,
+                reason or "not delivered",
             )
             return
         evt["_watch_next_retry_at"] = _refusal_retry_at(step)

@@ -14,7 +14,8 @@ import queue
 
 import pytest
 
-from tests.gateway.test_watch_notification_reset_pin import _foreign_pin, _gateway, _notice, _queued_admissions
+from tests.gateway.test_watch_notification_reset_pin import (
+    _foreign_pin, _gateway, _notice, _queued_admissions, _restart_wait)
 from tests.module_clock import install_module_clock
 
 _INJECTING = 'Watch pattern notification — injecting'
@@ -95,6 +96,59 @@ async def test_notice_refused_past_the_age_cap_is_dropped_with_one_warning(monke
         assert len(warnings) == 1, warnings
         assert 'dropping the queued event' in warnings[0] and 'admission_conflict' in warnings[0]
         assert not _queued_admissions(authority, entry.session_id)
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_notice_outlives_an_adapter_outage_longer_than_the_age_cap(monkeypatch, caplog):
+    """The age cap counts refusals only. While no adapter can carry the notice nothing refused it, so
+    it keeps backing off however long the outage lasts, and is admitted once the adapter is back."""
+    from gateway import run_notifications
+    runner, authority, entry = await _gateway(monkeypatch)
+    try:
+        connected = runner.adapters
+        runner.adapters = {}
+        pending = queue.Queue()
+        pending.put(_notice(entry, entry.session_id))
+        clock = install_module_clock(monkeypatch, run_notifications)
+
+        with caplog.at_level(logging.INFO, logger='gateway.run'):
+            await _drain_for(runner, pending, clock, 2 * 3600)  # two simulated hours without an adapter
+            assert not pending.empty(), 'a notice nothing refused is not dropped by the refusal age cap'
+
+            runner.adapters = connected
+            await _drain_for(runner, pending, clock, 120)
+
+        assert pending.empty()
+        assert len(_queued_admissions(authority, entry.session_id)) == 1
+        assert not [r for r in caplog.records if 'dropping the queued event' in r.getMessage()]
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_refused_replacement_tick_is_dropped_naming_its_refusal(monkeypatch, caplog):
+    """A liveness tick that would replace a still-queued tick is admitted as a folded copy; when that
+    copy is refused, the refusal still reaches the queued tick, so the age cap applies and names it."""
+    from gateway import run_notifications
+    runner, authority, entry = await _gateway(monkeypatch)
+    try:
+        pending = queue.Queue()
+        pending.put(_notice(entry, entry.session_id, 'heartbeat'))
+        await runner._drain_watch_notifications(pending)
+        assert pending.empty() and len(_queued_admissions(authority, entry.session_id)) == 1
+
+        _restart_wait(runner)
+        pending.put(dict(_notice(entry, entry.session_id, 'heartbeat'), event_id='heartbeat-2', seq=2))
+        clock = install_module_clock(monkeypatch, run_notifications)
+        with caplog.at_level(logging.INFO, logger='gateway.run'):
+            await _drain_for(runner, pending, clock, 2 * 3600)
+
+        assert pending.empty(), 'a tick refused past the age cap is dropped'
+        warnings = [r.getMessage() for r in caplog.records if 'dropping the queued event' in r.getMessage()]
+        assert len(warnings) == 1 and 'runtime_draining' in warnings[0], warnings
+        assert [row['status'] for row in _queued_admissions(authority, entry.session_id)] == ['queued']
     finally:
         authority.db.close()
 
