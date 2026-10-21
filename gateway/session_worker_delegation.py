@@ -143,24 +143,34 @@ def _claim(db, conn, session_id, payload, *, execution_id):
     return {'value': changed == 1}
 
 
+# The same settle contract as tools.async_delegation (drop reasons, counted deferrals, the age cap
+# applied where a deferral happens); SQLite evaluates every SET expression against the old row.
+_STALE = 'COALESCE(completed_at,dispatched_at)<:stale_before'
 _DELIVERY_UPDATES = {
     'ack': "delivery_state='delivered',delivered_at=:now",
-    'drop': "delivery_state='dropped'",
-    'defer': 'delivery_attempts=MAX(0,delivery_attempts-1)',
-    'release': "delivery_state=CASE WHEN delivery_attempts>=:cap THEN 'dropped' ELSE delivery_state END",
+    'drop': "delivery_state='dropped',drop_reason=:target_gone",
+    'defer': ('delivery_attempts=MAX(0,delivery_attempts-1),delivery_deferrals=delivery_deferrals+1,'
+              f"delivery_state=CASE WHEN {_STALE} THEN 'dropped' ELSE delivery_state END,"
+              f'drop_reason=CASE WHEN {_STALE} THEN :deferral_age_cap ELSE drop_reason END'),
+    'release': ("delivery_state=CASE WHEN delivery_attempts>=:cap THEN 'dropped' ELSE delivery_state END,"
+                'drop_reason=CASE WHEN delivery_attempts>=:cap THEN :attempts_exhausted ELSE drop_reason END'),
 }
 
 
 def _delivery(db, conn, session_id, payload, *, execution_id, action):
-    from tools.async_delegation import _MAX_DELIVERY_ATTEMPTS
+    from tools import async_delegation as ledger
     _shape(payload, {'delegation_id', 'claim_id'})
     _owned(conn, session_id, execution_id, payload['delegation_id'])
     _text(payload['claim_id'])
+    now = time.time()
     # Only constant, closed statement fragments enter this query.
     changed = conn.execute('UPDATE async_delegations SET ' + _DELIVERY_UPDATES[action] +
         ",updated_at=:now,delivery_claim=NULL,delivery_claimed_at=NULL WHERE delegation_id=:delegation_id "
         "AND delivery_state='pending' AND delivery_claim=:claim_id",
-        payload | {'now': time.time(), 'cap': _MAX_DELIVERY_ATTEMPTS}).rowcount
+        payload | {'now': now, 'cap': ledger._MAX_DELIVERY_ATTEMPTS,
+                   'stale_before': now - ledger._MAX_COMPLETION_REPLAY_AGE_S,
+                   'target_gone': ledger.DROP_TARGET_GONE, 'deferral_age_cap': ledger.DROP_DEFERRAL_AGE_CAP,
+                   'attempts_exhausted': ledger.DROP_ATTEMPTS_EXHAUSTED}).rowcount
     return {'value': changed == 1}
 
 

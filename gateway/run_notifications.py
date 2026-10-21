@@ -1068,12 +1068,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return verdict, parent_session_id, target_session_id or parent_session_id
 
     @staticmethod
-    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
-        """Best-effort ``drop``/``release`` of a durable completion claim."""
+    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str, **details) -> None:
+        """Best-effort settle of a durable completion claim (a ``defer`` takes its refusal ``reason``)."""
         fn_name, fail_msg = _DURABLE_CLAIM_OPS[kind]
         try:
             import tools.async_delegation as _ad
-            getattr(_ad, fn_name)(delegation_id, claim_id)
+            getattr(_ad, fn_name)(delegation_id, claim_id, **details)
         except Exception:
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
 
@@ -1233,6 +1233,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
+        defer_reason = "owner_unresolved"  # the pre-flight's ``retry`` verdict, unless a refusal names one
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1267,17 +1268,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
             # not yet proven) is refunded and never drops a completion the owner will take later.
             refused = not exc.permanent
+            defer_reason = exc.reason or "adapter_not_accepted"
             return False
         finally:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             operation = "complete" if accepted else "defer" if refused or claim.defer else "release"
+            details = {"reason": defer_reason} if operation == "defer" else {}
             if claim.claim_id:
-                self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id, **details)
             for sibling, claim_id in sibling_claims:
                 if claim_id:
-                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
+                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id, **details)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
