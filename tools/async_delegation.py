@@ -566,12 +566,12 @@ def defer_completion_delivery(delegation_id: str, claim_id: str, *, reason: Opti
         completed_at, deferrals = row[0], row[1] + 1
         expired = completed_at is not None and now - completed_at > _MAX_COMPLETION_REPLAY_AGE_S
         changed = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL, delivery_claimed_at=NULL,
-                      delivery_attempts=MAX(0, delivery_attempts-1), delivery_deferrals=?,
+                      delivery_attempts=MAX(0, delivery_attempts-1), delivery_deferrals=delivery_deferrals+1,
                       last_defer_reason=?, updated_at=?,
                       delivery_state=CASE WHEN ? THEN 'dropped' ELSE delivery_state END,
                       drop_reason=CASE WHEN ? THEN ? ELSE drop_reason END
                WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
-                               (deferrals, reason, now, expired, expired, DROP_DEFERRAL_AGE_CAP,
+                               (reason, now, expired, expired, DROP_DEFERRAL_AGE_CAP,
                                 delegation_id, claim_id)).rowcount
     if changed != 1:
         return False
