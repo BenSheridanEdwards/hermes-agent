@@ -60,7 +60,26 @@ class CredentialPolicy:
             raise CredentialPolicyError("Assigned credential pool is invalid")
         wanted = self.accounts[provider]["ids"]
         by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
-        return [by_id[cid] for cid in wanted if cid in by_id]
+        expect = self.accounts[provider].get("expect") or {}
+        # Additive account constraints (credential manager I1): a bound row must still hold the account the manager
+        # authorized -- same observed principal, OAuth client and permissions. A row now holding another or an
+        # unidentified account is not usable (fail closed); it is never silently swapped for another row.
+        return [by_id[cid] for cid in wanted if cid in by_id and _row_meets(provider, by_id[cid], expect.get(cid))]
+
+
+def _row_meets(provider: str, row: dict, expected: dict | None) -> bool:
+    if expected is None:
+        return True
+    from agent.credential_identity import observed_principal, principal_matches
+    stored = row.get("principal") if isinstance(row.get("principal"), dict) else None
+    observed = observed_principal(provider, row) or stored
+    if not principal_matches(observed, expected.get("principal")):
+        return False
+    if "client_id" in expected and row.get("client_id") != expected["client_id"]:
+        return False
+    if "scope" in expected and set(str(row.get("scope") or "").split()) != set(str(expected["scope"]).split()):
+        return False
+    return True
 
 
 def load_policy(home: Path | None = None) -> CredentialPolicy | None:
@@ -128,6 +147,15 @@ def load_policy(home: Path | None = None) -> CredentialPolicy | None:
             _require(isinstance(provider, str) and isinstance(binding, dict))
             _require(binding["store"] in ("root", "profile") and isinstance(binding["ids"], list))
             _require(all(isinstance(cid, str) and cid for cid in binding["ids"]))
+            expect = binding.get("expect")
+            if expect is not None:
+                # Additive per-row constraints; malformed constraints fail the whole policy closed.
+                _require(isinstance(expect, dict) and all(cid in binding["ids"] for cid in expect))
+                for constraint in expect.values():
+                    principal = constraint.get("principal") if isinstance(constraint, dict) else None
+                    _require(isinstance(principal, dict) and isinstance(principal.get("kind"), str) and principal["kind"]
+                             and isinstance(principal.get("value"), str) and principal["value"])
+                    _require(all(isinstance(constraint.get(k), str) for k in ("client_id", "scope") if k in constraint))
         return CredentialPolicy(hashlib.sha256(raw).hexdigest(), env, frozenset(names), accounts, bindings, home)
     except (OSError, ValueError, KeyError, TypeError, AssertionError) as exc:
         raise CredentialPolicyError("Credential assignment policy is missing or invalid; reconnect the credential manager") from exc
@@ -219,7 +247,8 @@ def persist_managed(provider: str, payloads: list[dict], status_cleared_ids=None
     return True
 
 
-def resolve_managed_runtime(policy: CredentialPolicy, requested: str, target_model=None):
+def select_managed_runtime(policy: CredentialPolicy, requested: str, target_model=None):
+    """The managed selection the runtime uses: (provider, selected entry, runtime). Records the selection receipt."""
     from hermes_cli import runtime_provider as rp
     from agent.credential_pool import load_pool
     provider = rp.resolve_provider(requested)
@@ -230,9 +259,14 @@ def resolve_managed_runtime(policy: CredentialPolicy, requested: str, target_mod
         raise CredentialPolicyError(f"No usable assigned credential for {provider}; open your credential manager")
     runtime = rp._resolve_runtime_from_pool_entry(provider=provider, entry=entry,
         requested_provider=requested, model_cfg=rp._get_model_config(), pool=pool, target_model=target_model)
+    from agent.credential_identity import RUNTIME_INSTANCE
     record_receipt(policy, phase="selection", provider=provider, entry=entry.id,
-                   source=entry.source, status="selected")
-    return runtime
+                   source=entry.source, status="selected", instance=RUNTIME_INSTANCE)
+    return provider, entry, runtime
+
+
+def resolve_managed_runtime(policy: CredentialPolicy, requested: str, target_model=None):
+    return select_managed_runtime(policy, requested, target_model)[2]
 
 
 def check_pool_revision(pool) -> None:
@@ -286,8 +320,12 @@ def restore_assigned_environment(home: Path, environ) -> None:
 
 
 def capabilities_command(_args) -> None:
+    # Additive capabilities (publication v2 unchanged): per-row account constraints, structured recipient-safe
+    # reauth, and bounded-operation receipts. Managers must feature-detect them; older Hermes omits them.
     print(json.dumps({"credential_policy": 2, "account_providers": ["openai-codex", "xai-oauth", "anthropic"],
-                      "refresh_owner": "hermes", "activation": "reload"}))
+                      "refresh_owner": "hermes", "activation": "reload",
+                      "account_constraints": 1, "stable_principal_providers": ["openai-codex"],
+                      "reauth_result": 1, "operation_receipt": 1}))
 
 
 # Operator-owned assignment, deliberately narrower than skill env_passthrough.

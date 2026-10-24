@@ -172,6 +172,9 @@ _EXTRA_KEYS = frozenset({
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
     # a billing bench to a 60s transient cooldown.
     "failure_reason",
+    # Non-secret provider-qualified account principal Hermes observed at sign-in / renewal
+    # (agent/credential_identity.observed_principal); round-tripped so refresh never drops it.
+    "principal",
 })
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.

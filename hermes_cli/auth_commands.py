@@ -375,9 +375,15 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
     # Every account gets a distinct, self-contained pool entry instead of routing through a
     # singleton save path (which collapsed every added account into the latest login).
     # ``manual:*`` entries refresh from their own token pair, so they need no singleton shadow.
+    # The account's stable principal, observed by Hermes on the new tokens (None where the provider has no supported
+    # stable claim); persisted as non-secret row metadata so a credential manager can record the authorized account.
+    from agent.credential_identity import observed_principal
+    tokens = creds.get("tokens") if isinstance(creds, dict) and isinstance(creds.get("tokens"), dict) else {}
+    principal = observed_principal(provider, {"access_token": token, "id_token": tokens.get("id_token")})
     entry = PooledCredential(
         provider=provider, id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_OAUTH, priority=0,
-        source=spec.source, access_token=token, **spec.fields(creds, provider))
+        source=spec.source, access_token=token, **spec.fields(creds, provider),
+        **({"extra": {"principal": principal}} if principal else {}))
     first_credential = not pool.entries()
     entry = pool.add_entry(entry)
     # The first Codex/xAI credential becomes the active provider (as the old singleton save path
@@ -557,6 +563,11 @@ def auth_refresh_command(args) -> None:
 def _auth_reauth_command(args) -> None:
     from hermes_cli.auth_reauth import auth_reauth_command
     auth_reauth_command(args)
+
+
+def _auth_probe_command(args) -> None:
+    from agent.credential_identity import probe_command
+    probe_command(args)
 
 
 def auth_status_command(args) -> None:
@@ -768,7 +779,7 @@ _AUTH_ACTIONS = {
     "policy-capabilities": capabilities_command,
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command,
-    "reauth": _auth_reauth_command, "status": auth_status_command,
+    "reauth": _auth_reauth_command, "status": auth_status_command, "probe": _auth_probe_command,
     "logout": auth_logout_command,
     "spotify": auth_spotify_command}
 

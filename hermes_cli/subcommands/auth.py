@@ -63,6 +63,14 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_reauth.add_argument(
         "--no-browser", action="store_true", help="Do not auto-open a browser for OAuth login")
     auth_reauth.add_argument("--timeout", type=float, help="OAuth/network timeout in seconds")
+    # Recipient-safe renewal for an external credential manager (additive; omitted = original behaviour).
+    auth_reauth.add_argument("--expect-principal", metavar="KIND=VALUE",
+                             help="Refuse to save unless the signed-in account has this stable principal")
+    auth_reauth.add_argument("--result-file", help="Write the structured, non-secret commit result here (atomic)")
+    auth_reauth.add_argument("--cancel-file", help="If this file exists at commit time, save nothing and report cancelled")
+    auth_probe = auth_subparsers.add_parser(
+        "probe", help="Run the managed credential's bounded operation and record its transport result")
+    auth_probe.add_argument("provider", help="Provider id (openai-codex, xai-oauth)")
     auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
     auth_status.add_argument("provider", help="Provider id")
     auth_logout = auth_subparsers.add_parser(
