@@ -52,11 +52,17 @@ _MAX_DURABLE_PENDING = 1000
 # Cap retried deliveries so an unroutable row converges to terminal 'dropped'.
 _MAX_DELIVERY_ATTEMPTS = 8
 # Pending completions older than this are dropped on restart replay instead of
-# re-run as a full-context turn; 48h keeps weekend results deliverable.
+# re-run as a full-context turn; 48h keeps weekend results deliverable. A deferral
+# past it drops the row too, so a completion refused on every retry cannot outlive it.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 # A delivery claim older than this is abandoned and may be re-claimed.
 _CLAIM_LEASE_S = 300.0
 _DB_LOCK = threading.Lock()
+# Why a row reached 'dropped', persisted in ``drop_reason`` (the closed set every drop path writes).
+DROP_REPLAY_AGE_CAP = "replay_age_cap"
+DROP_ATTEMPTS_EXHAUSTED = "delivery_attempts_exhausted"
+DROP_TARGET_GONE = "target_session_gone"
+DROP_DEFERRAL_AGE_CAP = "deferred_past_age_cap"
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
 # Startup replay runs once per process, so a completion whose owner died while THIS process was
@@ -370,10 +376,10 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
     for delegation_id, payload, completed_at, dispatched_at in rows:
         age_basis = completed_at or dispatched_at
         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
-            conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+            conn.execute("""UPDATE async_delegations SET delivery_state='dropped', drop_reason=?,
                           delivery_claim=NULL, delivery_claimed_at=NULL,
                           updated_at=?
-                   WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+                   WHERE delegation_id=? AND delivery_state='pending'""", (DROP_REPLAY_AGE_CAP, now, delegation_id))
             logger.warning("Async delegation %s: pending completion is %.1fh old "
                            "(cap %.1fh); terminally dropping the replay (result remains queryable).",
                            delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
@@ -434,9 +440,10 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died holding the final attempt; converge like release_completion_delivery.
-                conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                conn.execute("""UPDATE async_delegations SET delivery_state='dropped', drop_reason=?,
                               delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                       WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                             (DROP_ATTEMPTS_EXHAUSTED, now, delegation_id))
                 logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                                "marking terminally dropped (result remains queryable).",
                                delegation_id, _MAX_DELIVERY_ATTEMPTS)
@@ -521,11 +528,11 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return remote.release(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+        capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', drop_reason=?,
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=? AND delivery_attempts>=?""",
-            (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
+            (DROP_ATTEMPTS_EXHAUSTED, now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
         if capped.rowcount == 1:
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                            "marking terminally dropped (result remains queryable).",
@@ -538,15 +545,51 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Return an unadmitted completion to pending without spending a delivery attempt."""
+def defer_completion_delivery(delegation_id: str, claim_id: str, *, reason: Optional[str] = None) -> bool:
+    """Return an unadmitted completion to pending without spending a delivery attempt.
+
+    The deferral is counted in ``delivery_deferrals`` with its ``reason`` (the admission refusal
+    code) rather than vanishing into the refunded attempt. Each claim/defer pair refreshes
+    ``updated_at``, so a completion refused on every retry never looks idle to the orphan sweep and
+    never meets the replay age cap that a restart applies; the cap is therefore applied here, from
+    the completion time: a completion older than ``_MAX_COMPLETION_REPLAY_AGE_S`` that is deferred
+    again converges to ``dropped``. INFO names the reason on deferral 1, 2, 4, 8, ... only."""
     if remote := worker_ledger():
         return remote.defer(delegation_id, claim_id)
-    return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
-                  delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
-                  updated_at=?
-           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
-        (time.time(), delegation_id, claim_id))
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute("""SELECT COALESCE(completed_at, dispatched_at), delivery_deferrals FROM async_delegations
+               WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                           (delegation_id, claim_id)).fetchone()
+        if row is None:
+            return False
+        completed_at, deferrals = row[0], row[1] + 1
+        expired = completed_at is not None and now - completed_at > _MAX_COMPLETION_REPLAY_AGE_S
+        changed = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL, delivery_claimed_at=NULL,
+                      delivery_attempts=MAX(0, delivery_attempts-1), delivery_deferrals=delivery_deferrals+1,
+                      last_defer_reason=?, updated_at=?,
+                      delivery_state=CASE WHEN ? THEN 'dropped' ELSE delivery_state END,
+                      drop_reason=CASE WHEN ? THEN ? ELSE drop_reason END
+               WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                               (reason, now, expired, expired, DROP_DEFERRAL_AGE_CAP,
+                                delegation_id, claim_id)).rowcount
+    if changed != 1:
+        return False
+    log_deferral(delegation_id, reason, deferrals, now - completed_at if expired else 0.0, dropped=expired)
+    return True
+
+
+def log_deferral(delegation_id: str, reason: Optional[str], deferrals: int, age_s: float, *, dropped: bool) -> None:
+    """The log line of a settled deferral, for the in-process ledger and a managed worker's alike: one
+    WARNING when it dropped a completion past the age cap, else INFO on deferral 1, 2, 4, 8, ... only."""
+    if dropped:
+        logger.warning("Async delegation %s: completion is %.1fh old (cap %.1fh) and its delivery was deferred "
+                       "again (%s, %d deferral(s)); terminally dropping it (result remains queryable).",
+                       delegation_id, age_s / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
+                       reason or "unspecified", deferrals)
+    elif deferrals & (deferrals - 1) == 0:
+        logger.info("Async delegation %s: delivery deferred without spending an attempt (%s); "
+                    "%d deferral(s) so far", delegation_id, reason or "unspecified", deferrals)
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -556,11 +599,11 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     restart recovery from replaying it into a fail-closed drop forever."""
     if remote := worker_ledger():
         return remote.drop(delegation_id, claim_id)
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
+    return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped', drop_reason=?,
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
-             AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
+             AND delivery_claim=?""", (DROP_TARGET_GONE, time.time(), delegation_id, claim_id))
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -583,9 +626,10 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
     bounds the loop; a row without a stored event is left as it is."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
+        exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', drop_reason=?,
+                      updated_at=?
                WHERE delegation_id=? AND delivery_state='delivered' AND delivery_attempts>=?""",
-            (now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
+            (DROP_ATTEMPTS_EXHAUSTED, now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
         if exhausted.rowcount == 1:
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                            "marking terminally dropped (result remains queryable).",
@@ -641,12 +685,13 @@ def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, delivery_deferrals, last_defer_reason, drop_reason
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
     return None if row is None else {
         "delegation_id": delegation_id, "origin_session": row[0], "state": row[1], "dispatched_at": row[2],
         "completed_at": row[3], "result": redact_child_result(json.loads(row[4])) if row[4] else None, "delivery_state": row[5],
-        "delivery_attempts": row[6], "origin_session_id": row[7] or ""}
+        "delivery_attempts": row[6], "origin_session_id": row[7] or "", "delivery_deferrals": row[8],
+        "last_defer_reason": row[9], "drop_reason": row[10]}
 
 
 _FAILED_TASK_STATES = frozenset({"error", "failed", "failure", "timeout", "stalled", "unknown", "interrupted"})

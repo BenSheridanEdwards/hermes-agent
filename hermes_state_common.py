@@ -728,6 +728,11 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     result_json TEXT,
     delivery_state TEXT NOT NULL DEFAULT 'pending',
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    -- Claims refunded without spending a delivery attempt, the refusal behind the last one, and
+    -- why a row was dropped. Additive: _reconcile_columns adds them to older ledgers.
+    delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+    last_defer_reason TEXT,
+    drop_reason TEXT,
     delivered_at REAL,
     owner_pid INTEGER,
     owner_started_at INTEGER,
