@@ -229,7 +229,8 @@ async def test_native_completion_wake_refuses_another_adapter(tmp_path, monkeypa
 
 @pytest.mark.asyncio
 async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, caplog):
-    """A refused wake used to requeue silently; the refusal code is what diagnoses it (#138940)."""
+    """A refused wake used to requeue silently; the refusal code is what diagnoses it (#138940). It is
+    an INFO line, rate-limited per notice: the notice is retried while the refusal may clear."""
     import logging
     from gateway.session_identity import replace_source
     from gateway.wake import WakeNotAccepted
@@ -241,11 +242,11 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
         evt = {'type': 'completion', 'session_id': 'proc_x', 'session_key': route, 'platform': 'discord',
                'chat_id': '42', 'chat_type': 'dm', 'exit_code': 0, 'output': 'done', 'started_at': 1.0,
                'parent_session_id': metadata['gateway_session_id']}
-        with caplog.at_level(logging.WARNING, logger='gateway.run'):
+        with caplog.at_level(logging.INFO, logger='gateway.run'):
             with pytest.raises(WakeNotAccepted):
                 await runner._inject_watch_notification('[done]', evt, raise_not_accepted=True)
-        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-                and 'not admitted' in r.getMessage()] == [
-            'Watch notification not admitted for discord chat=42: admission_conflict']
+        assert [(r.levelno, r.getMessage()) for r in caplog.records if 'not admitted' in r.getMessage()] == [
+            (logging.INFO, 'Watch notification not admitted for discord chat=42: admission_conflict '
+                           '(1 refusal(s) since the last line)')]
     finally:
         authority.db.close()
