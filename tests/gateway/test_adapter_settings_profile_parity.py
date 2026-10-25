@@ -76,8 +76,6 @@ _SETTINGS = [
      lambda m: _signal_reactions(m)),
     ("plugins.platforms.line.adapter", "LINE_PORT", "18015", "18115",
      lambda m: (m._env_enablement() or {}).get("port")),
-    ("plugins.platforms.buzz.adapter", "BUZZ_RELAY_URL", "wss://default.relay", "wss://secondary.relay",
-     lambda m: (m._env_enablement() or {}).get("relay_url")),
     ("plugins.platforms.a2a.adapter", "A2A_AGENT_NAME", "default-agent", "secondary-agent",
      lambda m: m._default_agent_name()),
     ("plugins.platforms.discord.adapter", "DISCORD_COMMAND_SYNC_POLICY", "full", "off",
@@ -111,10 +109,10 @@ def _discord(mod, method):
 def test_served_secondary_resolves_its_own_setting(monkeypatch, module, var, default_value, secondary_value, resolve):
     mod = importlib.import_module(module)
     for name in (var, "LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET",
-                 "TEAMS_TENANT_ID", "SIGNAL_ACCOUNT", "BUZZ_PRIVATE_KEY"):
+                 "TEAMS_TENANT_ID", "SIGNAL_ACCOUNT"):
         monkeypatch.delenv(name, raising=False)
     creds = {"LINE_CHANNEL_ACCESS_TOKEN": "t", "LINE_CHANNEL_SECRET": "s", "TEAMS_CLIENT_ID": "a",
-             "TEAMS_CLIENT_SECRET": "b", "TEAMS_TENANT_ID": "c", "SIGNAL_ACCOUNT": "+1", "BUZZ_PRIVATE_KEY": "k"}
+             "TEAMS_CLIENT_SECRET": "b", "TEAMS_TENANT_ID": "c", "SIGNAL_ACCOUNT": "+1"}
     standalone, served = _served(monkeypatch, {var: default_value, **creds}, {var: secondary_value, **creds},
                                  lambda: resolve(mod))
     assert served == standalone, f"{var}: served={served!r} standalone={standalone!r}"

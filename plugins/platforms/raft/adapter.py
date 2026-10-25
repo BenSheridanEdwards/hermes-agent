@@ -518,7 +518,7 @@ def _env_enablement() -> Optional[dict]:
 
     Auto-enables when RAFT_PROFILE is set (the adapter needs it anyway). Scope-aware: consults the active
     profile's own RAFT_PROFILE (env, or a secondary profile's own .env via the secret scope) instead of the
-    default profile's bridged env value (mirrors the Buzz/SimpleX fix for 98738) — see
+    default profile's bridged env value (mirrors the SimpleX fix for 98738) — see
     ``_resolve_raft_profile``. See #98738.
     """
     return {"enabled": True} if _resolve_raft_profile() else None

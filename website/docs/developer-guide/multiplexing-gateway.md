@@ -301,7 +301,7 @@ HERMES_HOME override. Asset writes are atomic, type- and size-capped.
   profile's `.env` or secret source supplies the value. The launch profile's
   mapping still includes its frozen launch env (systemd `Environment=` /
   `op run` credentials resolve); a secondary resolves from its own files only.
-- Scoped platform gates: A2A (`A2A_PORT`) and Buzz enablement are read through
+- Scoped platform gates: A2A (`A2A_PORT`) enablement is read through
   the profile's own scope / `platforms.<name>` section, so a launch-profile
   env var no longer enables an inbound listener in every secondary.
 - Fallback: an external `cron.provider` does not support multiplexing and

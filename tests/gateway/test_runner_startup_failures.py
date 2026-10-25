@@ -31,7 +31,7 @@ def _host_attach_gate_is_not_under_test(monkeypatch):
         ("discord-bot-token_lock", True),
         ("whatsapp-session_lock", True),
         ("feishu_app_lock", True),
-        ("lock_conflict", True),             # buzz / irc / line identity conflicts
+        ("lock_conflict", True),             # irc / line identity conflicts
         ("telegram_connect_error", False),
         ("telegram_auth_error", False),
         ("relay_membership_required", False),

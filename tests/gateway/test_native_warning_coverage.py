@@ -10,7 +10,6 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
-from plugins.platforms.buzz.adapter import BuzzAdapter
 from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.google_chat.adapter import GoogleChatAdapter
 from plugins.platforms.matrix.adapter import MatrixAdapter
@@ -26,7 +25,7 @@ def policy(request, tmp_path, monkeypatch):
         if setting == "override":
             display["platforms"] = {
                 name: {"suppress_warning_notifications": True}
-                for name in ("matrix", "google_chat", "discord", "wecom", "buzz", "mattermost", "feishu", "telegram")
+                for name in ("matrix", "google_chat", "discord", "wecom", "mattermost", "feishu", "telegram")
             }
         (tmp_path / "config.yaml").write_text(json.dumps({"display": display}))
     return setting is True or setting == "override"
@@ -141,27 +140,6 @@ async def test_wecom_rejected_media_keeps_caption_and_failed_result(policy):
     result = await adapter.send_document("chat", "fixture.pdf", caption="Error: requested caption")
     assert not result.success and result.error == "fixture rejection"
     assert [f["markdown"]["content"] for f in frames] == (["Error: requested caption"] if policy else ["⚠️ fixture rejection"])
-
-
-@pytest.mark.asyncio
-async def test_buzz_missing_upload_fallback_and_real_upload_receipts(policy, tmp_path):
-    adapter = BuzzAdapter(PlatformConfig(extra={"cli_path": "fixture-buzz"}))
-    adapter._mention_pubkeys_for = AsyncMock(return_value=[])
-    frames = []
-
-    async def record(args, content, *extra):
-        frames.append((args, content))
-        return 0, json.dumps({"event_id": "a" * 64, "accepted": True}), ""
-
-    adapter._run_message_send = record
-    result = await adapter.send_image_file("chat", str(tmp_path / "missing.png"), caption="requested caption")
-    assert frames[0][1] == ("requested caption" if policy else "requested caption\n⚠️ Couldn't deliver the image attachment.")
-    assert result.success is (not policy)
-    path = tmp_path / "image.png"
-    path.write_bytes(b"fixture")
-    result = await adapter.send_image_file("chat", str(path), caption="⚠️ user caption")
-    assert result.success and result.message_id == "a" * 64
-    assert "--file" in frames[-1][0] and frames[-1][1] == "⚠️ user caption"
 
 
 @pytest.mark.asyncio

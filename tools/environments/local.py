@@ -22,8 +22,8 @@ from tools.environments.base_output import _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local_env_policy import (
     _ALWAYS_STRIP_FOLDED, _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
-    _is_hermes_internal_secret, _is_provider_env_blocklisted, _is_terminal_first_party_env,
-    _home_adapter_secret_env, _matches_terminal_first_party_prefix, _plugin_terminal_env_strip_keys,
+    _is_hermes_internal_secret, _is_provider_env_blocklisted,
+    _home_adapter_secret_env, _plugin_terminal_env_strip_keys,
     _registered_adapter_secret_env, _registry_adapter_secret_env,
     strip_profile_gate_env)
 from tools.environments.local_pythonpath import (
@@ -264,9 +264,7 @@ def _filter_secret_env(
     plugin_strip: frozenset = frozenset()) -> None:
     """Copy *items* into *out*, dropping Hermes-managed secrets. ``_HERMES_FORCE_<NAME>``
     unwraps to ``NAME`` when ``unwrap_force`` (caller extras / terminal env), else is
-    dropped. Blocklisted names survive only via env_passthrough registration or as
-    context-entitled first-party ``BUZZ_*`` vars; the latter are used directly, never
-    scope-resolved (UnscopedSecretError under multiplex)."""
+    dropped. Blocklisted names survive only via env_passthrough registration."""
     try:
         from tools.env_passthrough import is_env_passthrough, resolve_passthrough_value
     except Exception:
@@ -283,11 +281,10 @@ def _filter_secret_env(
             continue
         if _is_hermes_internal_secret(key) or key.upper() in plugin_strip_folded:
             continue
-        first_party = _is_terminal_first_party_env(key)
         passthrough = is_env_passthrough(key)
-        if _is_provider_env_blocklisted(key, registered) and not (passthrough or first_party):
+        if _is_provider_env_blocklisted(key, registered) and not passthrough:
             continue
-        if passthrough and not first_party:
+        if passthrough:
             value = resolve_passthrough_value(key, value)
         if value is not None:
             out[key] = value
@@ -1014,17 +1011,6 @@ class LocalEnvironment(BaseEnvironment):
     # Commands run on the Hermes host itself — controller-side platform behavior
     # (macOS TCC pruning, etc.) legitimately applies here.
     is_local = True
-
-    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
-        """First-party ``BUZZ_*`` names present in the env, excluded from the shared
-        session snapshot. env_passthrough can never list them (it refuses blocklisted
-        names), so under a multiplexed gateway profile A's BUZZ_PRIVATE_KEY would land
-        in the snapshot and be sourced by profile B. Prefix-only and monotonic on
-        purpose: conservative even when the context-gated carve-out is inactive."""
-        merged = dict(os.environ | self.env)
-        return tuple(sorted(
-            name for name in merged
-            if isinstance(name, str) and _matches_terminal_first_party_prefix(name)))
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True):
         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)

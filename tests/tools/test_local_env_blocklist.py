@@ -474,64 +474,6 @@ def test_force_prefix_is_not_plugin_passthrough(child_env, monkeypatch, builder,
         assert "AUXILIARY_VISION_API_KEY" not in factories[builder]()
 
 
-@pytest.mark.parametrize("managed,platform,allowed", [(True, "telegram", True), (False, "buzz", True), (False, "telegram", False)])
-@pytest.mark.parametrize("scope", [None, {"BUZZ_PRIVATE_KEY": "fake-scoped"}])
-def test_buzz_context_and_plain_process_value(child_env, monkeypatch, managed, platform, allowed, scope):
-    from agent import secret_scope as ss
-    from gateway.session_context import _SESSION_PLATFORM
-    from tools.code_execution_env import _scrub_child_env
-    from tools.env_passthrough import register_env_passthrough, is_env_passthrough
-    buzz = {"BUZZ_PRIVATE_KEY": "fake-process", "BUZZ_AUTH_TAG": "fake-tag", "BUZZ_RELAY_URL": "fake-relay"}
-    for k, v in buzz.items():
-        monkeypatch.setenv(k, v)
-    if managed:
-        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
-    platform_token = _SESSION_PLATFORM.set(platform)
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope(scope) if scope is not None else None
-    try:
-        register_env_passthrough(buzz)
-        assert not any(is_env_passthrough(k) for k in buzz)
-        for result in (local._make_run_env({}), local._sanitize_subprocess_env(dict(os.environ))):
-            assert {k: result.get(k) for k in buzz} == (buzz if allowed else dict.fromkeys(buzz))
-        for result in (local.hermes_subprocess_env(), _scrub_child_env(os.environ)):
-            assert not set(buzz) & result.keys()
-    finally:
-        if scope_token is not None:
-            ss.reset_secret_scope(scope_token)
-        ss.set_multiplex_active(False)
-        _SESSION_PLATFORM.reset(platform_token)
-
-
-@pytest.mark.platforms("linux", "macos", "windows")
-@pytest.mark.parametrize("first_platform,first_value", [("buzz", "fake-profile-a"), ("telegram", None)], ids=["buzz", "other"])
-def test_buzz_secret_never_reaches_second_profile_via_snapshot(child_env, monkeypatch, first_platform, first_value):
-    from agent import secret_scope as ss
-    from gateway.session_context import _SESSION_PLATFORM
-    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "fake-profile-a")
-    ss.set_multiplex_active(True)
-    platform = _SESSION_PLATFORM.set(first_platform)
-    env = None
-    try:
-        env = local.LocalEnvironment(cwd=str(child_env), timeout=30)
-        snap = Path(env._snapshot_path)
-        assert snap.exists()
-        assert "BUZZ_PRIVATE_KEY" not in snap.read_text(encoding="utf-8")
-        assert observe_terminal(env, ["BUZZ_PRIVATE_KEY"]) == {"BUZZ_PRIVATE_KEY": first_value}
-        assert "fake-profile-a" not in snap.read_text(encoding="utf-8")
-        monkeypatch.delenv("BUZZ_PRIVATE_KEY")
-        _SESSION_PLATFORM.reset(platform)
-        platform = _SESSION_PLATFORM.set("telegram")
-        assert observe_terminal(env, ["BUZZ_PRIVATE_KEY"]) == {"BUZZ_PRIVATE_KEY": None}
-        assert "BUZZ_PRIVATE_KEY" in env._snapshot_passthrough_names
-        assert "BUZZ_PRIVATE_KEY" not in snap.read_text(encoding="utf-8")
-    finally:
-        if env is not None:
-            env.cleanup()
-        _SESSION_PLATFORM.reset(platform)
-        ss.set_multiplex_active(False)
-
-
 @pytest.mark.parametrize("scoped,expected", [({"SERVICE_TOKEN": "fake-routed"}, "fake-routed"), ({}, None)])
 def test_profile_passthrough_in_terminal_child(child_env, monkeypatch, scoped, expected):
     from agent import secret_scope as ss
