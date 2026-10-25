@@ -1770,7 +1770,7 @@ class TestV1SpecRegressionFixes:
 # profile's YAML-to-env bridge output — a secondary profile with its own
 # (different, or absent) A2A config would silently borrow the default
 # profile's port, toolset advertisement, agent name, or Agent Card
-# description. Mirrors the Buzz/SimpleX fix for #98738.
+# description. Mirrors the SimpleX fix for #98738.
 
 _A2A_ENV_VARS = (
     "A2A_PORT",

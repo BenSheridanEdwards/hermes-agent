@@ -207,7 +207,7 @@ class TestRaftConfig:
 # (set only in its own .env, resolved via the installed secret scope) would
 # silently connect the bridge subprocess / CLI hint to the default profile's
 # external Raft workspace/agent identity instead of its own. Mirrors the
-# Buzz/SimpleX fix for #98738.
+# SimpleX fix for #98738.
 
 @pytest.fixture
 def multiplex_scope():

@@ -357,7 +357,7 @@ class StreamFallbackMixin:
             # thread_id metadata and reply_to on every commentary is spam.
             _plat = getattr(getattr(self.adapter, "platform", None), "value", None)
             _platform_name = str(_plat or getattr(self.adapter, "name", "")).lower()
-            _needs_reply_anchor = _platform_name in ("buzz", "slack", "mattermost", "feishu")
+            _needs_reply_anchor = _platform_name in ("slack", "mattermost", "feishu")
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text,
                 reply_to=self._initial_reply_to_id if _needs_reply_anchor else None, metadata=_md)

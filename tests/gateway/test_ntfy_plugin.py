@@ -479,7 +479,7 @@ class TestFatalErrorPropagation:
 # secondary profile with its own (different or absent) ntfy config would
 # silently subscribe to / publish on the default profile's topic, or get
 # auto-enabled using the default profile's topic entirely. Mirrors the
-# LINE/Buzz/SimpleX fix for #98738.
+# LINE/SimpleX fix for #98738.
 
 @pytest.fixture
 def multiplex_scope():

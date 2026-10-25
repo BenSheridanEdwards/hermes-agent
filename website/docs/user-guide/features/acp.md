@@ -141,80 +141,6 @@ The bootstrap is idempotent — re-running it is fast and skips work that's alre
 
 ## Host setup
 
-### Buzz channels (relay bridge)
-
-[Buzz](https://github.com/block/buzz) is a Nostr-based collaboration platform
-for people and agents. Its `buzz-acp` harness connects Buzz channels to any ACP
-agent over stdio:
-
-```text
-Buzz relay <-- WebSocket --> buzz-acp <-- ACP over stdio --> Hermes Agent
-```
-
-This is a transport integration, not a second Hermes installation. The
-subprocess launched by `buzz-acp` uses the same Hermes configuration,
-credentials, memory, skills, and state as `hermes` on that host.
-
-(This is distinct from [Buzz Desktop's managed runtime](#buzz-desktop), which
-spawns Hermes locally as a preset harness. The relay bridge is for joining Buzz
-*channels* as an agent identity, typically on a server.)
-
-Prerequisites:
-
-- Complete the ACP installation and `hermes acp --check` above.
-- Build `buzz-acp` and the `buzz` CLI from the
-  [Buzz repository](https://github.com/block/buzz)
-  (`cargo build --release -p buzz-acp`).
-- Mint a dedicated Nostr keypair for Hermes (`buzz-admin generate-key`) and
-  register it as a relay member (`buzz-admin add-member`). Every agent needs
-  its own identity — do not reuse a human keypair.
-- Add that identity to the intended Buzz channels.
-
-Start a bridge with:
-
-```bash
-export BUZZ_RELAY_URL="wss://community.example.com"
-export BUZZ_PRIVATE_KEY="..."
-export BUZZ_API_TOKEN="..."
-export BUZZ_ACP_AGENT_COMMAND="hermes"
-export BUZZ_ACP_AGENT_ARGS="acp"
-
-buzz-acp
-```
-
-`BUZZ_API_TOKEN` is needed only when the relay enforces token authentication.
-Do not commit or paste the private key or API token.
-
-For a persistent server deployment, run `buzz-acp` under a service manager as
-the same operating-system user that owns the intended Hermes home. Setup,
-key generation, channel discovery, and per-agent options are documented in the
-[buzz-acp README](https://github.com/block/buzz/tree/main/crates/buzz-acp).
-
-The bridge discovers every Buzz channel where the Hermes identity is a member
-and automatically subscribes when it is added to another channel. Buzz channel
-membership therefore remains the access boundary; Hermes does not need a
-separate channel list in its own configuration.
-
-To expose Hermes ACP activity in the owner's Buzz Desktop, add:
-
-```bash
-export BUZZ_ACP_RELAY_OBSERVER="true"
-```
-
-This publishes encrypted kind `24200` observer frames addressed to the agent's
-owner (Buzz's NIP-AO). Desktop renders the live lifecycle, tool, response, and
-usage stream in the agent's **Activity log**. The relay treats these frames as
-ephemeral, so Desktop must be online before the turn starts; its local observer
-archive is the durable owner-side history.
-
-Headless bridges answer ACP permission requests themselves because no editor
-is present to show approval dialogs — see
-[Keep Buzz agents owner-only](#keep-buzz-agents-owner-only). Treat the bridge
-as privileged automation: use a dedicated operating-system account, restrict
-which Buzz users can prompt the agent (`buzz-acp` supports an owner-only
-respond gate via `BUZZ_ACP_AGENT_OWNER`), and grant membership only in channels
-where Hermes is expected to work.
-
 ### VS Code
 
 Install the [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client) extension.
@@ -267,61 +193,18 @@ Prerequisites:
 
 Use an ACP-compatible plugin and point it at `hermes acp` or `hermes-acp`.
 
-### Buzz Desktop
+### Model picker
 
-[Buzz](https://github.com/block/buzz) ships Hermes Agent as a preset runtime.
-With Hermes installed the normal way, Buzz discovers it automatically —
-open **Settings → Runtimes** and Hermes appears under your runtimes.
-
-If discovery fails (older installs), make sure the ACP launcher resolves on a
-login-shell PATH:
-
-```bash
-command -v hermes-acp || command -v hermes
-```
-
-Recent installs write both `hermes` and `hermes-acp` launchers into
-`~/.local/bin`; running `hermes update` adds the `hermes-acp` launcher to
-older installs. As a manual fallback, configure Buzz's agent command as
-`hermes` with args `["acp"]`.
-
-#### Model picker
-
-Buzz Desktop (v0.5.1+) renders Hermes' full model menu in the agent's runtime
-settings. The list comes from Hermes itself over ACP: it shows every model
-from providers you have authenticated in Hermes (the same inventory behind
-`hermes model` and the `/model` command), so a model missing from the menu
-means its provider has no credentials configured on the Hermes side.
+Hosts that expose a model selector render Hermes' full model menu. The list
+comes from Hermes itself over ACP: it shows every model from providers you have
+authenticated in Hermes (the same inventory behind `hermes model` and the
+`/model` command), so a model missing from the menu means its provider has no
+credentials configured on the Hermes side.
 
 Entry IDs take the form `provider:model` (e.g. `openrouter:z-ai/glm-5.1`), or
 `custom:<name>:<model>` for custom OpenAI-compatible endpoints defined in
 `config.yaml`. Picking a model applies to that agent's session; it does not
 change your Hermes-wide default — use `hermes model` for that.
-
-#### Keep Buzz agents owner-only
-
-Buzz creates every agent with **Who can talk to this agent** set to `Owner only`.
-Leave it there when the runtime is Hermes.
-
-Two behaviors combine on this path. The `hermes-acp` toolset includes `terminal`
-and `execute_code`, and Buzz's ACP bridge answers Hermes' permission requests
-itself with `allow_once` rather than surfacing them. A Hermes agent in Buzz
-therefore runs shell commands on the host without prompting. I asked one to run
-`rm -rf` against a scratch directory and it deleted it, no prompt anywhere.
-
-Selecting `Anyone` hands that same shell access to every author who can reach
-the channel. Buzz does not warn when you pick it.
-
-`approvals.mode: manual` does not help: Hermes raises the permission request,
-but Buzz auto-approves it and the command still runs. To take the shell away,
-narrow the toolset instead: set `platform_toolsets.acp` to a list without
-`terminal` and `code_execution`, or add them to `agent.disabled_toolsets`.
-Even an empty `platform_toolsets.acp: []` still adds enabled plugin
-toolsets, so name any plugin toolset you want gone in
-`agent.disabled_toolsets`.
-
-`!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
-command from everyone else.
 
 ## Configuration and credentials
 
@@ -393,8 +276,8 @@ Dangerous terminal commands can be routed back to the editor as approval prompts
 
 Whether you actually see a prompt is up to the host. A host is free to answer the
 request programmatically instead of showing it to you, in which case these
-options exist on the wire but never reach a human. Buzz Desktop does this, so
-treat that path as unattended execution regardless of your `approvals` setting.
+options exist on the wire but never reach a human. Treat such a host as
+unattended execution regardless of your `approvals` setting.
 
 On timeout or error, the approval bridge denies the request. The wait is
 `approvals.timeout` from `config.yaml` (default 300 s), the same knob the CLI and
@@ -448,7 +331,6 @@ or by editing `~/.hermes/.env`. The terminal auth flow (`hermes acp --setup`) ca
 
 ## See also
 
-- [Buzz ACP harness](https://github.com/block/buzz/tree/main/crates/buzz-acp)
 - [ACP Internals](../../developer-guide/acp-internals.md)
 - [Provider Runtime Resolution](../../developer-guide/provider-runtime.md)
 - [Tools Runtime](../../developer-guide/tools-runtime.md)

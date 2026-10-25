@@ -403,7 +403,7 @@ class TestIRCStandaloneSend:
 # (different or absent) IRC config would silently connect to the default
 # profile's server/channel, or (for _env_enablement) get auto-enabled using
 # the default's channel as its cron home_channel -- a real message-
-# misdelivery risk, not just cosmetic. Mirrors the LINE/Buzz/SimpleX fix for
+# misdelivery risk, not just cosmetic. Mirrors the LINE/SimpleX fix for
 # #98738.
 
 @pytest.fixture

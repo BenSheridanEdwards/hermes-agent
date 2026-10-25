@@ -3,7 +3,7 @@
 Hermes Desktop's Projects sidebar, ``hermes sessions list``, and every
 profile-keyed consumer group sessions off ``sessions.cwd``. The ACP adapter
 recorded the workspace only inside the ``model_config`` JSON blob, so every
-editor-created session (VS Code, Antigravity, Zed, JetBrains, Buzz) rendered
+editor-created session (VS Code, Antigravity, Zed, JetBrains) rendered
 as unassigned -- "Workspace: --" -- even though its transcript was intact.
 
 ``_insert_session_row`` already accepted ``cwd``/``git_repo_root``; the ACP

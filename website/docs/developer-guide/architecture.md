@@ -123,7 +123,7 @@ hermes-agent/
 ├── plugins/platforms/        # Bundled platform plugins: telegram, discord, slack,
 │                             #   whatsapp, matrix, mattermost, email, sms, dingtalk,
 │                             #   feishu, wecom, irc, line, teams, google_chat,
-│                             #   buzz, ntfy, photon, raft, simplex, whatsapp_cloud,
+│                             #   ntfy, photon, raft, simplex, whatsapp_cloud,
 │                             #   signal, weixin, bluebubbles, qqbot, yuanbao
 │                             #   (Home Assistant: `homeassistant` catalog plugin)
 │
